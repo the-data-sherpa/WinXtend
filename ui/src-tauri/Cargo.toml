@@ -1,0 +1,44 @@
+[package]
+name = "winxtend-ui"
+description = "WinXtend desktop UI: device discovery, the layout editor, and status"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.79"
+
+# Its own workspace, deliberately.
+#
+# Tauri pulls in a large, fast-moving dependency tree (webview bindings, an HTTP
+# stack, image codecs) that has nothing to do with the engine crates. Sharing the
+# root workspace would put all of it in every `cargo test` at the repository root
+# and let a UI dependency bump re-lock the daemon's tree. Keeping it separate
+# costs a second target directory and buys an engine build that cannot be broken
+# by the UI. The engine crates are referenced by path so there is still exactly
+# one copy of the protocol source.
+[workspace]
+
+# The lib holds everything and the bin is three lines, so the parts that are
+# testable without a webview — layout validation, locating the agent binary — are
+# reachable from `cargo test`.
+[lib]
+name = "winxtend_ui_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "winxtend-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tauri = "2.11.5"
+tokio = { version = "1.53.1", features = ["sync", "time"] }
+wx-agent = { version = "0.1.0", path = "../../crates/wx-agent" }
+wx-core = { version = "0.1.0", path = "../../crates/wx-core" }
+wx-proto = { version = "0.1.0", path = "../../crates/wx-proto" }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt", "time", "test-util"] }

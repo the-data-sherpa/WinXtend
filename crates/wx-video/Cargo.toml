@@ -1,0 +1,23 @@
+[package]
+name = "wx-video"
+description = "WinXtend optional screen streaming: capture, encode, decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wx-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zstd = { version = "0.13.3", optional = true }
+
+[features]
+# On by default: an uncompressed passthrough stream is 249 MB/s at 1080p30, which
+# is not usable on any real link. Buildable without it so a target with no C
+# toolchain can still compile the crate.
+default = ["zstd"]
+zstd = ["dep:zstd"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }

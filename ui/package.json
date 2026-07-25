@@ -1,0 +1,22 @@
+{
+  "name": "winxtend-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WinXtend desktop UI: devices, layout editor, status",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "vite": "^7",
+    "vitest": "^3"
+  }
+}

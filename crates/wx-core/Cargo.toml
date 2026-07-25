@@ -1,0 +1,13 @@
+[package]
+name = "wx-core"
+description = "WinXtend engine: global desktop layout, edge crossing, and input routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wx-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

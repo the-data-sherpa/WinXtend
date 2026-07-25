@@ -1,0 +1,3 @@
+# Written by tauri-build from tauri.conf.json on every build; regenerating it is
+# part of the build, so a committed copy is only ever a stale copy.
+/gen/schemas

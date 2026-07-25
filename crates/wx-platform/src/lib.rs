@@ -1,0 +1,285 @@
+//! Platform abstraction for input, displays, and clipboard.
+//!
+//! Everything OS-specific lives behind the traits in [`traits`] so that
+//! [`wx_core`](../wx_core/index.html) stays testable and portable. The backend for
+//! the build target is assembled by [`current_platform`].
+//!
+//! # Backends
+//!
+//! | Platform | Capture | Inject | State |
+//! |---|---|---|---|
+//! | Windows | `WH_KEYBOARD_LL` / `WH_MOUSE_LL` | `SendInput` | implemented |
+//! | macOS | `CGEventTap` | `CGEventPost` | skeleton |
+//! | Linux/X11 | XInput2 raw events | XTEST | skeleton |
+//! | Linux/Wayland | libei via portal | libei | skeleton |
+//! | Linux headless | evdev | uinput | skeleton |
+//!
+//! Wayland matters: it is the default on current Fedora, Ubuntu, and Steam Deck,
+//! and the Synergy-lineage tools still do not support it. Supporting it is a
+//! reason to pick WinXtend rather than a nice-to-have.
+//!
+//! # The one idea that has to survive every backend
+//!
+//! Keys are resolved to **text** on the machine they were typed on, using that
+//! machine's own layout, before they ever reach the network. [`keyres`] owns that
+//! translation and every backend routes through it, so the cross-layout guarantee
+//! cannot be true on one platform and false on another. A backend that hands raw
+//! keycodes upwards has moved the problem to the wrong side of the wire.
+//!
+//! # Layering
+//!
+//! ```text
+//!   agent  ->  Box<dyn InputCapture>  ->  keyres::KeyResolver  ->  wx_proto::KeyEvent
+//!   agent  <-  Box<dyn InputInjector> <-  wx_proto::InputEvent
+//! ```
+//!
+//! Nothing here knows about the network, the layout engine, or async. Backends
+//! deliver events to a callback and accept events one at a time.
+
+pub mod coords;
+pub mod error;
+pub mod keyres;
+pub mod traits;
+
+// Backend modules are declared unconditionally even though only one is ever used.
+// They contain no platform-specific dependencies yet, so compiling them everywhere
+// costs nothing and stops the skeletons rotting: a change to `traits` breaks them
+// here and now rather than months later on a machine nobody has. When real syscalls
+// land, the call sites get `cfg`-gated, not the module.
+pub mod linux_evdev;
+pub mod linux_wayland;
+pub mod linux_x11;
+pub mod macos;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+pub use error::{PlatformError, Result};
+pub use keyres::{KeyResolver, RawKey};
+pub use traits::{
+    CaptureSink, CapturedEvent, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
+    ScreenSaverControl,
+};
+
+use wx_proto::{Capabilities, DisplayServer, Platform};
+
+/// What a node advertises about itself in the handshake.
+///
+/// Assembled from what the backend can actually do rather than from what the OS
+/// theoretically supports: on macOS the same binary reports different capabilities
+/// depending on which permissions the user has granted, and a peer needs the real
+/// answer to decide whether to offer clipboard sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformInfo {
+    pub platform: Platform,
+    pub display_server: DisplayServer,
+    pub capabilities: Capabilities,
+}
+
+/// The assembled backend for this machine.
+///
+/// Boxed trait objects rather than generics: the agent holds exactly one of these
+/// for its whole life, so monomorphising five type parameters through every layer
+/// above would buy nothing and make the engine's signatures depend on the build
+/// target.
+///
+/// Every field is present even where the platform cannot honour it. A headless node
+/// still has a `clipboard`, which returns [`PlatformError::Unsupported`] on every
+/// call. That keeps the agent free of `Option` handling on paths it should never
+/// take anyway, and [`PlatformInfo::capabilities`] is the authority on what to
+/// attempt.
+pub struct PlatformBackend {
+    pub info: PlatformInfo,
+    pub displays: Box<dyn DisplayEnumerator>,
+    pub capture: Box<dyn InputCapture>,
+    pub injector: Box<dyn InputInjector>,
+    pub clipboard: Box<dyn ClipboardAccess>,
+    pub screensaver: Box<dyn ScreenSaverControl>,
+}
+
+impl core::fmt::Debug for PlatformBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The trait objects have nothing useful to print, and the info is the part
+        // that ends up in a bug report.
+        f.debug_struct("PlatformBackend")
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Build the backend for the compile target.
+///
+/// On Linux the choice is made at runtime rather than compile time, because one
+/// binary has to serve X11, Wayland, and headless machines — see
+/// [`detect_display_server`].
+pub fn current_platform() -> Result<PlatformBackend> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::backend()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::backend()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match detect_display_server(&EnvVars::from_process()) {
+            DisplayServer::Wayland => linux_wayland::backend(),
+            DisplayServer::X11 => linux_x11::backend(),
+            _ => linux_evdev::backend(),
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err(PlatformError::Unsupported {
+            operation: "any platform backend",
+            backend: "unknown",
+        })
+    }
+}
+
+/// The environment variables that decide which Linux backend to use.
+///
+/// Passed in as data rather than read inside the decision function so the decision
+/// is testable: setting process environment variables from a test races every other
+/// test in the binary.
+#[derive(Debug, Default, Clone)]
+pub struct EnvVars {
+    pub wayland_display: Option<String>,
+    pub display: Option<String>,
+    pub xdg_session_type: Option<String>,
+}
+
+impl EnvVars {
+    pub fn from_process() -> Self {
+        Self {
+            wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),
+            display: std::env::var("DISPLAY").ok(),
+            xdg_session_type: std::env::var("XDG_SESSION_TYPE").ok(),
+        }
+    }
+}
+
+/// Decide which display server a Linux session is running.
+///
+/// `WAYLAND_DISPLAY` wins over `DISPLAY` when both are set, and both are set
+/// constantly: every Wayland session runs Xwayland, which exports `DISPLAY`. Picking
+/// X11 there would work — through Xwayland — but only for X11 clients, so captured
+/// input would miss every native Wayland window. That failure looks like "keyboard
+/// sharing works in my terminal but not in Firefox", which is exactly the kind of
+/// bug that never gets diagnosed correctly.
+///
+/// `XDG_SESSION_TYPE` is consulted only as a tiebreak, because it is set by the
+/// display manager and is wrong or absent often enough not to be trusted first.
+pub fn detect_display_server(env: &EnvVars) -> DisplayServer {
+    let non_empty = |v: &Option<String>| v.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+
+    if non_empty(&env.wayland_display) {
+        return DisplayServer::Wayland;
+    }
+    if non_empty(&env.display) {
+        return DisplayServer::X11;
+    }
+    match env.xdg_session_type.as_deref() {
+        Some("wayland") => DisplayServer::Wayland,
+        Some("x11") => DisplayServer::X11,
+        // No display server: a headless forwarder driving peers via evdev.
+        _ => DisplayServer::Headless,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(wayland: Option<&str>, x11: Option<&str>, session: Option<&str>) -> EnvVars {
+        EnvVars {
+            wayland_display: wayland.map(str::to_string),
+            display: x11.map(str::to_string),
+            xdg_session_type: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn wayland_wins_when_xwayland_also_advertises_a_display() {
+        // Every Wayland session exports DISPLAY for Xwayland. Choosing X11 there
+        // would silently miss input in native Wayland windows.
+        assert_eq!(
+            detect_display_server(&env(Some("wayland-0"), Some(":0"), Some("wayland"))),
+            DisplayServer::Wayland
+        );
+    }
+
+    #[test]
+    fn a_plain_x11_session_is_detected() {
+        assert_eq!(
+            detect_display_server(&env(None, Some(":0"), Some("x11"))),
+            DisplayServer::X11
+        );
+    }
+
+    #[test]
+    fn an_empty_variable_counts_as_unset() {
+        // Shell profiles routinely export empty values; treating one as a live
+        // display server would pick a backend that cannot connect.
+        assert_eq!(
+            detect_display_server(&env(Some(""), Some(""), None)),
+            DisplayServer::Headless
+        );
+    }
+
+    #[test]
+    fn a_bare_session_type_is_enough_when_no_socket_is_exported() {
+        assert_eq!(
+            detect_display_server(&env(None, None, Some("wayland"))),
+            DisplayServer::Wayland
+        );
+        assert_eq!(
+            detect_display_server(&env(None, None, Some("x11"))),
+            DisplayServer::X11
+        );
+    }
+
+    #[test]
+    fn nothing_set_means_headless() {
+        assert_eq!(
+            detect_display_server(&EnvVars::default()),
+            DisplayServer::Headless
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_session_type_falls_back_to_headless() {
+        // `tty` is the common real value. Guessing X11 would make the agent hang
+        // trying to open a display that does not exist.
+        assert_eq!(
+            detect_display_server(&env(None, None, Some("tty"))),
+            DisplayServer::Headless
+        );
+    }
+
+    #[test]
+    fn the_current_platform_reports_the_host_it_was_built_for() {
+        let backend = current_platform().unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(backend.info.platform, Platform::Windows);
+            assert_eq!(backend.info.display_server, DisplayServer::Windows);
+        }
+        // The debug impl is what ends up in bug reports; make sure it says
+        // something useful rather than panicking on the trait objects.
+        assert!(format!("{backend:?}").contains("PlatformInfo"));
+    }
+
+    #[test]
+    fn a_usable_platform_advertises_capture_and_injection() {
+        // The two capabilities without which a node cannot participate at all.
+        let backend = current_platform().unwrap();
+        #[cfg(target_os = "windows")]
+        assert!(backend
+            .info
+            .capabilities
+            .contains(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT));
+        let _ = backend;
+    }
+}

@@ -1,0 +1,13 @@
+# Build into the repository's own target directory rather than ui/src-tauri/target.
+#
+# Two reasons, one of them local and hard:
+#
+# * This machine's application-control policy refuses to execute binaries created
+#   under ui/src-tauri/target, which makes every crate with a build script fail with
+#   "An Application Control policy has blocked this file" (os error 4551). The
+#   repository's target directory is permitted, so build scripts run from there.
+# * A separate subdirectory rather than the workspace's own target root, because this
+#   crate is its own workspace: sharing the root target directory would mean sharing
+#   its lock, and a UI build would block an engine build for no reason.
+[build]
+target-dir = "../../target/ui"

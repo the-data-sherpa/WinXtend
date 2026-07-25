@@ -1,0 +1,20 @@
+# Normalise to LF in the repository regardless of the contributor's platform.
+# Without this, a Windows checkout commits CRLF and every Linux/macOS contributor
+# sees whole-file diffs on files they never touched.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+
+# Lock files are generated; collapse them in review so they do not drown a diff.
+Cargo.lock linguist-generated=true
+ui/package-lock.json linguist-generated=true
+ui/src-tauri/Cargo.lock linguist-generated=true
+
+# GitHub language stats should reflect the engine, not the vendored web assets.
+ui/src-tauri/gen/** linguist-vendored=true
