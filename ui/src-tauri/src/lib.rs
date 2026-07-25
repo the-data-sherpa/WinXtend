@@ -196,10 +196,22 @@ impl From<&EndpointFile> for EndpointView {
 }
 
 fn daemon_view(state: &AppState, connected: bool, message: Option<String>) -> DaemonView {
-    let endpoint = state
-        .config_dir
-        .as_deref()
-        .and_then(|dir| EndpointFile::read(dir).ok());
+    // Report why the endpoint could not be read rather than discarding the error.
+    // A swallowed failure here is indistinguishable in the UI from "no agent is
+    // running", which sends the user looking for a daemon that is already up.
+    let endpoint = match state.config_dir.as_deref() {
+        Some(dir) => match EndpointFile::read(dir) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!("wx-ui: endpoint unreadable at {}: {e}", dir.display());
+                None
+            }
+        },
+        None => {
+            eprintln!("wx-ui: no config directory resolved");
+            None
+        }
+    };
     DaemonView {
         connected,
         config_dir: state
