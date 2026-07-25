@@ -166,7 +166,7 @@ impl EndpointFile {
                 .map_err(io_err("creating the endpoint file"))?;
             file.write_all(json.as_bytes())
                 .map_err(io_err("writing the endpoint file"))?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(unix))]
