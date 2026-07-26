@@ -3,8 +3,8 @@
 [![CI](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml/badge.svg)](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml)
 
 **Share one keyboard and mouse across every machine on your desk.** Move the cursor
-off the edge of one screen and it appears on the next machine — Windows, macOS, or
-Linux — with the clipboard following it and no KVM switch in sight.
+off the edge of one screen and it appears on the next machine — today that means
+Windows, with Linux/Wayland the alpha target — and no KVM switch in sight.
 
 A spiritual successor to Synergy, Barrier, and [hydra](https://github.com/PacAnimal/hydra),
 written in Rust, with a QUIC transport, zero-configuration discovery, and a visual
@@ -20,8 +20,11 @@ layout editor.
 > targeted one are not the same backend:
 >
 > - **Windows is the only complete backend, and it is out of alpha scope.**
->   Capture, injection, displays, and clipboard all work there. It is kept, tested,
->   and accurately described below — but it is not what the alpha is aimed at.
+>   Capture, injection, displays, and the clipboard platform layer all work there.
+>   Clipboard *sync*, though, does not work end to end on Windows any more than
+>   anywhere else, because the agent does not act on clipboard messages yet
+>   (`crates/wx-agent/src/engine.rs:1411`). It is kept, tested, and accurately
+>   described below — but it is not what the alpha is aimed at.
 > - **Linux/Wayland is the alpha target, and it is being built now.** Today it is a
 >   compiling skeleton that advertises no capabilities and refuses what it cannot
 >   do, on purpose (`crates/wx-platform/src/linux_wayland/mod.rs:196`). macOS, X11,
@@ -55,8 +58,8 @@ an operating system, or rescue a machine whose kernel has hung. Those need captu
 hardware physically attached to the target, and no amount of software substitutes
 for it.
 
-So what WinXtend does today is input and clipboard sharing between machines that
-each have their own display. It does not send you a picture of any of them. See
+So what WinXtend does today is input sharing between machines that each have their
+own display. It does not send you a picture of any of them. See
 the [roadmap](#roadmap) for where screen streaming stands.
 
 ## Why another one of these
@@ -315,7 +318,8 @@ exist in a Linux build, which is exactly why `wx-platform` reports 70 tests on
 Linux against 160 on Windows. `crates/wx-video/tests/windows_capture_smoke.rs` is
 `#![cfg(target_os = "windows")]` too, though its cases are additionally `#[ignore]`d
 because they need an interactive desktop. The cross-platform crates — `wx-proto`,
-`wx-core`, `wx-net`, `wx-agent`, `wx-video` — run the same tests everywhere.
+`wx-core`, `wx-net`, `wx-agent` — run the same tests everywhere, as does the rest
+of `wx-video` apart from that one file.
 
 Once the Wayland backend has an implementation, the Linux number rises by its own
 tests; it will never converge with the Windows number, because each platform's
