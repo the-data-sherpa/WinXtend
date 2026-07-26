@@ -216,7 +216,7 @@ alongside the identity key and trust store. The QUIC listener defaults to port
 |---|---|
 | `Ctrl+Alt+Super+L` | Pin the cursor to this machine. The one hotkey that has to exist — full-screen games and VMs are exactly where sliding onto another machine is never what you meant. |
 | `Ctrl+Alt+Super+Home` | Reclaim a cursor stranded on a machine that has stopped responding. |
-| `Ctrl+Alt+Super+K` | Lock every machine on the desk at once. A machine that has not advertised that it can lock itself is named in a warning rather than silently left running. |
+| `Ctrl+Alt+Super+K` | Lock every connected machine on the desk at once. One that has not advertised that it can lock itself is named in a warning rather than silently left running; a paired machine that is currently offline is neither asked nor named. |
 
 `Super` is the Windows key, or Command on macOS. All three are configurable.
 
