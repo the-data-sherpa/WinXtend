@@ -108,8 +108,12 @@ impl Link {
         notifier: std::sync::Arc<dyn Notifier>,
     ) -> Result<Self, ConnectError> {
         let endpoint = EndpointFile::read(dir).map_err(ConnectError::from_ipc)?;
-        let requests = IpcClient::connect(dir).await.map_err(ConnectError::from_ipc)?;
-        let events = IpcClient::connect(dir).await.map_err(ConnectError::from_ipc)?;
+        let requests = IpcClient::connect(dir)
+            .await
+            .map_err(ConnectError::from_ipc)?;
+        let events = IpcClient::connect(dir)
+            .await
+            .map_err(ConnectError::from_ipc)?;
 
         let (tx, rx) = mpsc::channel(REQUEST_QUEUE_DEPTH);
         tauri::async_runtime::spawn(pump_requests(requests, rx, notifier.clone()));
@@ -163,7 +167,9 @@ async fn pump_events(mut client: IpcClient, notifier: std::sync::Arc<dyn Notifie
     match client.call(Request::Subscribe).await {
         Ok(Response::Ok) => {}
         Ok(other) => {
-            notifier.disconnected(format!("the agent refused the event subscription: {other:?}"));
+            notifier.disconnected(format!(
+                "the agent refused the event subscription: {other:?}"
+            ));
             return;
         }
         Err(e) => {

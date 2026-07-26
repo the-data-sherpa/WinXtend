@@ -214,10 +214,7 @@ fn daemon_view(state: &AppState, connected: bool, message: Option<String>) -> Da
     };
     DaemonView {
         connected,
-        config_dir: state
-            .config_dir
-            .as_ref()
-            .map(|d| d.display().to_string()),
+        config_dir: state.config_dir.as_ref().map(|d| d.display().to_string()),
         endpoint: endpoint.as_ref().map(EndpointView::from),
         agent_path: spawn::find_agent().map(|p| p.display().to_string()),
         ui_version: UI_VERSION.to_string(),

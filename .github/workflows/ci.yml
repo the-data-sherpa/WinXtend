@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant, and
+# the matrix is slow enough that leaving stale runs going costs real minutes.
+# Never cancel on main: those runs are the record of what the branch built as.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Both jobs build and run code from the pull request; neither needs the token for
+# anything beyond checking the tree out.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The engine workspace, on all three targets. Five of the six platform backends
+  # have no hardware here, but they are compiled unconditionally (see the comment
+  # in crates/wx-platform/src/lib.rs) so a change to `traits` fails this job rather
+  # than rotting until someone finds the machine.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The tests bind sockets and exercise QUIC/mDNS paths; a hang would otherwise
+    # sit on GitHub's six-hour default, on three runners at once.
+    timeout-minutes: 30
+    strategy:
+      # One platform failing says nothing about the other two, and knowing which
+      # of them are also broken is the whole point of a matrix.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins `stable` with rustfmt and clippy, so the action
+      # is given no `toolchain` input on purpose: the file is the single source.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # PR runs restore but never save: each save is a multi-hundred-MB entry, and
+      # a busy PR period would evict the main-branch caches they restore from.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Formatting is platform-independent; checking it three times only buys
+      # three copies of the same answer.
+      - name: cargo fmt
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      # `-D warnings` is deliberate and stays. Lints fire per-target because the
+      # `cfg` blocks differ, so a warning that only exists on one OS is exactly
+      # what this matrix is for; fix the lint rather than relaxing the flag.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No --include-ignored: the windows_capture_smoke tests need an interactive
+      # desktop session that a runner does not have.
+      - name: cargo test
+        run: cargo test --workspace
+
+  # ui/src-tauri is its own workspace on purpose (see its Cargo.toml), so the
+  # root `--workspace` above does not reach it. Linux only: the Tauri toolchain
+  # is the slowest thing here and the crate holds no platform-specific code.
+  ui:
+    name: ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      - name: npm test
+        working-directory: ui
+        run: npm test
+
+      # Tauri links against the system webview and tray stack; without these the
+      # crate does not even compile, let alone run its tests.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ui/src-tauri/.cargo/config.toml redirects target-dir to ../../target/ui,
+      # so the cache has to be told where the artefacts actually land.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/src-tauri -> ../../target/ui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # This workspace is not reached by the root `cargo fmt --all` either, so it
+      # gets its own format gate, in the same fmt-clippy-test order as above.
+      - name: cargo fmt (ui)
+        working-directory: ui/src-tauri
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (ui)
+        working-directory: ui/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (ui)
+        working-directory: ui/src-tauri
+        run: cargo test

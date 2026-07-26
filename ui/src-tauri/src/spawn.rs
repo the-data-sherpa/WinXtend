@@ -138,7 +138,10 @@ mod tests {
             Some(Path::new("C:/Program Files/WinXtend")),
             Path::new("C:/src/WinXtend/ui/src-tauri"),
         );
-        assert_eq!(list[0], Path::new("C:/Program Files/WinXtend").join(AGENT_EXE));
+        assert_eq!(
+            list[0],
+            Path::new("C:/Program Files/WinXtend").join(AGENT_EXE)
+        );
         assert!(list.len() > 1, "development fallbacks are still offered");
     }
 
@@ -171,14 +174,15 @@ mod tests {
     async fn waiting_for_an_agent_that_never_starts_gives_up_instead_of_hanging() {
         let dir = std::env::temp_dir().join(format!("winxtend-ui-none-{}", std::process::id()));
         assert!(
-            wait_for_endpoint(&dir, Duration::from_secs(2)).await.is_none(),
+            wait_for_endpoint(&dir, Duration::from_secs(2))
+                .await
+                .is_none(),
             "a directory with no endpoint file must time out"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_endpoint_file_that_is_already_there_is_returned_without_waiting()
-    {
+    async fn an_endpoint_file_that_is_already_there_is_returned_without_waiting() {
         let dir = std::env::temp_dir().join(format!("winxtend-ui-ready-{}", std::process::id()));
         let file = EndpointFile {
             port: 40404,
