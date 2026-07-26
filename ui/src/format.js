@@ -108,11 +108,18 @@ export function capabilityLabels(bits) {
 }
 
 /// The same list as one line, for a row under a machine's name.
-export function capabilitiesText(bits) {
+///
+/// An empty set means two different things, and `connected` — whether the machine
+/// has completed a handshake — is what tells them apart. A peer that has only been
+/// discovered has claimed nothing yet; one that has introduced itself and claimed
+/// no bits is reporting that it can do nothing, which is the ordinary case for
+/// every Linux and macOS peer in this build rather than an oddity. `Capabilities`
+/// in crates/wx-proto/src/caps.rs draws the same distinction, describing an empty
+/// set as "nothing".
+export function capabilitiesText(bits, connected = false) {
   const labels = capabilityLabels(bits);
-  // A peer that has not completed a handshake has claimed nothing yet, which is
-  // different from a machine that claims it can do nothing.
-  return labels.length ? labels.join("  ·  ") : "Nothing reported yet";
+  if (labels.length) return labels.join("  ·  ");
+  return connected ? "Reports it can do nothing" : "Nothing reported yet";
 }
 
 /// Human form of a peer's connection state, plus the class the pill is styled with.

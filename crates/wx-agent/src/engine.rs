@@ -1041,33 +1041,49 @@ impl Engine {
                 self.execute(actions, Origin::Remote).await;
             }
             HotkeyAction::LockAll => {
-                let refused = self.broadcast_optional(
+                let mut unlocked = self.broadcast_optional(
                     Capabilities::SCREENSAVER_SYNC,
                     "lock the session",
                     ControlMsg::LockSession,
                 );
-                if !refused.is_empty() {
+                // This machine is asked the same question as a peer, and through the
+                // same check, because the notice below names the machines still on
+                // screen and this one is no less on screen for being the one the
+                // hotkey was pressed on.
+                let local = self.local;
+                let label = self.peer_label(local);
+                if !permit_optional(
+                    self.advertised_by(local),
+                    Capabilities::SCREENSAVER_SYNC,
+                    local,
+                    &label,
+                    "lock this session",
+                ) {
+                    unlocked.push(label);
+                } else if let Err(e) = self.platform.screensaver.lock_session() {
+                    tracing::warn!(error = %e, "could not lock this session");
+                    unlocked.push(label);
+                }
+                unlocked.sort();
+                if !unlocked.is_empty() {
                     // The hotkey is invisible by design, so a machine left unlocked
                     // would otherwise be discovered by walking over to it and
                     // finding the desktop still on screen.
                     self.notice(
                         ipc::NoticeLevel::Warning,
-                        if refused.len() == 1 {
+                        if unlocked.len() == 1 {
                             format!(
                                 "{} was left unlocked: it cannot lock its own session",
-                                refused[0]
+                                unlocked[0]
                             )
                         } else {
                             format!(
                                 "These machines were left unlocked, because they cannot lock \
                                  their own sessions: {}",
-                                refused.join(", ")
+                                unlocked.join(", ")
                             )
                         },
                     );
-                }
-                if let Err(e) = self.platform.screensaver.lock_session() {
-                    tracing::warn!(error = %e, "could not lock this session");
                 }
             }
         }
@@ -1562,10 +1578,7 @@ impl Engine {
                     ipc::NoticeLevel::Warning,
                     format!(
                         "{} disconnected while holding the cursor; control returned here",
-                        self.state
-                            .peer(&node)
-                            .map(|p| p.display_name().to_string())
-                            .unwrap_or_else(|| node.short())
+                        self.peer_label(node)
                     ),
                 );
             }
@@ -1784,11 +1797,7 @@ impl Engine {
             // the peer is not immediately redialled into the same silence.
             self.state
                 .on_disconnected(owner, Some("stopped responding".into()), now);
-            let name = self
-                .state
-                .peer(&owner)
-                .map(|p| p.display_name().to_string())
-                .unwrap_or_else(|| owner.short());
+            let name = self.peer_label(owner);
             self.notice(
                 ipc::NoticeLevel::Warning,
                 format!("{name} stopped responding; control returned here"),
@@ -1857,11 +1866,7 @@ impl Engine {
         }
         self.state
             .on_disconnected(driver, Some("stopped responding".into()), now);
-        let name = self
-            .state
-            .peer(&driver)
-            .map(|p| p.display_name().to_string())
-            .unwrap_or_else(|| driver.short());
+        let name = self.peer_label(driver);
         self.notice(
             ipc::NoticeLevel::Warning,
             format!("{name} stopped responding; the keys it was holding were released"),

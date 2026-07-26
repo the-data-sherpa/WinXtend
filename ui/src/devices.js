@@ -243,11 +243,11 @@ function nameCell(peer) {
 /// cannot see the reason for is no better than the silent failure it replaced. It is
 /// also the cheapest guard against the software claiming something it cannot do: an
 /// untrue line here is visible on the first screen of the app.
-function capabilityRow(bits) {
+function capabilityRow(bits, connected) {
   return h(
     "div",
     { class: "facts capabilities", title: "What this machine has told the others it can do" },
-    capabilitiesText(bits)
+    capabilitiesText(bits, connected)
   );
 }
 
@@ -347,7 +347,7 @@ function peerRow(peer) {
       { class: "device-main" },
       nameCell(peer),
       h("div", { class: "facts" }, facts.join("  ·  ")),
-      capabilityRow(peer.capabilities)
+      capabilityRow(peer.capabilities, peer.status?.state === "connected")
     ),
     h(
       "div",
@@ -390,7 +390,7 @@ function localRow() {
           `port ${status.port}`,
         ].join("  ·  ")
       ),
-      capabilityRow(status.capabilities)
+      capabilityRow(status.capabilities, true)
     ),
     h(
       "div",

@@ -54,7 +54,7 @@ function localPanel() {
       // Saying so beats a switch that silently does nothing.
       status.autostart ? "yes" : "no, run wx-agent --install to change that",
     ],
-    ["Can do", capabilitiesText(status.capabilities)],
+    ["Can do", capabilitiesText(status.capabilities, true)],
     [
       "Displays",
       status.monitors.length

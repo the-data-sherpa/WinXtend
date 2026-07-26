@@ -31,11 +31,29 @@ describe("what a machine says it can do", () => {
   });
 
   it("says so when a machine has claimed nothing yet", () => {
-    // A peer that has been discovered but never connected, which is not the same
-    // as a machine that reports it can do nothing.
+    // A peer that has been discovered but never connected, so nothing it can do is
+    // known either way.
     expect(capabilityLabels(0)).toEqual([]);
     expect(capabilitiesText(0)).toBe("Nothing reported yet");
     expect(capabilitiesText(undefined)).toBe("Nothing reported yet");
+    expect(capabilitiesText(0, false)).toBe("Nothing reported yet");
+  });
+
+  it("separates a machine that has not answered from one that reports nothing", () => {
+    // A connected peer advertising no bits has answered the question, and the
+    // answer is "nothing" — which every Linux and macOS peer in this build gives.
+    // Showing it as though it had never reported hides a real, actionable fact.
+    expect(capabilitiesText(0, true)).toBe("Reports it can do nothing");
+    expect(capabilitiesText(undefined, true)).toBe("Reports it can do nothing");
+    expect(capabilitiesText(0, true)).not.toBe(capabilitiesText(0, false));
+  });
+
+  it("names the bits the same way whether or not the machine is connected", () => {
+    // Connection state only decides the wording of the empty case; it must not
+    // change what a machine that did claim something is said to be able to do.
+    expect(capabilitiesText(CAPTURE_INPUT | INJECT_INPUT, true)).toBe(
+      capabilitiesText(CAPTURE_INPUT | INJECT_INPUT, false)
+    );
   });
 
   it("reports a bit it has never heard of rather than hiding it", () => {
