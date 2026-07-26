@@ -192,8 +192,7 @@ mod tests {
         assert!(
             problems
                 .iter()
-                .any(|p| p.kind == ProblemKind::Degenerate
-                    && p.refs[0].node == node(2)),
+                .any(|p| p.kind == ProblemKind::Degenerate && p.refs[0].node == node(2)),
             "{problems:?}"
         );
     }
