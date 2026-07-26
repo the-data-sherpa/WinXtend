@@ -63,8 +63,11 @@ impl Capabilities {
 
     /// Capabilities both nodes share.
     ///
-    /// The basis for every feature decision: clipboard images are only attempted
-    /// when both ends advertise them, and so on.
+    /// For reporting what two machines have in common. It is not where a feature
+    /// is permitted or refused: that is done one machine at a time, by
+    /// `Engine::peer_supports` in `crates/wx-agent/src/engine.rs`, so that the
+    /// refusal can name which machine was missing which bit. A feature needing
+    /// both ends — clipboard images, say — asks about each end in turn.
     pub const fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }

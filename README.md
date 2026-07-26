@@ -159,8 +159,9 @@ second machine.
 | Automatic first-pass layout on pairing | ✅ |
 | Visual layout editor | ✅ |
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
+| Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
-| File transfer | ❌ capability is advertised but does nothing |
+| File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ⚠️ passthrough only, no real codec |
 | Relay for cross-NAT / VPN | ❌ not started |
 | Wayland | ❌ the reason to pick this over Synergy, still to do |
@@ -215,7 +216,7 @@ alongside the identity key and trust store. The QUIC listener defaults to port
 |---|---|
 | `Ctrl+Alt+Super+L` | Pin the cursor to this machine. The one hotkey that has to exist — full-screen games and VMs are exactly where sliding onto another machine is never what you meant. |
 | `Ctrl+Alt+Super+Home` | Reclaim a cursor stranded on a machine that has stopped responding. |
-| `Ctrl+Alt+Super+K` | Lock every machine on the desk at once. |
+| `Ctrl+Alt+Super+K` | Lock every machine on the desk at once. A machine that has not advertised that it can lock itself is named in a warning rather than silently left running. |
 
 `Super` is the Windows key, or Command on macOS. All three are configurable.
 
@@ -253,7 +254,7 @@ that it can be argued with; please do.
 cargo test --workspace                    # everything
 cargo test -p wx-core                     # layout and routing, no I/O needed
 cargo clippy --workspace --all-targets    # clean
-cd ui && npm test                         # layout-editor snapping geometry
+cd ui && npm test                         # layout-editor geometry, status formatting
 ```
 
 The cargo commands above stop at the engine workspace; the Tauri crate has its own
@@ -272,12 +273,11 @@ Roughly in order of value:
 
 1. **Validate between two physical Windows machines.** Nothing here is trustworthy
    until a cursor actually crosses a real network.
-2. **Stop advertising `FILE_TRANSFER`**, which currently does nothing.
-3. **Wire clipboard sync into the agent.** The platform side already works.
-4. **macOS backend**, then **Wayland** — Wayland being the standing gap in every
+2. **Wire clipboard sync into the agent.** The platform side already works.
+3. **macOS backend**, then **Wayland** — Wayland being the standing gap in every
    tool in this space, and the strongest reason to prefer this one.
-5. A real video codec behind the existing `Encoder` seam.
-6. A relay for machines on different networks or across a VPN.
+4. A real video codec behind the existing `Encoder` seam.
+5. A relay for machines on different networks or across a VPN.
 
 ## Prior art
 

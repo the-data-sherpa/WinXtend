@@ -290,7 +290,10 @@ pub enum Request {
         #[serde(default = "half")]
         y: f64,
     },
-    /// Lock this session and ask every connected peer to lock theirs.
+    /// Lock this session and every connected peer's, skipping any machine — this
+    /// one included — that has not advertised `SCREENSAVER_SYNC`. The machines
+    /// left unlocked are named in a warning [`Event::Notice`], since the point of
+    /// the request is knowing that nothing is still on screen.
     LockAll,
     GetConfig,
     SetNodeName {
