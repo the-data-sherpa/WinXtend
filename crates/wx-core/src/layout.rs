@@ -217,7 +217,7 @@ impl GlobalLayout {
             let offset = perpendicular_offset(r, exit, edge);
 
             if offset == 0.0 {
-                let better = covering.map_or(true, |(g, _, _)| gap < g);
+                let better = covering.is_none_or(|(g, _, _)| gap < g);
                 if better {
                     covering = Some((gap, pl.monitor, r));
                 }
@@ -225,7 +225,7 @@ impl GlobalLayout {
             // Ranked by gap plus offset so a screen straight ahead beats one the
             // same distance away but far off to the side.
             let score = gap + offset;
-            let better = nearest.map_or(true, |(s, _, _)| score < s);
+            let better = nearest.is_none_or(|(s, _, _)| score < s);
             if better {
                 nearest = Some((score, pl.monitor, r));
             }
@@ -311,7 +311,7 @@ fn exit_edge(rect: Rect, from: Point, to: Point) -> Option<(Edge, Point)> {
         if !(0.0..=1.0).contains(&t) {
             return;
         }
-        if best.map_or(true, |(bt, _)| t < bt) {
+        if best.is_none_or(|(bt, _)| t < bt) {
             best = Some((t, edge));
         }
     };

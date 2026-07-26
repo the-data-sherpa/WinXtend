@@ -197,7 +197,8 @@ for what the next release is about.
 
 ## Building
 
-Requires **Rust 1.79+** and, for the UI, **Node 20+**.
+Requires **Rust 1.87+** and, for the UI, **Node 20+**. No system development
+packages are needed: the Wayland portal path speaks D-Bus and libei in pure Rust.
 
 ```bash
 git clone git@github.com:the-data-sherpa/WinXtend.git
