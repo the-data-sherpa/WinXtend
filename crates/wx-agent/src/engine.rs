@@ -3258,6 +3258,33 @@ mod tests {
     }
 
     #[test]
+    fn what_a_node_advertises_follows_the_permission_it_holds_now() {
+        // On Wayland input permission arrives — and vanishes — long after startup,
+        // so what peers are told has to come from the live set rather than from the
+        // `PlatformInfo` fixed when the backend was built. Reading the startup value
+        // here would leave a node whose portal session was revoked still inviting
+        // peers to push their cursor onto it.
+        let platform = wx_platform::current_platform().unwrap();
+        let screens = [mon(0, 0, 1920)];
+
+        platform
+            .live_capabilities
+            .set(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT);
+        let granted = capabilities_for(&platform, &screens);
+        assert!(granted.contains(Capabilities::CAPTURE_INPUT));
+        assert!(granted.contains(Capabilities::INJECT_INPUT));
+
+        platform.live_capabilities.set(Capabilities::NONE);
+        let revoked = capabilities_for(&platform, &screens);
+        assert!(!revoked.contains(Capabilities::CAPTURE_INPUT));
+        assert!(!revoked.contains(Capabilities::INJECT_INPUT));
+        assert!(
+            revoked.contains(Capabilities::HAS_DISPLAYS),
+            "screens are not a portal permission and must survive a revocation"
+        );
+    }
+
+    #[test]
     fn a_full_reclaim_path_routes_input_locally_again() {
         // End to end over the pure pieces: the cursor is on a peer, the peer dies,
         // and the next mouse movement has to reach this machine.
