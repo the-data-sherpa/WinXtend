@@ -81,6 +81,7 @@ pub fn backend() -> Result<PlatformBackend> {
             display_server: DisplayServer::Windows,
             capabilities: capabilities(has_displays),
         },
+        live_capabilities: crate::LiveCapabilities::fixed(capabilities(has_displays)),
         displays: Box::new(displays),
         capture: Box::new(WindowsCapture::new()),
         injector: Box::new(WindowsInjector::new()),

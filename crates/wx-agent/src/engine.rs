@@ -671,7 +671,11 @@ impl Engine {
             "starting WinXtend agent {AGENT_VERSION}"
         );
 
-        let platform = wx_platform::current_platform()?;
+        // `current_platform_in` rather than `current_platform`: this is the daemon,
+        // so it is the one caller allowed to acquire OS permissions — on Wayland,
+        // the portal consent dialog — and the config directory is where the backend
+        // keeps what it needs between runs.
+        let platform = wx_platform::current_platform_in(&config_dir)?;
         let monitors = platform.displays.monitors().unwrap_or_else(|e| {
             // Not fatal. A node with no readable displays still forwards input to
             // its peers, and taking the whole machine out of the mesh over a
@@ -1405,6 +1409,25 @@ impl Engine {
                     tracing::warn!(error = %e, "could not release input after a yield");
                 }
             }
+            ControlMsg::CapabilitiesChanged { capabilities } => {
+                // A peer whose portal session was revoked, most likely. Recording it
+                // is what stops this machine from routing the cursor onto one that
+                // can no longer accept it.
+                let now = Instant::now();
+                let name = self
+                    .state
+                    .peer(&node)
+                    .map(|p| p.advertised_name.clone())
+                    .unwrap_or_default();
+                if let Some(info) = self.state.entry(node, &name, now).info.as_mut() {
+                    if info.capabilities == capabilities {
+                        return;
+                    }
+                    tracing::info!(peer = %node, capabilities = capabilities.0, "a peer's capabilities changed");
+                    info.capabilities = capabilities;
+                }
+                self.publish_peer(node);
+            }
             ControlMsg::MonitorsChanged { monitors } => {
                 let now = Instant::now();
                 let name = self
@@ -1890,6 +1913,62 @@ impl Engine {
         self.publish_peer(driver);
     }
 
+    /// Notice that what this machine can do has changed, and tell everyone.
+    ///
+    /// Separate from the display check above, because the two change for unrelated
+    /// reasons. A Wayland node loses `CAPTURE_INPUT` and `INJECT_INPUT` the moment
+    /// the portal revokes its session — screen locked, dialog dismissed, session
+    /// expired — with every monitor still exactly where it was. Left to the display
+    /// path, that would go unannounced until somebody unplugged something.
+    ///
+    /// Polled rather than pushed: the backend that loses a permission is on its own
+    /// thread with no route into this loop, and a tick is soon enough for a change
+    /// the user just made by hand.
+    fn sync_capabilities(&mut self) {
+        let now = capabilities_for(&self.platform, self.state.local_monitors());
+        let before = {
+            let mut info = self.local_info.lock().expect("local info lock");
+            let before = info.capabilities;
+            info.capabilities = now;
+            before
+        };
+        if before == now {
+            return;
+        }
+
+        let lost = Capabilities(before.0 & !now.0);
+        tracing::info!(
+            before = before.0,
+            now = now.0,
+            "local capabilities changed; re-advertising"
+        );
+        self.broadcast_control(ControlMsg::CapabilitiesChanged { capabilities: now });
+
+        if lost.contains(Capabilities::CAPTURE_INPUT) {
+            // Stopped, not restarted. The usual reason to lose this is a user who
+            // refused, and a daemon that answered by asking again would put the
+            // consent dialog back on their screen forever.
+            if let Err(e) = self.platform.capture.stop() {
+                tracing::debug!(error = %e, "input capture was already stopped");
+            }
+            tracing::warn!("this machine can no longer capture input");
+            self.notice(
+                ipc::NoticeLevel::Warning,
+                "this machine can no longer send input to other machines".to_string(),
+            );
+        }
+        if lost.contains(Capabilities::INJECT_INPUT) {
+            // Whatever a peer was holding down here is never coming up on its own.
+            if let Err(e) = self.platform.injector.release_all() {
+                tracing::debug!(error = %e, "nothing to release");
+            }
+            self.notice(
+                ipc::NoticeLevel::Warning,
+                "this machine can no longer be controlled by other machines".to_string(),
+            );
+        }
+    }
+
     async fn on_tick(&mut self) {
         let now = Instant::now();
 
@@ -1898,9 +1977,13 @@ impl Engine {
             if self.state.set_local_monitors(monitors.clone()) {
                 tracing::info!(count = monitors.len(), "local displays changed");
                 {
+                    // Capabilities are deliberately not touched here: unplugging the
+                    // last display drops `HAS_DISPLAYS`, and `sync_capabilities`
+                    // below is the one place that notices and tells peers. Setting
+                    // them here as well would make that call see no change and stay
+                    // quiet.
                     let mut info = self.local_info.lock().expect("local info lock");
                     info.monitors = monitors.clone();
-                    info.capabilities = capabilities_for(&self.platform, &monitors);
                 }
                 let mut layout = self.router.layout().clone();
                 if needs_placement(&layout, self.local, &monitors)
@@ -1916,6 +1999,8 @@ impl Engine {
                 });
             }
         }
+
+        self.sync_capabilities();
 
         // Round-trip times, for the UI and for diagnosing a slow link.
         let rtts: Vec<(NodeId, Duration)> = self
@@ -2567,7 +2652,10 @@ impl Engine {
 /// the lid shut and no external screen would otherwise advertise `HAS_DISPLAYS`
 /// for the rest of the session, and peers would place monitors it does not have.
 fn capabilities_for(platform: &PlatformBackend, monitors: &[Monitor]) -> Capabilities {
-    with_displays(platform.info.capabilities, !monitors.is_empty())
+    // The live set, not `info.capabilities`: on Wayland input capture and injection
+    // exist only while the portal session does, and the value fixed at startup would
+    // keep telling peers this machine can drive them after the user revoked it.
+    with_displays(platform.current_capabilities(), !monitors.is_empty())
 }
 
 /// `base` with `HAS_DISPLAYS` set to match whether a screen is actually attached.

@@ -270,6 +270,23 @@ pub enum ControlMsg {
     Goodbye {
         reason: String,
     },
+
+    /// What this node can do has changed since it said hello.
+    ///
+    /// [`ControlMsg::Hello`] carries the answer that was true when the connection
+    /// opened, and on most platforms that answer never changes. On Wayland it does:
+    /// input capture and injection depend on an `xdg-desktop-portal` session the
+    /// compositor may revoke at any moment, and a peer that never heard about it
+    /// would keep routing the cursor onto a machine that has stopped being able to
+    /// accept it.
+    ///
+    /// Appended to the end of the enum rather than grouped with the other
+    /// node-description messages, because the wire format is positional: inserting a
+    /// variant anywhere else would renumber every one after it and break peers on an
+    /// older build.
+    CapabilitiesChanged {
+        capabilities: Capabilities,
+    },
 }
 
 #[cfg(test)]
@@ -416,6 +433,37 @@ mod tests {
             transfer_id: 1,
             error: Some("permission denied".into()),
         });
+    }
+
+    #[test]
+    fn a_capability_change_round_trips() {
+        round_trip(&ControlMsg::CapabilitiesChanged {
+            capabilities: Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT,
+        });
+        // A Wayland node whose portal session was revoked: it keeps its displays and
+        // loses everything that needed permission.
+        round_trip(&ControlMsg::CapabilitiesChanged {
+            capabilities: Capabilities::HAS_DISPLAYS,
+        });
+    }
+
+    #[test]
+    fn appending_a_variant_did_not_renumber_the_existing_ones() {
+        // The wire format is positional, so a variant added anywhere but the end
+        // silently changes what every later one decodes as. This pins the tail.
+        let goodbye = postcard::to_allocvec(&ControlMsg::Goodbye {
+            reason: "bye".into(),
+        })
+        .unwrap();
+        let changed = postcard::to_allocvec(&ControlMsg::CapabilitiesChanged {
+            capabilities: Capabilities::NONE,
+        })
+        .unwrap();
+        assert_eq!(
+            changed[0],
+            goodbye[0] + 1,
+            "CapabilitiesChanged must sit immediately after Goodbye"
+        );
     }
 
     #[test]

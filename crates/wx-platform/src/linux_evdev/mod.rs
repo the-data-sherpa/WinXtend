@@ -169,6 +169,7 @@ pub fn backend() -> Result<PlatformBackend> {
             display_server: DisplayServer::Headless,
             capabilities: Capabilities::NONE,
         },
+        live_capabilities: crate::LiveCapabilities::fixed(Capabilities::NONE),
         displays: Box::new(EvdevDisplays),
         capture: Box::new(EvdevCapture),
         injector: Box::new(EvdevInjector),
