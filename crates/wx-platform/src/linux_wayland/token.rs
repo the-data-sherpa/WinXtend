@@ -6,9 +6,13 @@
 //! WinXtend agent starts with the machine, so without this the user approves a dialog
 //! at every boot.
 //!
-//! It lives beside `identity.key` and `trusted-peers.toml` in the per-user config
-//! directory, written `0o600` for the same reason the identity key is: anyone holding
-//! it can silently re-acquire remote-control permission for this desktop.
+//! It lives under [`RESTORE_TOKEN_FILE`], beside `identity.key` and
+//! `trusted-peers.toml` in the per-user config directory, written `0o600` for the same
+//! reason the identity key is: anyone holding it can silently re-acquire
+//! remote-control permission for this desktop.
+//!
+//! Deleting the file is the supported way for a user to withdraw that standing
+//! consent: the next run finds nothing to present, and the desktop asks again.
 //!
 //! Plain text rather than TOML or JSON, because the content is one opaque string the
 //! portal gave us and never anything we parse.

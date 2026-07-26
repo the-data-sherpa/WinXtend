@@ -29,15 +29,17 @@
 //! that was the point of the redesign. Both go through
 //! `xdg-desktop-portal`'s `RemoteDesktop` interface, which means:
 //!
-//! * A **user consent dialog** on first use, and a session handle that the portal
-//!   can revoke at any moment. Losing it is reported as
-//!   [`PlatformError::PermissionDenied`] and drops the capture capability; it is
-//!   never retried in a loop against a user who said no. [`session`] owns that rule.
+//! * A **user consent dialog** the first time the agent runs, and a session handle
+//!   that the portal can revoke at any moment. Refusal and revocation are both final
+//!   for that run: they are reported as [`PlatformError::PermissionDenied`], the
+//!   input capabilities go away and the agent re-advertises the smaller set to its
+//!   peers, and nothing puts the dialog back on the user's screen. [`session`] owns
+//!   that rule.
 //! * A **restore token** persisted between runs, so the consent prompt appears once
 //!   rather than on every launch. Without it the product is unusable as a daemon.
-//!   [`token`] owns that.
+//!   [`token`] owns that, including how a user asks to be prompted again.
 //! * **libei** (`ei_*`) as the actual transport for events once the portal has
-//!   handed over a file descriptor. [`driver`] owns that.
+//!   handed over a file descriptor. The private `driver` module owns that.
 //!
 //! # One session, both directions
 //!
