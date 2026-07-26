@@ -26,11 +26,60 @@ Related: clippy's `-D warnings` fires per-target because those `cfg` blocks diff
 lint can be clean on Linux and fail on Windows or macOS (or the reverse — see `f41c426`).
 Fix the lint on the platform that reports it rather than dropping the flag.
 
-## The README's test count is right
+## A Linux test count below the README's is expected
 
-The README says 614 tests; a Linux run reports 523 passed, 1 ignored. That reconciles:
-`wx-platform` contributes 70 of its 160 on Linux (90 are Windows-gated), and
-523 + 90 + 1 = 614. It is a Windows-run number, not a stale one. Don't "fix" it.
+The README quotes a Windows-run total, so `cargo test --workspace` on Linux
+legitimately reports fewer. Three things account for the gap:
+
+- a large block of `wx-platform` tests is gated `#[cfg(target_os = "windows")]`
+  and does not run on Linux;
+- a smaller number of tests in `wx-platform`'s Wayland backend are gated
+  `cfg(target_os = "linux")` and do not run on Windows;
+- one test, in `crates/wx-agent/src/autostart.rs`, is
+  `#[cfg_attr(not(windows), ignore)]`, so anywhere but Windows it is counted as
+  ignored rather than passed.
+
+A Linux total below a Windows-run total is therefore expected, and is not evidence
+that a quoted number is stale or wrong. `cargo test --workspace` is the only
+authority on what the current figure is — don't copy one back into this file.
+
+## Testing Linux/Wayland backends without a second machine
+
+Wayland work (`crates/wx-platform/src/linux_wayland/`) can be exercised against a
+real compositor on one box, with no extra packages:
+
+- **Multi-monitor, mixed-DPI, hotplug** — run a private nested compositor on its
+  own D-Bus session, then drive it through Mutter's `DisplayConfig`:
+
+  ```sh
+  eval "$(dbus-daemon --session --print-address --fork --print-pid \
+    | { read a; read p; echo "export DBUS_SESSION_BUS_ADDRESS='$a'"; })"
+  gnome-shell --headless --wayland --wayland-display=wxtest \
+    --virtual-monitor 2560x1440 --virtual-monitor 1920x1080 &
+  # then run the client with WAYLAND_DISPLAY=wxtest
+  ```
+
+  `ApplyMonitorsConfig` on that bus changes scale, rotation and position live, and
+  applying a config that omits a monitor *is* an unplug as far as a client sees.
+  Note current gnome-shell has no `--nested`, and Mutter rejects negative logical
+  positions.
+
+- **Fractional scaling on the real session** — `GetCurrentState` /
+  `ApplyMonitorsConfig` on `org.gnome.Mutter.DisplayConfig` is the ground truth to
+  compare against; supported scales are listed per mode.
+
+- **Headless (CI)** — anything that opens a Wayland connection must skip, not
+  fail. Reproduce with
+  `env -u WAYLAND_DISPLAY -u DISPLAY -u XDG_SESSION_TYPE XDG_RUNTIME_DIR=$(mktemp -d) cargo test`.
+
+- **End-to-end without the UI** — `wx-agent --config-dir <scratch> --status`
+  prints the same `StatusSnapshot` the Tauri layout editor renders. Always pass
+  `--config-dir`; the default writes an identity key into the user's real config
+  directory. The UI honours `WINXTEND_CONFIG_DIR` and `WINXTEND_AGENT` for the
+  same reason.
+
+GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
+callers, so visual confirmation of the UI needs a human or a portal prompt.
 
 ## Maintaining this file
 

@@ -11,8 +11,10 @@
 //! It compiles on every target on purpose. It has no Apple dependencies yet, so
 //! including it in the Windows build is free and keeps it from rotting: a
 //! refactor of [`crate::traits`] breaks it immediately instead of six months later
-//! on someone's Mac. When real Core Graphics calls land, the *call sites* get
-//! gated, not the module.
+//! on someone's Mac. When real Core Graphics calls land, only the code that needs
+//! the Apple types gets `cfg`-gated — a submodule, or the call sites — and this
+//! module declaration stays unconditional; [`crate::linux_wayland`] is the worked
+//! example.
 //!
 //! # The permission wall, which dominates this backend
 //!

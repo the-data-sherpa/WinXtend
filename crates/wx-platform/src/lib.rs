@@ -11,7 +11,7 @@
 //! | Windows | `WH_KEYBOARD_LL` / `WH_MOUSE_LL` | `SendInput` | implemented |
 //! | macOS | `CGEventTap` | `CGEventPost` | skeleton |
 //! | Linux/X11 | XInput2 raw events | XTEST | skeleton |
-//! | Linux/Wayland | libei via portal | libei | skeleton |
+//! | Linux/Wayland | libei via portal | libei | displays implemented, input skeleton |
 //! | Linux headless | evdev | uinput | skeleton |
 //!
 //! Wayland matters: it is the default on current Fedora, Ubuntu, and Steam Deck,
@@ -42,10 +42,11 @@ pub mod keyres;
 pub mod traits;
 
 // Backend modules are declared unconditionally even though only one is ever used.
-// They contain no platform-specific dependencies yet, so compiling them everywhere
-// costs nothing and stops the skeletons rotting: a change to `traits` breaks them
-// here and now rather than months later on a machine nobody has. When real syscalls
-// land, the call sites get `cfg`-gated, not the module.
+// Compiling them everywhere stops the skeletons rotting: a change to `traits` breaks
+// them here and now rather than months later on a machine nobody has. Where a
+// backend has grown real platform dependencies — `linux_wayland` so far — the module
+// itself still compiles everywhere and only the submodule holding the OS types is
+// `cfg`-gated, so the interpretation around it stays unit-testable on any host.
 pub mod linux_evdev;
 pub mod linux_wayland;
 pub mod linux_x11;
