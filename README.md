@@ -256,6 +256,11 @@ cargo clippy --workspace --all-targets    # clean
 cd ui && npm test                         # layout-editor snapping geometry
 ```
 
+The cargo commands above stop at the engine workspace; the Tauri crate has its own
+`cargo clippy` and `cargo test`, run from `ui/src-tauri`.
+`.github/workflows/ci.yml` is the authoritative list of what every push and pull
+request is checked against, on Linux, Windows, and macOS.
+
 Tests are written to assert behaviour rather than implementation, and to cover the
 adversarial cases: hostile values off the wire, NaN, zero-size rectangles, integer
 overflow at coordinate extremes, datagram reordering, and frame boundaries split at
@@ -271,10 +276,8 @@ Roughly in order of value:
 3. **Wire clipboard sync into the agent.** The platform side already works.
 4. **macOS backend**, then **Wayland** — Wayland being the standing gap in every
    tool in this space, and the strongest reason to prefer this one.
-5. **CI across Windows, macOS, and Linux runners**, so the non-Windows backends
-   stop being unverifiable.
-6. A real video codec behind the existing `Encoder` seam.
-7. A relay for machines on different networks or across a VPN.
+5. A real video codec behind the existing `Encoder` seam.
+6. A relay for machines on different networks or across a VPN.
 
 ## Prior art
 
