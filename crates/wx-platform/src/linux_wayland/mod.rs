@@ -55,6 +55,16 @@
 //! of them. Display enumeration needs no portal, so a refusal must not take this
 //! machine's screens out of the layout.
 //!
+//! One thing to check before building capture on top of this. Every device this
+//! session offers is an *emulation* device — on GNOME 50 the seat produces "WinXtend
+//! virtual pointer", "WinXtend virtual keyboard" and "WinXtend shared virtual absolute
+//! pointer", which is the injection direction. `RemoteDesktop` is the portal for
+//! driving a desktop; the portal for *receiving* input is
+//! `org.freedesktop.portal.InputCapture`, which is present on the alpha target
+//! (version 1, `SupportedCapabilities` 15) and has a `ConnectToEIS` of its own.
+//! Whether capture can be served from this session or needs that one is the first
+//! question to settle in the capture slice, not an assumption to inherit.
+//!
 //! There is no global grab, so [`InputCapture::set_suppress_local`] cannot be
 //! implemented the way it is on X11 or Windows. The portal session itself is
 //! exclusive while active, which is the closest equivalent; a compositor that does
