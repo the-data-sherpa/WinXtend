@@ -151,15 +151,6 @@ impl PeerState {
             .unwrap_or(Capabilities::NONE)
     }
 
-    /// Whether this peer advertised a capability.
-    ///
-    /// A peer with no session has advertised nothing, so the answer is no. That is
-    /// the honest answer rather than a conservative one: there is no connection to
-    /// attempt the feature over either.
-    pub fn supports(&self, cap: Capabilities) -> bool {
-        self.capabilities().contains(cap)
-    }
-
     /// Whether this peer should participate in the mesh at all.
     pub fn is_eligible(&self) -> bool {
         self.paired && !self.blocked && self.enabled
@@ -265,19 +256,16 @@ impl AgentState {
     }
 
     /// What a peer says it can do, or nothing for a machine with no session.
+    ///
+    /// The one place a peer's advertised set is read from. Whether a feature is
+    /// permitted is asked in exactly one spelling, `Engine::peer_supports`, which
+    /// answers it from here; a second predicate at this level would be a seam a
+    /// caller could reach for that knows nothing about this machine.
     pub fn peer_capabilities(&self, node: NodeId) -> Capabilities {
         self.peers
             .get(&node)
             .map(PeerState::capabilities)
             .unwrap_or(Capabilities::NONE)
-    }
-
-    /// Whether a peer advertised a capability.
-    ///
-    /// The question every optional feature has to ask before it sends anything;
-    /// see `Engine::peer_supports`, which is where the asking is done.
-    pub fn peer_supports(&self, node: NodeId, cap: Capabilities) -> bool {
-        self.peer_capabilities(node).contains(cap)
     }
 
     /// Record what a peer now says it can do, reporting whether it changed.
@@ -907,11 +895,12 @@ mod tests {
         let (mut state, _, _) = state_with_peer(1, 2, now);
         state.on_session(info(2, vec![mon(0, 0, 0, 1920, 1080)]), true, now);
 
-        assert!(state.peer_supports(node(2), wx_proto::Capabilities::INJECT_INPUT));
-        assert!(state.peer_supports(node(2), wx_proto::Capabilities::HAS_DISPLAYS));
+        let caps = state.peer_capabilities(node(2));
+        assert!(caps.contains(wx_proto::Capabilities::INJECT_INPUT));
+        assert!(caps.contains(wx_proto::Capabilities::HAS_DISPLAYS));
         // Never advertised, so never assumed.
-        assert!(!state.peer_supports(node(2), wx_proto::Capabilities::CLIPBOARD_TEXT));
-        assert!(!state.peer_supports(node(2), wx_proto::Capabilities::SCREENSAVER_SYNC));
+        assert!(!caps.contains(wx_proto::Capabilities::CLIPBOARD_TEXT));
+        assert!(!caps.contains(wx_proto::Capabilities::SCREENSAVER_SYNC));
     }
 
     #[test]
@@ -925,9 +914,14 @@ mod tests {
             state.peer_capabilities(node(2)),
             wx_proto::Capabilities::NONE
         );
-        assert!(!state.peer_supports(node(2), wx_proto::Capabilities::INJECT_INPUT));
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(wx_proto::Capabilities::INJECT_INPUT));
         // And a machine that is not known at all is not a special case.
-        assert!(!state.peer_supports(node(7), wx_proto::Capabilities::INJECT_INPUT));
+        assert_eq!(
+            state.peer_capabilities(node(7)),
+            wx_proto::Capabilities::NONE
+        );
     }
 
     #[test]
@@ -941,7 +935,9 @@ mod tests {
 
         let reduced = wx_proto::Capabilities::CAPTURE_INPUT | wx_proto::Capabilities::INJECT_INPUT;
         assert!(state.set_peer_capabilities(node(2), reduced));
-        assert!(!state.peer_supports(node(2), wx_proto::Capabilities::HAS_DISPLAYS));
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(wx_proto::Capabilities::HAS_DISPLAYS));
         // An unchanged set is not reported as a change, so nothing downstream
         // re-renders or re-broadcasts on every tick.
         assert!(!state.set_peer_capabilities(node(2), reduced));

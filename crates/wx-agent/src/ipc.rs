@@ -291,9 +291,10 @@ pub enum Request {
         y: f64,
     },
     /// Lock this session and every connected peer's, skipping any machine — this
-    /// one included — that has not advertised `SCREENSAVER_SYNC`. The machines
-    /// left unlocked are named in a warning [`Event::Notice`], since the point of
-    /// the request is knowing that nothing is still on screen.
+    /// one included — that has not advertised `SCREENSAVER_SYNC`. The connected
+    /// machines left unlocked are named in a warning [`Event::Notice`]; a paired
+    /// machine that is currently offline or in dial backoff is neither sent the
+    /// request nor named, so this is not a guarantee that every machine is locked.
     LockAll,
     GetConfig,
     SetNodeName {
