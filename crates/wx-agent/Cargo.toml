@@ -39,4 +39,11 @@ thiserror.workspace = true
 getrandom = "0.3.4"
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Registry"] }
+# Win32_Security is not for security work: RegCreateKeyExW takes a
+# SECURITY_ATTRIBUTES pointer, so the windows crate gates it behind that feature
+# even though autostart passes NULL and inherits the default descriptor.
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+] }

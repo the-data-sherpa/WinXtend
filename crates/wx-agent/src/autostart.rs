@@ -114,11 +114,12 @@ fn unsupported() -> AutostartError {
 mod windows_impl {
     use super::{AutostartError, ENTRY_NAME};
     use std::path::PathBuf;
-    use windows::core::HSTRING;
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
     };
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -143,12 +144,56 @@ mod windows_impl {
         }
     }
 
-    fn open(
-        access: windows::Win32::System::Registry::REG_SAM_FLAGS,
-    ) -> Result<Key, AutostartError> {
+    /// Opens the Run key, or `Ok(None)` when the key itself does not exist.
+    ///
+    /// Windows creates `…\CurrentVersion\Run` lazily, so a user profile on which
+    /// nothing has ever registered a startup entry simply has no such key, and
+    /// `RegOpenKeyExW` answers `ERROR_FILE_NOT_FOUND`. For a reader that is not a
+    /// failure but an answer: a key that does not exist holds no entry, so the
+    /// honest result is "not registered" rather than an error. Reporting it as an
+    /// error made [`is_registered`] fail on exactly the clean profiles it is most
+    /// often asked about — including GitHub's Windows runners, whose freshly
+    /// provisioned profiles are how this was found.
+    fn open_existing(access: REG_SAM_FLAGS) -> Result<Option<Key>, AutostartError> {
         let mut key = HKEY::default();
         let path = HSTRING::from(RUN_KEY);
         let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, access, &mut key) };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(AutostartError::Os {
+                operation: "opening HKCU Run",
+                code: status.0,
+            });
+        }
+        Ok(Some(Key(key)))
+    }
+
+    /// Opens the Run key for writing, creating it when it is absent.
+    ///
+    /// A writer cannot treat the missing key as an answer the way a reader can:
+    /// registering has to work on a profile that has never registered anything.
+    /// `RegCreateKeyExW` opens the key when it exists and creates it when it does
+    /// not, which is why installing uses it rather than [`open_existing`].
+    fn open_or_create(access: REG_SAM_FLAGS) -> Result<Key, AutostartError> {
+        let mut key = HKEY::default();
+        let path = HSTRING::from(RUN_KEY);
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &path,
+                None,
+                PCWSTR::null(),
+                // Non-volatile: an autostart entry that vanished at reboot would
+                // be worse than none, because it would appear to work until then.
+                REG_OPTION_NON_VOLATILE,
+                access,
+                None,
+                &mut key,
+                None,
+            )
+        };
         if status != ERROR_SUCCESS {
             return Err(AutostartError::Os {
                 operation: "opening HKCU Run",
@@ -160,7 +205,7 @@ mod windows_impl {
 
     pub fn install() -> Result<PathBuf, AutostartError> {
         let (exe, command) = command_line()?;
-        let key = open(KEY_SET_VALUE)?;
+        let key = open_or_create(KEY_SET_VALUE)?;
         let name = HSTRING::from(ENTRY_NAME);
         // REG_SZ is a NUL-terminated wide string, and the terminator is part of
         // the value: without it Windows reads whatever follows in the buffer.
@@ -179,7 +224,11 @@ mod windows_impl {
     }
 
     pub fn uninstall() -> Result<(), AutostartError> {
-        let key = open(KEY_SET_VALUE)?;
+        // No key at all means no entry, which is the end state being asked for —
+        // the same reasoning as the ERROR_FILE_NOT_FOUND arm below.
+        let Some(key) = open_existing(KEY_SET_VALUE)? else {
+            return Ok(());
+        };
         let name = HSTRING::from(ENTRY_NAME);
         let status = unsafe { RegDeleteValueW(key.0, &name) };
         // Not installed is the desired end state, so it is success.
@@ -193,7 +242,9 @@ mod windows_impl {
     }
 
     pub fn is_registered() -> Result<bool, AutostartError> {
-        let key = open(KEY_QUERY_VALUE)?;
+        let Some(key) = open_existing(KEY_QUERY_VALUE)? else {
+            return Ok(false);
+        };
         let name = HSTRING::from(ENTRY_NAME);
         let mut len: u32 = 0;
         let status = unsafe { RegQueryValueExW(key.0, &name, None, None, None, Some(&mut len)) };
@@ -214,6 +265,53 @@ mod windows_impl {
 mod tests {
     use super::*;
 
+    /// Serialises every test that touches the one real `HKCU` autostart value,
+    /// and puts back what the developer had when the test ends.
+    ///
+    /// Both properties matter, and neither is a comment:
+    ///
+    /// * These tests share a single registry value. Cargo runs them on parallel
+    ///   threads by default, so without the lock one test's `uninstall` lands
+    ///   between another's `install` and its assertion. Holding the guard is the
+    ///   only supported way to reach the real registry from a test — a future
+    ///   test that mutates without it is the accident this exists to prevent.
+    /// * Restoring happens in `Drop`, so it survives a panic. The earlier version
+    ///   restored on the success path only, which meant a failing assertion left
+    ///   the developer's own autostart setting changed by a test run.
+    #[cfg(windows)]
+    struct RealRegistry {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        was: Option<bool>,
+    }
+
+    #[cfg(windows)]
+    impl RealRegistry {
+        fn acquire() -> Self {
+            static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Poison only means some other test panicked while holding this; the
+            // registry is not left inconsistent by that, so carry on.
+            let _guard = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+            // `.ok()` rather than `.unwrap()`: whether querying can fail is the
+            // very thing one of these tests asserts, and the guard must not be
+            // the thing that panics on it.
+            let was = is_registered().ok();
+            Self { _guard, was }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for RealRegistry {
+        fn drop(&mut self) {
+            // Errors are deliberately swallowed: a restore that fails must not
+            // replace the test's own failure with a less informative one.
+            let _ = match self.was {
+                Some(true) => install().map(|_| ()),
+                Some(false) => uninstall(),
+                None => Ok(()),
+            };
+        }
+    }
+
     #[test]
     fn a_platform_with_no_mechanism_says_what_to_do_instead() {
         // The point of the error text: an unsupported platform must tell the user
@@ -230,19 +328,24 @@ mod tests {
         #[cfg(windows)]
         {
             // Windows has a real implementation; querying it must not error even
-            // when nothing is registered.
-            assert!(is_registered().is_ok());
+            // when nothing is registered — including on a profile so clean that
+            // the Run key itself has never been created. `expect` rather than
+            // `assert!(….is_ok())` so the failure names the OS error: the bare
+            // assertion cost several CI runs to diagnose once.
+            let _real = RealRegistry::acquire();
+            is_registered().expect("querying autostart must not error when nothing is registered");
         }
     }
 
     #[test]
     #[cfg_attr(not(windows), ignore = "no autostart mechanism on this platform")]
     fn registering_is_idempotent_and_removable() {
-        // Touches the real registry, but only HKCU and only this one value, and it
-        // restores whatever it found.
+        // Touches the real registry, but only HKCU and only this one value.
+        // `RealRegistry` serialises it against the other tests and restores
+        // whatever it found, even if an assertion below panics.
         #[cfg(windows)]
         {
-            let was = is_registered().unwrap();
+            let _real = RealRegistry::acquire();
             install().unwrap();
             assert!(is_registered().unwrap());
             install().unwrap();
@@ -251,9 +354,37 @@ mod tests {
             assert!(!is_registered().unwrap());
             // Removing twice is not an error: the desired end state is reached.
             uninstall().unwrap();
-            if was {
-                install().unwrap();
-            }
+        }
+    }
+
+    /// Guards the property that actually broke CI, on every platform.
+    ///
+    /// Asking whether autostart is registered is a question about *this* profile,
+    /// and "nothing has ever been registered here" is an answer to it, not a
+    /// failure to answer. On Windows that means an absent Run key reads as
+    /// `Ok(false)`; on a platform with no mechanism at all it means a refusal
+    /// that still says what to do by hand. Neither may be an unexplained error.
+    #[test]
+    fn asking_about_a_profile_that_has_never_registered_anything_is_answerable() {
+        #[cfg(windows)]
+        {
+            let _real = RealRegistry::acquire();
+            // Remove the value, so the query below runs against a profile with
+            // nothing registered — the state a fresh install is asked about.
+            uninstall().unwrap();
+            assert!(
+                !is_registered().unwrap(),
+                "with nothing registered the answer is a plain no"
+            );
+            // And installing must work from that state rather than failing for
+            // want of a key: `RegCreateKeyExW` creates it when it is missing.
+            install().unwrap();
+            assert!(is_registered().unwrap());
+        }
+        #[cfg(not(windows))]
+        {
+            let err = is_registered().unwrap_err();
+            assert!(matches!(err, AutostartError::Unsupported { .. }), "{err}");
         }
     }
 }

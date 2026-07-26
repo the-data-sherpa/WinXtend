@@ -81,6 +81,16 @@ real compositor on one box, with no extra packages:
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
 
+## Windows-only code can be checked from Linux
+
+`cargo check --target x86_64-pc-windows-msvc` needs no MSVC toolchain (checking does not
+link), but the root workspace still fails: `aws-lc-sys`/`ring` build scripts want `lib.exe`.
+To validate a `cfg(windows)` block without waiting for CI, copy the module into a throwaway
+crate whose only dependency is `windows`, and run clippy against that target — `--all-targets`
+covers `cfg(test)` code too, so the Windows tests get compiled as well. This turns a
+push-and-wait CI loop into a local one. It proves compilation and lints, not behaviour;
+anything touching the real registry, clipboard, or desktop still needs a Windows run.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
