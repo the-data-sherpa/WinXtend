@@ -9,6 +9,7 @@
 import { callOk, changed, disconnect, log, refreshStatus, store } from "./agent.js";
 import { h, replace } from "./dom.js";
 import {
+  capabilitiesText,
   clockTime,
   connectionState,
   displayServerLabel,
@@ -53,6 +54,7 @@ function localPanel() {
       // Saying so beats a switch that silently does nothing.
       status.autostart ? "yes" : "no, run wx-agent --install to change that",
     ],
+    ["Can do", capabilitiesText(status.capabilities)],
     [
       "Displays",
       status.monitors.length

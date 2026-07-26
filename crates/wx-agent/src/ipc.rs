@@ -503,6 +503,12 @@ pub struct PeerSnapshot {
     #[serde(default)]
     pub rtt_ms: Option<u64>,
     pub monitors: Vec<MonitorSpec>,
+    /// Raw [`wx_proto::Capabilities`] bits this peer advertised, zero before it has
+    /// introduced itself. Raw for the same reason the local set is (see
+    /// [`StatusSnapshot::capabilities`]), and present at all so the UI can show what
+    /// each machine will actually do rather than what the software wishes it would.
+    #[serde(default)]
+    pub capabilities: u32,
 }
 
 impl PeerSnapshot {
@@ -523,6 +529,7 @@ impl PeerSnapshot {
             agent_version: peer.info.as_ref().map(|i| i.agent_version.clone()),
             rtt_ms: peer.rtt.map(|d| d.as_millis() as u64),
             monitors: peer.monitors().iter().map(MonitorSpec::of).collect(),
+            capabilities: peer.capabilities().0,
         }
     }
 }
@@ -1332,6 +1339,9 @@ mod tests {
                 agent_version: Some("0.1.0".into()),
                 rtt_ms: Some(3),
                 monitors: vec![],
+                capabilities: (wx_proto::Capabilities::CAPTURE_INPUT
+                    | wx_proto::Capabilities::INJECT_INPUT)
+                    .0,
             }],
         };
         let msg = ServerMessage::Response {

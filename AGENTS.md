@@ -91,6 +91,25 @@ covers `cfg(test)` code too, so the Windows tests get compiled as well. This tur
 push-and-wait CI loop into a local one. It proves compilation and lints, not behaviour;
 anything touching the real registry, clipboard, or desktop still needs a Windows run.
 
+## Capability negotiation is enforced, not just advertised
+
+- **Protocol enums and capability bits are append-only.** postcard encodes variants by
+  index, so deleting one silently reinterprets every older peer's messages. Stop
+  *advertising* a capability rather than removing it — see the note at the top of
+  `crates/wx-proto/src/lib.rs`.
+- **Optional features are gated on what the peer advertised, before they send.**
+  `Engine::peer_supports` / `send_optional` / `broadcast_optional` in
+  `crates/wx-agent/src/engine.rs` are that seam, and a refusal is a `warn` naming the
+  machine and the capability, never a silent drop. A peer's advertised set lives on
+  `PeerState` in `crates/wx-agent/src/state.rs`. The Linux backends land one capability
+  at a time, so a partially capable peer is the normal case during the alpha, not a bug.
+- **This machine is asked the same question as a peer.** A backend that implements
+  `lock_session` without also advertising `SCREENSAVER_SYNC` silently stops locking its
+  own screen — implement and advertise together.
+- **`ControlMsg::MonitorsChanged` carries monitors and not capabilities.** Both sides
+  therefore derive `HAS_DISPLAYS` from the monitor list, through `with_displays` in
+  `engine.rs`. Keep it as one rule in one place.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

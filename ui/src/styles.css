@@ -451,6 +451,14 @@ button:focus-visible,
   overflow-wrap: anywhere;
 }
 
+/* What a machine says it can do, set apart from the identifying facts above it:
+   the agent refuses features a machine has not advertised, so this line is the
+   explanation for a refusal and has to be findable without being loud. */
+.capabilities {
+  margin-top: 2px;
+  font-style: italic;
+}
+
 .device-state {
   display: flex;
   flex-direction: column;

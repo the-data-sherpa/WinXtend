@@ -42,12 +42,18 @@ use crate::{PlatformBackend, PlatformInfo};
 /// 0 with `SeTcbPrivilege` to reach the secure desktop, and advertising it from an
 /// ordinary user process would make peers believe input will keep working across a
 /// UAC prompt when it silently will not.
+///
+/// `FILE_TRANSFER` is not claimed either, and for the same reason: nothing in this
+/// build implements the `FileTransfer*` half of the protocol, so a peer that took
+/// the claim at face value would offer a file and wait forever for an answer that
+/// no code path produces. The capability bit and the wire variants stay defined —
+/// protocol enums are append-only — but this machine does not pretend to speak
+/// them.
 fn capabilities(has_displays: bool) -> Capabilities {
     let mut caps = Capabilities::CAPTURE_INPUT
         | Capabilities::INJECT_INPUT
         | Capabilities::CLIPBOARD_TEXT
         | Capabilities::CLIPBOARD_IMAGE
-        | Capabilities::FILE_TRANSFER
         | Capabilities::SCREENSAVER_SYNC;
     if has_displays {
         caps = caps.union(Capabilities::HAS_DISPLAYS);
@@ -98,6 +104,15 @@ mod tests {
         // Claiming it would promise input across UAC prompts that this process
         // cannot deliver.
         assert!(!capabilities(true).contains(Capabilities::PRIVILEGED_INJECT));
+    }
+
+    #[test]
+    fn file_transfer_is_never_claimed_because_nothing_implements_it() {
+        // No `FileTransfer*` message is handled anywhere in the agent, so a peer
+        // that believed this claim would offer a file and wait for an answer that
+        // no code path produces.
+        assert!(!capabilities(true).contains(Capabilities::FILE_TRANSFER));
+        assert!(!capabilities(false).contains(Capabilities::FILE_TRANSFER));
     }
 
     #[test]
