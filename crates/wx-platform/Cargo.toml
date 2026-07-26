@@ -16,8 +16,6 @@ windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31.15"
-# Exact, not caret: 0.32.13 is edition 2024 / rust-version 1.86 and would silently
-# break the workspace rust-version of 1.79 the first time anything re-resolves.
-wayland-protocols = { version = "=0.32.12", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "unstable"] }
 # Already in the tree via wayland-backend; a direct edge adds no crate to the build.
 rustix = { version = "1.1.4", features = ["event"] }
