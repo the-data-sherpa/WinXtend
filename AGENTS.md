@@ -26,11 +26,23 @@ Related: clippy's `-D warnings` fires per-target because those `cfg` blocks diff
 lint can be clean on Linux and fail on Windows or macOS (or the reverse — see `f41c426`).
 Fix the lint on the platform that reports it rather than dropping the flag.
 
-## The README's test count is right
+## A Linux test count below the README's is expected
 
-The README says 614 tests; a Linux run reports 523 passed, 1 ignored. That reconciles:
-`wx-platform` contributes 70 of its 160 on Linux (90 are Windows-gated), and
-523 + 90 + 1 = 614. It is a Windows-run number, not a stale one. Don't "fix" it.
+The README quotes a Windows-run total, so a `cargo test --workspace` on Linux
+legitimately reports fewer. `wx-platform` is where the gap lives: a large block of
+its tests is `cfg(windows)`-gated and never runs here, a handful are
+`cfg(target_os = "linux")` and never run there, and one is
+`#[cfg_attr(not(windows), ignore)]` so it counts as ignored off Windows. Whether a
+given figure still holds is a question for the compiler, not this file:
+
+```sh
+cargo test --workspace                 # the total for this platform
+cargo test -p wx-platform --lib        # the crate the gap comes from
+grep -rn 'cfg(windows)\|cfg(target_os = "linux")\|cfg_attr(not(windows)' crates/wx-platform/src
+```
+
+A lower Linux number is not evidence the README is stale. Confirm with the above
+before "fixing" it — and don't copy a fresh number back into this file.
 
 ## Testing Linux/Wayland backends without a second machine
 

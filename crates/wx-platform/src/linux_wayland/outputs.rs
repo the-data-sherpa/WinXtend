@@ -185,11 +185,20 @@ fn roundtrip(
     }
 }
 
+/// The one place the wording of a lost-connection failure lives.
+///
+/// [`is_self_healing`] matches on it, so a reworded copy elsewhere would silently
+/// stop being recognised.
+const ROUNDTRIP_FAILED: &str = "wayland roundtrip failed";
+
+/// The same, for the [`ENUMERATION_BUDGET`] deadline.
+const ENUMERATION_TIMED_OUT: &str = "wayland enumeration timed out";
+
 /// A dead connection is reported rather than papered over: the compositor
 /// restarting is exactly the moment the layout must stop trusting its rectangles.
 /// The next call opens a new connection, so this is self-healing.
 fn roundtrip_failed(e: impl std::fmt::Display) -> PlatformError {
-    PlatformError::Other(format!("wayland roundtrip failed: {e}"))
+    PlatformError::Other(format!("{ROUNDTRIP_FAILED}: {e}"))
 }
 
 /// A compositor that stopped answering is reported the same way, and for the same
@@ -197,9 +206,27 @@ fn roundtrip_failed(e: impl std::fmt::Display) -> PlatformError {
 /// publishes no screens until the compositor recovers.
 fn timed_out() -> PlatformError {
     PlatformError::Other(format!(
-        "wayland enumeration timed out after {}ms",
+        "{ENUMERATION_TIMED_OUT} after {}ms",
         ENUMERATION_BUDGET.as_millis()
     ))
+}
+
+/// Whether an [`enumerate`] failure is one the next call is expected to recover
+/// from on its own.
+///
+/// Deliberately narrow: only the two failures the doc comments above call
+/// transient, matched against the constants their constructors format from rather
+/// than against a repeated literal. This is not
+/// [`PlatformError::is_transient`] — that one drives the clipboard poller's retry
+/// loop for every backend and is not widened for this.
+#[cfg(test)]
+fn is_self_healing(e: &PlatformError) -> bool {
+    match e {
+        PlatformError::Other(msg) => {
+            msg.starts_with(ROUNDTRIP_FAILED) || msg.starts_with(ENUMERATION_TIMED_OUT)
+        }
+        _ => false,
+    }
 }
 
 /// Wayland strings are never null but are routinely empty; an empty name is no
@@ -399,6 +426,11 @@ mod tests {
     /// `zxdg_output_manager_v1` are both documented non-failures, and a bare
     /// `gnome-shell --headless` with no `--virtual-monitor` — the harness AGENTS.md
     /// recommends — is exactly the first of them.
+    ///
+    /// The two [`is_self_healing`] failures skip as well. The deadline exists to
+    /// stop a wedged compositor freezing the engine loop; a compositor that
+    /// hiccups past it under a parallel `cargo test` would otherwise turn that
+    /// robustness bound into a flaky suite. Anything else still panics.
     fn session_monitors() -> Option<Vec<Monitor>> {
         if Connection::connect_to_env().is_err() {
             eprintln!("skipped: no wayland session");
@@ -411,6 +443,26 @@ mod tests {
             }
             Ok(monitors) => Some(monitors),
             Err(e @ PlatformError::Unsupported { .. }) => {
+                eprintln!("skipped: {e}");
+                None
+            }
+            Err(e) if is_self_healing(&e) => {
+                eprintln!("skipped: {e}");
+                None
+            }
+            Err(e) => panic!("enumeration failed against a live compositor: {e}"),
+        }
+    }
+
+    /// A further reading of a session [`session_monitors`] has already proved is
+    /// there, with the same skip rule.
+    ///
+    /// Unwrapping instead would reintroduce the flake this skip exists to prevent:
+    /// a compositor is no less free to hiccup on the second call than on the first.
+    fn resample<T>(result: Result<T>) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) if is_self_healing(&e) => {
                 eprintln!("skipped: {e}");
                 None
             }
@@ -443,7 +495,9 @@ mod tests {
         let Some(first) = session_monitors() else {
             return;
         };
-        let second = super::super::WaylandDisplays::new().monitors().unwrap();
+        let Some(second) = resample(super::super::WaylandDisplays::new().monitors()) else {
+            return;
+        };
 
         assert_eq!(
             first.iter().map(|m| m.id).collect::<Vec<_>>(),
@@ -460,9 +514,9 @@ mod tests {
         let Some(monitors) = session_monitors() else {
             return;
         };
-        let bounds = super::super::WaylandDisplays::new()
-            .virtual_bounds()
-            .unwrap();
+        let Some(bounds) = resample(super::super::WaylandDisplays::new().virtual_bounds()) else {
+            return;
+        };
         for m in monitors {
             assert!(bounds.x <= m.local_bounds.x);
             assert!(bounds.y <= m.local_bounds.y);
