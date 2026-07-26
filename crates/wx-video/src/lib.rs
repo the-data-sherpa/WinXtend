@@ -6,8 +6,9 @@
 //! or a `use`. `wx-agent` does not construct a pipeline from it; it answers
 //! [`ControlMsg::VideoStart`](wx_proto::ControlMsg::VideoStart) and
 //! [`ControlMsg::VideoReconfigure`](wx_proto::ControlMsg::VideoReconfigure)
-//! with a hardcoded `VideoUnavailable` refusal. The refusal site is
-//! `crates/wx-agent/src/engine.rs:1395`.
+//! with a hardcoded `VideoUnavailable` refusal. The refusal site is the
+//! `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm in
+//! `crates/wx-agent/src/engine.rs`.
 //!
 //! So the code here compiles and its tests pass, but no running agent reaches
 //! it. It is parked for the Linux/Wayland alpha rather than deleted: it is

@@ -22,12 +22,15 @@ layout editor.
 > - **Windows is the only complete backend, and it is out of alpha scope.**
 >   Capture, injection, displays, and the clipboard platform layer all work there.
 >   Clipboard *sync*, though, does not work end to end on Windows any more than
->   anywhere else, because the agent does not act on clipboard messages yet
->   (`crates/wx-agent/src/engine.rs:1411`). It is kept, tested, and accurately
->   described below — but it is not what the alpha is aimed at.
+>   anywhere else, because the agent does not act on clipboard messages yet — they
+>   fall into the catch-all arm in `crates/wx-agent/src/engine.rs` that logs
+>   "ignoring a message this build does not handle". It is kept, tested, and
+>   accurately described below — but it is not what the alpha is aimed at.
 > - **Linux/Wayland is the alpha target, and it is being built now.** Today it is a
 >   compiling skeleton that advertises no capabilities and refuses what it cannot
->   do, on purpose (`crates/wx-platform/src/linux_wayland/mod.rs:196`). macOS, X11,
+>   do, on purpose
+>   (`crates/wx-platform/src/linux_wayland/mod.rs::the_skeleton_advertises_nothing_it_cannot_do`
+>   and `::suppression_is_refused_rather_than_silently_ignored`). macOS, X11,
 >   and evdev are in the same state: documented down to the exact syscall
 >   sequences, implemented no further. On those platforms the agent starts and
 >   does nothing.
@@ -35,8 +38,9 @@ layout editor.
 >   in a single process. The QUIC handshake and session tests are real, but they
 >   are loopback.
 > - **Screen streaming is not connected.** `wx-video` compiles and its 61 tests
->   pass, but nothing depends on it and the agent hardcodes a refusal
->   (`crates/wx-agent/src/engine.rs:1395`). It is parked for alpha.
+>   pass, but nothing depends on it and the agent hardcodes a refusal in the
+>   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
+>   `crates/wx-agent/src/engine.rs`. It is parked for alpha.
 >
 > The protocol, layout engine, routing, transport, and pairing are the parts worth
 > looking at today. Treat the rest as a well-marked construction site.
@@ -144,7 +148,7 @@ flowchart TD
 | `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. | — |
 
 Test counts are the Windows figures, where every backend compiles and every test
-runs; they sum to the 614 above. On Linux `wx-platform` reports 70 and `wx-agent`
+that can run does; they sum to the 614 above. On Linux `wx-platform` reports 70 and `wx-agent`
 138 — see [Testing](#why-the-test-count-differs-by-platform).
 
 `wx-proto` and `wx-core` deliberately contain no I/O and no platform calls, which
@@ -198,11 +202,18 @@ cargo build --release      # produces target/release/wx-agent
 
 ### Ubuntu / Debian prerequisites
 
-The engine needs a C toolchain and OpenSSL headers:
+The engine compiles C through two build scripts — `zstd-sys`, because `zstd` is a
+default feature of `wx-video`, and `ring` — so it needs a C toolchain:
 
 ```bash
-sudo apt install -y build-essential pkg-config libssl-dev
+sudo apt install -y build-essential pkg-config
 ```
+
+It does **not** need `libssl-dev`. Nothing in the tree links OpenSSL: neither
+`Cargo.lock` nor `ui/src-tauri/Cargo.lock` contains `openssl-sys` or
+`native-tls`, and `wx-net` pins `quinn` with `default-features = false` and
+`rustls-ring`, a pure-Rust TLS stack. This departs deliberately from the package
+list in issue #2, which named `libssl-dev` in error.
 
 The Tauri UI additionally needs the WebKitGTK and tray stack:
 
@@ -210,6 +221,11 @@ The Tauri UI additionally needs the WebKitGTK and tray stack:
 sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
                     libayatana-appindicator3-dev libxdo-dev
 ```
+
+The authority for that list is the "Install Tauri system dependencies" step in
+`.github/workflows/ci.yml`, which installs those five packages and nothing else.
+The engine job in the same workflow installs no packages at all, because GitHub's
+runners ship a C toolchain preinstalled.
 
 Verified on Ubuntu 26.04. `libwebkit2gtk-4.1-dev` is the Tauri 2 dependency and
 exists on Ubuntu 24.04 and newer; on 22.04 you would need the `4.0` package and a
@@ -309,8 +325,9 @@ every possible byte offset.
 
 ### Why the test count differs by platform
 
-`cargo test --workspace` reports **523 passing on Linux and 614 on Windows**. That
-is expected, not a broken checkout — a Rust test that is `#[cfg]`-gated to a
+`cargo test --workspace` reports **523 passing on Linux and 614 on Windows**.
+macOS reports 523 as well, for the same reason Linux does: both gates below are
+keyed on Windows, not on Linux. That is expected, not a broken checkout — a Rust test that is `#[cfg]`-gated to a
 platform is not compiled at all elsewhere, so it cannot be counted.
 
 Nearly the whole 91-test gap is the Windows backend: `crates/wx-platform/src/windows/`
@@ -320,8 +337,8 @@ Linux against 160 on Windows. The one remaining test is
 `registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`,
 which is `#[cfg_attr(not(windows), ignore)]`: it compiles everywhere but only runs
 where there is an autostart mechanism to exercise, so `wx-agent` reports 139
-passing on Windows and 138 passing plus one skipped on Linux. 90 + 1 is the whole
-difference.
+passing on Windows and 138 passing plus one skipped on Linux and macOS alike.
+90 + 1 is the whole difference.
 
 `crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
 too, but it moves neither total: its cases are additionally `#[ignore]`d because
@@ -353,7 +370,9 @@ The alpha is Linux/Wayland. Roughly in order of value:
    monitor attached sending its screen to the UI, so a headless mini-PC is usable
    rather than merely reachable. It is **not connected today** — `wx-video` exists
    and passes its tests, but nothing depends on it and `wx-agent` answers video
-   requests with a refusal (`crates/wx-agent/src/engine.rs:1395`). Connecting it
+   requests with a refusal, in the
+   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
+   `crates/wx-agent/src/engine.rs`. Connecting it
    also means a real codec behind the existing `Encoder` seam; the current
    lossless passthrough is LAN-only. Even finished, it needs the agent running, so
    it would never be a bare-metal rescue tool.
