@@ -191,7 +191,7 @@ fn roundtrip(
 /// A dead connection is reported rather than papered over: the compositor
 /// restarting is exactly the moment the layout must stop trusting its rectangles.
 /// The next call opens a new one, so this heals itself, and
-/// [`is_self_healing`] recognises it by this prefix.
+/// the `is_self_healing` test helper recognises it by this prefix.
 const CONNECTION_LOST: &str = "wayland connection lost";
 
 /// The one place the wording of a protocol failure lives.
