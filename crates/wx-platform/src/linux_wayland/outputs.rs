@@ -10,8 +10,13 @@
 //! for, and the registry does not promise to advertise it before the outputs, so
 //! the two phases cannot be collapsed into one.
 
-use wayland_client::protocol::{wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
+use std::io::ErrorKind;
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+
+use wayland_client::backend::WaylandError;
+use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 
 use super::display::{RawOutput, WL_OUTPUT_VERSION, XDG_OUTPUT_MANAGER_VERSION};
@@ -26,10 +31,24 @@ use crate::error::{PlatformError, Result};
 /// enumeration is not.
 const GEOMETRY_ROUNDTRIPS: usize = 2;
 
+/// Wall-clock budget for one whole enumeration, roundtrips included.
+///
+/// This is a liveness bound, not a performance one. `monitors()` is called inline
+/// from the agent's single engine loop, the same loop that forwards captured input
+/// and answers peer heartbeats. A compositor that stops servicing its socket
+/// without closing it — wedged under load, SIGSTOPped, mid-crash — would otherwise
+/// block that loop forever and strand the cursor on whichever machine owns it.
+/// Giving up instead costs one tick's monitor list, which the next tick recomputes.
+///
+/// Enumeration measures ~200us against a live compositor, so this is pure headroom.
+const ENUMERATION_BUDGET: Duration = Duration::from_millis(250);
+
 /// One connection's worth of enumeration state.
 struct Enumerator {
     manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     outputs: Vec<Entry>,
+    /// Set when the `wl_display.sync` barrier of the roundtrip in flight replies.
+    synced: bool,
 }
 
 struct Entry {
@@ -41,6 +60,8 @@ struct Entry {
 ///
 /// See [`super::display::WaylandDisplays`] for why the connection is not kept.
 pub(super) fn enumerate() -> Result<Vec<RawOutput>> {
+    let deadline = Instant::now() + ENUMERATION_BUDGET;
+
     let conn = Connection::connect_to_env().map_err(|e| {
         // Not an error worth a warning: a headless agent, a CI runner and a
         // machine on a TTY all land here, and none of them is broken.
@@ -57,10 +78,11 @@ pub(super) fn enumerate() -> Result<Vec<RawOutput>> {
     let mut state = Enumerator {
         manager: None,
         outputs: Vec::new(),
+        synced: false,
     };
 
     // First pass: learn the globals, and bind every output as it is advertised.
-    queue.roundtrip(&mut state).map_err(roundtrip_failed)?;
+    roundtrip(&conn, &mut queue, &qh, &mut state, deadline)?;
 
     if state.outputs.is_empty() {
         // A compositor with no outputs at all — a nested session being torn down,
@@ -78,8 +100,16 @@ pub(super) fn enumerate() -> Result<Vec<RawOutput>> {
     }
 
     for _ in 0..GEOMETRY_ROUNDTRIPS {
-        queue.roundtrip(&mut state).map_err(roundtrip_failed)?;
-        if state.outputs.iter().all(|e| e.raw.logical_size.is_some()) {
+        roundtrip(&conn, &mut queue, &qh, &mut state, deadline)?;
+        // The same completeness rule `to_monitors` drops on: an output missing
+        // either half of its geometry is not published, so stopping early on the
+        // size alone would silently lose a monitor whose position is still in
+        // flight.
+        if state
+            .outputs
+            .iter()
+            .all(|e| e.raw.logical_pos.is_some() && e.raw.logical_size.is_some())
+        {
             break;
         }
     }
@@ -87,11 +117,89 @@ pub(super) fn enumerate() -> Result<Vec<RawOutput>> {
     Ok(state.outputs.into_iter().map(|e| e.raw).collect())
 }
 
+/// A roundtrip that gives up at `deadline` instead of blocking indefinitely.
+///
+/// [`EventQueue::roundtrip`] loops on `blocking_dispatch`, which polls the socket
+/// with no timeout; this is the same dance with the wait bounded. See
+/// [`ENUMERATION_BUDGET`] for why the bound has to exist at all.
+fn roundtrip(
+    conn: &Connection,
+    queue: &mut EventQueue<Enumerator>,
+    qh: &QueueHandle<Enumerator>,
+    state: &mut Enumerator,
+    deadline: Instant,
+) -> Result<()> {
+    state.synced = false;
+    // `wl_display.sync` replies only once the server has processed everything sent
+    // before it, which is what makes this a roundtrip rather than a poll.
+    let _barrier = conn.display().sync(qh, ());
+
+    loop {
+        queue.dispatch_pending(state).map_err(roundtrip_failed)?;
+        if state.synced {
+            return Ok(());
+        }
+
+        conn.flush().map_err(roundtrip_failed)?;
+
+        // `None` means the queue still holds events nobody has dispatched; going
+        // round drains them rather than waiting for a socket that may stay quiet.
+        let Some(guard) = conn.prepare_read() else {
+            continue;
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+
+        let fd = conn.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR,
+        )];
+        let timeout = rustix::event::Timespec {
+            tv_sec: remaining.as_secs() as _,
+            tv_nsec: remaining.subsec_nanos() as _,
+        };
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(0) => return Err(timed_out()),
+            Ok(_) => {}
+            // Re-derive the timeout from the deadline rather than restarting it,
+            // so a stream of signals cannot extend the budget indefinitely.
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                return Err(PlatformError::Other(format!(
+                    "polling the wayland socket failed: {e}"
+                )));
+            }
+        }
+
+        match guard.read() {
+            Ok(_) => {}
+            // Another thread beat us to the socket, or the readiness was spurious.
+            // Either way the deadline still bounds the retry.
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(PlatformError::Other(format!("wayland read failed: {e}"))),
+        }
+    }
+}
+
 /// A dead connection is reported rather than papered over: the compositor
 /// restarting is exactly the moment the layout must stop trusting its rectangles.
 /// The next call opens a new connection, so this is self-healing.
-fn roundtrip_failed(e: wayland_client::DispatchError) -> PlatformError {
+fn roundtrip_failed(e: impl std::fmt::Display) -> PlatformError {
     PlatformError::Other(format!("wayland roundtrip failed: {e}"))
+}
+
+/// A compositor that stopped answering is reported the same way, and for the same
+/// reason: enumeration failure is already non-fatal upstream, so the node simply
+/// publishes no screens until the compositor recovers.
+fn timed_out() -> PlatformError {
+    PlatformError::Other(format!(
+        "wayland enumeration timed out after {}ms",
+        ENUMERATION_BUDGET.as_millis()
+    ))
 }
 
 /// Wayland strings are never null but are routinely empty; an empty name is no
@@ -245,6 +353,22 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, usize> for Enumerator {
     }
 }
 
+/// The `wl_display.sync` barrier that ends a [`roundtrip`].
+impl Dispatch<wl_callback::WlCallback, ()> for Enumerator {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.synced = true;
+        }
+    }
+}
+
 /// The manager is a factory with no events of its own.
 impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for Enumerator {
     fn event(
@@ -263,28 +387,42 @@ mod tests {
     use super::*;
     use crate::traits::DisplayEnumerator;
     use std::collections::HashSet;
+    use wx_proto::Monitor;
 
-    /// Whether this machine has a compositor to talk to.
+    /// The monitors of this session, or `None` when there is nothing to assert
+    /// against.
     ///
     /// CI is headless, and a test that fails there would make the whole suite
-    /// unrunnable on the one platform that builds this code. Skipping is the only
-    /// honest option: there is nothing to assert about a machine with no
-    /// compositor.
-    fn wayland_session() -> bool {
-        Connection::connect_to_env().is_ok()
+    /// unrunnable on the one platform that builds this code. The skip has to cover
+    /// everything [`enumerate`] itself calls acceptable, not just an absent
+    /// compositor: a session with no outputs and a compositor with no
+    /// `zxdg_output_manager_v1` are both documented non-failures, and a bare
+    /// `gnome-shell --headless` with no `--virtual-monitor` — the harness AGENTS.md
+    /// recommends — is exactly the first of them.
+    fn session_monitors() -> Option<Vec<Monitor>> {
+        if Connection::connect_to_env().is_err() {
+            eprintln!("skipped: no wayland session");
+            return None;
+        }
+        match super::super::WaylandDisplays::new().monitors() {
+            Ok(monitors) if monitors.is_empty() => {
+                eprintln!("skipped: wayland session with no outputs");
+                None
+            }
+            Ok(monitors) => Some(monitors),
+            Err(e @ PlatformError::Unsupported { .. }) => {
+                eprintln!("skipped: {e}");
+                None
+            }
+            Err(e) => panic!("enumeration failed against a live compositor: {e}"),
+        }
     }
 
     #[test]
     fn enumerating_this_session_yields_consistent_monitors() {
-        if !wayland_session() {
-            eprintln!("skipped: no wayland session");
+        let Some(monitors) = session_monitors() else {
             return;
-        }
-        let monitors = super::super::WaylandDisplays::new().monitors().unwrap();
-        assert!(
-            !monitors.is_empty(),
-            "a wayland session with no outputs at all"
-        );
+        };
         assert_eq!(monitors.iter().filter(|m| m.primary).count(), 1);
 
         for m in &monitors {
@@ -299,16 +437,13 @@ mod tests {
 
     #[test]
     fn ids_survive_a_reconnect() {
-        if !wayland_session() {
-            eprintln!("skipped: no wayland session");
-            return;
-        }
         // Each call is a whole new connection, so the registry object ids are
         // renumbered between these two. Ids derived from them would differ here,
         // and every saved layout would address the wrong screen after a restart.
-        let displays = super::super::WaylandDisplays::new();
-        let first = displays.monitors().unwrap();
-        let second = displays.monitors().unwrap();
+        let Some(first) = session_monitors() else {
+            return;
+        };
+        let second = super::super::WaylandDisplays::new().monitors().unwrap();
 
         assert_eq!(
             first.iter().map(|m| m.id).collect::<Vec<_>>(),
@@ -322,13 +457,13 @@ mod tests {
 
     #[test]
     fn virtual_bounds_contain_every_monitor() {
-        if !wayland_session() {
-            eprintln!("skipped: no wayland session");
+        let Some(monitors) = session_monitors() else {
             return;
-        }
-        let displays = super::super::WaylandDisplays::new();
-        let bounds = displays.virtual_bounds().unwrap();
-        for m in displays.monitors().unwrap() {
+        };
+        let bounds = super::super::WaylandDisplays::new()
+            .virtual_bounds()
+            .unwrap();
+        for m in monitors {
             assert!(bounds.x <= m.local_bounds.x);
             assert!(bounds.y <= m.local_bounds.y);
             assert!(bounds.right() >= m.local_bounds.right());

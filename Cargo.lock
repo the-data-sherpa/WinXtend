@@ -2052,6 +2052,7 @@ dependencies = [
 name = "wx-platform"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "thiserror",
  "tracing",
  "wayland-client",

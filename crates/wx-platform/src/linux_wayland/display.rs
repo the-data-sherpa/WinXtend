@@ -117,6 +117,30 @@ impl Default for RawOutput {
 /// seconds.
 ///
 /// A unit struct also keeps `Send` trivially true.
+///
+/// # Liveness
+///
+/// Correctness is not the only thing at stake here: this method runs *inline on
+/// the agent's engine loop*, the same single thread that forwards captured input
+/// and answers peer heartbeats. Every socket wait therefore has a deadline
+/// (`ENUMERATION_BUDGET` in `outputs`), because a compositor that stops servicing
+/// its socket without closing it would otherwise block that loop indefinitely and
+/// strand the cursor wherever it happens to be. On timeout enumeration fails, the
+/// failure is logged and non-fatal, and the node publishes no screens until the
+/// next tick finds a compositor that answers.
+///
+/// # Known limit: `WAYLAND_SOCKET`
+///
+/// `Connection::connect_to_env` *consumes* `WAYLAND_SOCKET`, unsetting it once it
+/// has taken the fd. A process launched with `WAYLAND_SOCKET` set and
+/// `WAYLAND_DISPLAY` unset therefore enumerates exactly once and reports
+/// [`PlatformError::NoDisplayServer`] forever after, since each later call opens a
+/// fresh connection and finds nothing to open it from. This is a known and
+/// accepted consequence of the connection-per-call design, not an oversight: it is
+/// unreachable from a normal desktop launch or a systemd user service, both of
+/// which export `WAYLAND_DISPLAY`.
+///
+/// [`PlatformError::NoDisplayServer`]: crate::error::PlatformError::NoDisplayServer
 pub struct WaylandDisplays;
 
 impl WaylandDisplays {
