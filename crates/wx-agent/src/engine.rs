@@ -1052,6 +1052,11 @@ impl Engine {
                 // hotkey was pressed on.
                 let local = self.local;
                 let label = self.peer_label(local);
+                // A machine that can lock but just failed to is a different fact from
+                // one that cannot lock at all, and only this one carries an error the
+                // user can act on, so it is reported separately rather than folded
+                // into the list above.
+                let mut local_failure = None;
                 if !permit_optional(
                     self.advertised_by(local),
                     Capabilities::SCREENSAVER_SYNC,
@@ -1062,28 +1067,34 @@ impl Engine {
                     unlocked.push(label);
                 } else if let Err(e) = self.platform.screensaver.lock_session() {
                     tracing::warn!(error = %e, "could not lock this session");
-                    unlocked.push(label);
+                    local_failure = Some(format!("{label} was left unlocked: {e}"));
                 }
                 unlocked.sort();
-                if !unlocked.is_empty() {
-                    // The hotkey is invisible by design, so a machine left unlocked
-                    // would otherwise be discovered by walking over to it and
-                    // finding the desktop still on screen.
-                    self.notice(
-                        ipc::NoticeLevel::Warning,
-                        if unlocked.len() == 1 {
-                            format!(
-                                "{} was left unlocked: it cannot lock its own session",
-                                unlocked[0]
-                            )
-                        } else {
-                            format!(
-                                "These machines were left unlocked, because they cannot lock \
-                                 their own sessions: {}",
-                                unlocked.join(", ")
-                            )
-                        },
-                    );
+                // The hotkey is invisible by design, so a machine left unlocked would
+                // otherwise be discovered by walking over to it and finding the
+                // desktop still on screen.
+                let mut message = if unlocked.is_empty() {
+                    String::new()
+                } else if unlocked.len() == 1 {
+                    format!(
+                        "{} was left unlocked: it cannot lock its own session",
+                        unlocked[0]
+                    )
+                } else {
+                    format!(
+                        "These machines were left unlocked, because they cannot lock \
+                         their own sessions: {}",
+                        unlocked.join(", ")
+                    )
+                };
+                if let Some(failure) = local_failure {
+                    if !message.is_empty() {
+                        message.push_str(". ");
+                    }
+                    message.push_str(&failure);
+                }
+                if !message.is_empty() {
+                    self.notice(ipc::NoticeLevel::Warning, message);
                 }
             }
         }
