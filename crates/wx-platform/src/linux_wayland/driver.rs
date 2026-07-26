@@ -917,7 +917,10 @@ mod tests {
         // implementing the portal answers a method call this way, and the name is not
         // the portal's own, so `ashpd` passes it back through `PortalError::ZBus`.
         let failure = Failure::from_ashpd(
-            method_error("org.freedesktop.DBus.Error.ServiceUnknown", "no such service"),
+            method_error(
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "no such service",
+            ),
             TokenSent::Yes,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
