@@ -153,7 +153,7 @@ async fn run(
 
     let live = match established {
         Ok(live) => live,
-        Err(failure) => {
+        Err(Aborted { failure, session }) => {
             // A stored token the portal would not accept must not be tried again on
             // every subsequent launch: clear it so the next run asks the user once,
             // rather than failing silently forever.
@@ -162,6 +162,13 @@ async fn run(
                 store.clear();
             }
             failure.report(shared);
+            // A session the portal already granted outlives this thread — nothing
+            // drops it and ashpd keeps the bus connection process-wide — so the
+            // compositor would go on showing this machine as remotely controlled by
+            // something that will never use the session.
+            if let Some(session) = session {
+                close_session(session).await;
+            }
             return;
         }
     };
@@ -194,17 +201,59 @@ enum Ended {
     Broken(String),
 }
 
+/// A failed [`establish`], paired with the portal session that was created before it
+/// failed, if the sequence got that far.
+struct Aborted {
+    failure: Failure,
+    session: Option<Session<RemoteDesktop>>,
+}
+
+impl Aborted {
+    /// A failure from before `CreateSession` answered, so there is nothing to close.
+    fn before_session(e: ashpd::Error) -> Self {
+        Self {
+            failure: Failure::from_ashpd(e),
+            session: None,
+        }
+    }
+}
+
 /// Run the whole `CreateSession` → `SelectDevices` → `Start` → `ConnectToEIS`
 /// sequence and bring the `ei` connection up.
-async fn establish(store: &RestoreTokenStore) -> Result<Live, Failure> {
-    let proxy = RemoteDesktop::new().await.map_err(Failure::from_ashpd)?;
+async fn establish(store: &RestoreTokenStore) -> Result<Live, Aborted> {
+    let proxy = RemoteDesktop::new()
+        .await
+        .map_err(Aborted::before_session)?;
     tracing::debug!(version = proxy.version(), "portal RemoteDesktop interface");
 
     let session = proxy
         .create_session(Default::default())
         .await
-        .map_err(Failure::from_ashpd)?;
+        .map_err(Aborted::before_session)?;
 
+    match negotiate(&proxy, &session, store).await {
+        Ok(granted) => Ok(Live {
+            session,
+            granted: granted.devices,
+            connection: granted.connection,
+            events: granted.events,
+        }),
+        Err(failure) => Err(Aborted {
+            failure,
+            session: Some(session),
+        }),
+    }
+}
+
+/// Everything [`establish`] does once the session object exists.
+///
+/// Split out so that every failure from here on hands the session back to the caller
+/// to close, rather than abandoning it to the portal.
+async fn negotiate(
+    proxy: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
+    store: &RestoreTokenStore,
+) -> Result<Negotiated, Failure> {
     // The restore token rides on SelectDevices, not on CreateSession: it is part of
     // *what* is being asked for, and the portal matches it against the device types
     // requested. Getting this wrong is silent — the session works and prompts every
@@ -212,7 +261,7 @@ async fn establish(store: &RestoreTokenStore) -> Result<Live, Failure> {
     let restore_token = store.load();
     proxy
         .select_devices(
-            &session,
+            session,
             SelectDevicesOptions::default()
                 .set_devices(wanted_devices())
                 .set_restore_token(restore_token.as_deref())
@@ -231,7 +280,7 @@ async fn establish(store: &RestoreTokenStore) -> Result<Live, Failure> {
         "starting the portal session; a consent dialog appears unless a restore token covers it"
     );
     let started = proxy
-        .start(&session, None, Default::default())
+        .start(session, None, Default::default())
         .await
         .map_err(Failure::from_ashpd)?
         .response()
@@ -265,7 +314,7 @@ async fn establish(store: &RestoreTokenStore) -> Result<Live, Failure> {
     }
 
     let fd = proxy
-        .connect_to_eis(&session, Default::default())
+        .connect_to_eis(session, Default::default())
         .await
         .map_err(Failure::from_ashpd)?;
 
@@ -277,12 +326,18 @@ async fn establish(store: &RestoreTokenStore) -> Result<Live, Failure> {
         .map_err(|e| Failure::broken(format!("the libei handshake failed: {e}")))?;
     tracing::debug!("libei transport connected");
 
-    Ok(Live {
-        session,
-        granted,
+    Ok(Negotiated {
+        devices: granted,
         connection,
         events,
     })
+}
+
+/// What [`negotiate`] produces: everything a [`Live`] needs except the session.
+struct Negotiated {
+    devices: BitFlags<DeviceType>,
+    connection: reis::event::Connection,
+    events: reis::tokio::EiConvertEventStream,
 }
 
 /// Drive the `ei` connection until the session ends.
@@ -318,11 +373,21 @@ async fn pump(
 
             _ = &mut stop => return Ended::Stopped,
 
-            _ = closed.next() => {
-                return Ended::Revoked(
-                    "the desktop portal closed the remote desktop session".into(),
-                );
-            }
+            signal = closed.next() => match signal {
+                // The portal really closed the session: somebody decided this.
+                Some(_) => {
+                    return Ended::Revoked(
+                        "the desktop portal closed the remote desktop session".into(),
+                    );
+                }
+                // The signal stream only ends when the bus connection does, and a
+                // D-Bus that went away is not a decision anybody made.
+                None => {
+                    return Ended::Broken(
+                        "the connection to the desktop portal went away".into(),
+                    );
+                }
+            },
 
             event = events.next() => match event {
                 Some(Ok(event)) => {
@@ -376,10 +441,21 @@ fn on_ei_event(connection: &reis::event::Connection, event: EiEvent) -> Option<E
             );
             None
         }
-        EiEvent::Disconnected(gone) => Some(Ended::Revoked(format!(
-            "the compositor disconnected the libei transport ({:?})",
-            gone.reason
-        ))),
+        EiEvent::Disconnected(gone) => {
+            let detail = format!(
+                "the compositor disconnected the libei transport ({:?})",
+                gone.reason
+            );
+            // Only reason zero means the client was purposely disconnected. The rest
+            // — a protocol violation, a rejected handshake mode, a transport error —
+            // are faults on one side or the other, and telling the user their
+            // permission was withdrawn would send them to a settings panel to fix a
+            // bug that is ours.
+            match gone.reason {
+                ei::connection::DisconnectReason::Disconnected => Some(Ended::Revoked(detail)),
+                _ => Some(Ended::Broken(detail)),
+            }
+        }
         _ => None,
     }
 }
@@ -400,8 +476,14 @@ async fn teardown(shared: &SharedSession, session: Session<RemoteDesktop>, reaso
         }
     }
 
-    // Closing a session the portal already closed fails, and that is fine: the point
-    // is to leave nothing behind when *we* are the ones ending it.
+    close_session(session).await;
+}
+
+/// Hand a session back to the portal, bounded by [`TEARDOWN_TIMEOUT`].
+///
+/// Closing a session the portal already closed fails, and that is fine: the point is
+/// to leave nothing behind when *we* are the ones ending it.
+async fn close_session(session: Session<RemoteDesktop>) {
     match tokio::time::timeout(TEARDOWN_TIMEOUT, session.close()).await {
         Ok(Ok(())) => tracing::debug!("portal session closed"),
         Ok(Err(e)) => tracing::debug!(error = %e, "the portal session was already gone"),

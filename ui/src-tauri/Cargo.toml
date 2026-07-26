@@ -4,7 +4,7 @@ description = "WinXtend desktop UI: device discovery, the layout editor, and sta
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.79"
+rust-version = "1.87"
 
 # Its own workspace, deliberately.
 #

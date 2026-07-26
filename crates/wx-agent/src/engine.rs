@@ -1411,15 +1411,9 @@ impl Engine {
             }
             ControlMsg::CapabilitiesChanged { capabilities } => {
                 // A peer whose portal session was revoked, most likely. Recording it
-                // is what stops this machine from routing the cursor onto one that
-                // can no longer accept it.
-                let now = Instant::now();
-                let name = self
-                    .state
-                    .peer(&node)
-                    .map(|p| p.advertised_name.clone())
-                    .unwrap_or_default();
-                if let Some(info) = self.state.entry(node, &name, now).info.as_mut() {
+                // keeps the peer's own account of what it can do current, which is
+                // what `publish_peer` below shows the user.
+                if let Some(info) = self.peer_info_mut(node) {
                     if info.capabilities == capabilities {
                         return;
                     }
@@ -1429,13 +1423,7 @@ impl Engine {
                 self.publish_peer(node);
             }
             ControlMsg::MonitorsChanged { monitors } => {
-                let now = Instant::now();
-                let name = self
-                    .state
-                    .peer(&node)
-                    .map(|p| p.advertised_name.clone())
-                    .unwrap_or_default();
-                if let Some(info) = self.state.entry(node, &name, now).info.as_mut() {
+                if let Some(info) = self.peer_info_mut(node) {
                     info.monitors = monitors.clone();
                 }
                 // `MonitorsChanged` carries monitors and not capabilities, so the
@@ -1937,12 +1925,23 @@ impl Engine {
         }
 
         let lost = Capabilities(before.0 & !now.0);
+        let gained = Capabilities(now.0 & !before.0);
         tracing::info!(
             before = before.0,
             now = now.0,
             "local capabilities changed; re-advertising"
         );
         self.broadcast_control(ControlMsg::CapabilitiesChanged { capabilities: now });
+
+        if gained.contains(Capabilities::CAPTURE_INPUT) {
+            // The permission this machine needs to capture may arrive long after
+            // startup — a Wayland consent dialog is answered whenever the user gets
+            // to it — and the one `start_capture` at boot has already failed by then.
+            // No guard is needed: this only fires on a bit that was absent and is now
+            // present, which is a fresh grant rather than a retry against a refusal.
+            tracing::info!("this machine can capture input again; starting capture");
+            self.start_capture();
+        }
 
         if lost.contains(Capabilities::CAPTURE_INPUT) {
             // Stopped, not restarted. The usual reason to lose this is a user who
@@ -2588,6 +2587,20 @@ impl Engine {
         for node in peers {
             self.send_to(node, Outbound::Control(msg.clone()));
         }
+    }
+
+    /// The `NodeInfo` a peer sent at its handshake, ready to be amended.
+    ///
+    /// `None` until the peer has actually introduced itself: a control message from
+    /// one that has not creates the entry but has nothing to amend.
+    fn peer_info_mut(&mut self, node: NodeId) -> Option<&mut NodeInfo> {
+        let now = Instant::now();
+        let name = self
+            .state
+            .peer(&node)
+            .map(|p| p.advertised_name.clone())
+            .unwrap_or_default();
+        self.state.entry(node, &name, now).info.as_mut()
     }
 
     fn publish_peer(&self, node: NodeId) {
