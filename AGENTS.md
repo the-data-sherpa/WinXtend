@@ -32,6 +32,44 @@ The README says 614 tests; a Linux run reports 523 passed, 1 ignored. That recon
 `wx-platform` contributes 70 of its 160 on Linux (90 are Windows-gated), and
 523 + 90 + 1 = 614. It is a Windows-run number, not a stale one. Don't "fix" it.
 
+## Testing Linux/Wayland backends without a second machine
+
+Wayland work (`crates/wx-platform/src/linux_wayland/`) can be exercised against a
+real compositor on one box, with no extra packages:
+
+- **Multi-monitor, mixed-DPI, hotplug** — run a private nested compositor on its
+  own D-Bus session, then drive it through Mutter's `DisplayConfig`:
+
+  ```sh
+  eval "$(dbus-daemon --session --print-address --fork --print-pid \
+    | { read a; read p; echo "export DBUS_SESSION_BUS_ADDRESS='$a'"; })"
+  gnome-shell --headless --wayland --wayland-display=wxtest \
+    --virtual-monitor 2560x1440 --virtual-monitor 1920x1080 &
+  # then run the client with WAYLAND_DISPLAY=wxtest
+  ```
+
+  `ApplyMonitorsConfig` on that bus changes scale, rotation and position live, and
+  applying a config that omits a monitor *is* an unplug as far as a client sees.
+  Note current gnome-shell has no `--nested`, and Mutter rejects negative logical
+  positions.
+
+- **Fractional scaling on the real session** — `GetCurrentState` /
+  `ApplyMonitorsConfig` on `org.gnome.Mutter.DisplayConfig` is the ground truth to
+  compare against; supported scales are listed per mode.
+
+- **Headless (CI)** — anything that opens a Wayland connection must skip, not
+  fail. Reproduce with
+  `env -u WAYLAND_DISPLAY -u DISPLAY -u XDG_SESSION_TYPE XDG_RUNTIME_DIR=$(mktemp -d) cargo test`.
+
+- **End-to-end without the UI** — `wx-agent --config-dir <scratch> --status`
+  prints the same `StatusSnapshot` the Tauri layout editor renders. Always pass
+  `--config-dir`; the default writes an identity key into the user's real config
+  directory. The UI honours `WINXTEND_CONFIG_DIR` and `WINXTEND_AGENT` for the
+  same reason.
+
+GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
+callers, so visual confirmation of the UI needs a human or a portal prompt.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

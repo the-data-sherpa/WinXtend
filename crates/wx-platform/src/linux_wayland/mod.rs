@@ -1,14 +1,27 @@
-//! Linux/Wayland backend — skeleton.
+//! Linux/Wayland backend.
 //!
-//! Sketched from the libei and xdg-desktop-portal APIs but not implemented; see the
-//! note in [`crate::macos`] about why these skeletons compile on every target.
+//! | Concern | Mechanism | State |
+//! |---|---|---|
+//! | Displays | `wl_output` + `xdg_output` | implemented, see [`display`] |
+//! | Capture | libei via the RemoteDesktop portal | skeleton |
+//! | Injection | libei | skeleton |
+//! | Clipboard | `wl_data_device` / `zwlr_data_control_manager_v1` | skeleton |
+//! | Locking | systemd-logind | skeleton |
+//!
+//! The unimplemented parts are sketched from the libei and xdg-desktop-portal
+//! APIs; see the note in [`crate::macos`] about why these skeletons compile on
+//! every target.
+//!
+//! Display enumeration is deliberately first: it is the one piece that needs no
+//! portal, no consent dialog and no libei, so a Linux machine can appear in the
+//! layout editor and be arranged before it can capture or inject anything.
 //!
 //! # Why this backend matters more than its line count suggests
 //!
 //! Wayland is the default session on current Fedora, Ubuntu, and SteamOS, and the
 //! Synergy-lineage tools still do not support it. Supporting it properly is a
-//! reason to choose WinXtend rather than a checkbox, so this skeleton is written to
-//! be filled in with the *portal* path rather than an X11 fallback hack.
+//! reason to choose WinXtend rather than a checkbox, so the remaining pieces are
+//! written to be filled in with the *portal* path rather than an X11 fallback hack.
 //!
 //! # The shape Wayland forces on this
 //!
@@ -31,6 +44,12 @@
 //! not honour that leaves keystrokes reaching local windows, and the backend should
 //! report that honestly rather than pretend.
 
+pub mod display;
+#[cfg(target_os = "linux")]
+mod outputs;
+
+pub use display::WaylandDisplays;
+
 use wx_proto::{
     Capabilities, ClipboardFormat, DisplayServer, InputEvent, Monitor, NormPos, Platform,
 };
@@ -48,23 +67,6 @@ fn todo_err(operation: &'static str) -> PlatformError {
     PlatformError::Unsupported {
         operation,
         backend: BACKEND,
-    }
-}
-
-/// TODO: there is no privileged "list all outputs" call for an ordinary client.
-/// Bind `wl_output` from the registry and read `xdg_output`'s `logical_position`
-/// and `logical_size` events, which give the compositor's layout in the same
-/// top-left-origin space [`Monitor`] uses. `wl_output.scale` is the integer scale;
-/// `xdg_output` is needed for fractional scaling.
-///
-/// Identity comes from `wl_output`'s `name` event (`DP-1`) hashed through
-/// [`crate::coords::stable_monitor_id`]; the registry object id is per-connection
-/// and useless as a stable id.
-pub struct WaylandDisplays;
-
-impl DisplayEnumerator for WaylandDisplays {
-    fn monitors(&self) -> Result<Vec<Monitor>> {
-        Err(todo_err("display enumeration"))
     }
 }
 
@@ -174,14 +176,46 @@ impl ScreenSaverControl for WaylandSession {
     }
 }
 
+/// Everything this build can do on Wayland.
+///
+/// Display enumeration is the only piece implemented so far, so it is the only
+/// thing advertised — and only when a display was actually found. A node that
+/// claims `HAS_DISPLAYS` with no screens invites peers to route the cursor into a
+/// desktop that does not exist, and there is no error to report when they do.
+///
+/// Capture, injection, clipboard and screensaver sync stay unadvertised because
+/// they still return [`PlatformError::Unsupported`]. Claiming them would make a
+/// peer hand this node the cursor and then watch it disappear.
+fn capabilities(has_displays: bool) -> Capabilities {
+    if has_displays {
+        Capabilities::HAS_DISPLAYS
+    } else {
+        Capabilities::NONE
+    }
+}
+
 pub fn backend() -> Result<PlatformBackend> {
+    let displays = WaylandDisplays::new();
+    // A failed enumeration is not fatal: the node can still forward, and once the
+    // portal work lands it can still inject. Treating it as fatal would take a
+    // whole machine out of the mesh over a compositor that happens not to offer
+    // `xdg_output`. It is logged, because "my screens are missing from the layout"
+    // is otherwise unattributable.
+    let has_displays = match displays.monitors() {
+        Ok(monitors) => !monitors.is_empty(),
+        Err(e) => {
+            tracing::warn!(error = %e, "display enumeration failed; advertising no displays");
+            false
+        }
+    };
+
     Ok(PlatformBackend {
         info: PlatformInfo {
             platform: Platform::Linux,
             display_server: DisplayServer::Wayland,
-            capabilities: Capabilities::NONE,
+            capabilities: capabilities(has_displays),
         },
-        displays: Box::new(WaylandDisplays),
+        displays: Box::new(displays),
         capture: Box::new(WaylandCapture),
         injector: Box::new(WaylandInjector),
         clipboard: Box::new(WaylandClipboard),
@@ -194,10 +228,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_skeleton_advertises_nothing_it_cannot_do() {
+    fn the_backend_advertises_nothing_it_cannot_do() {
+        // Display enumeration is implemented; nothing else is. Anything beyond
+        // HAS_DISPLAYS here would be a promise the backend cannot keep.
         let backend = backend().unwrap();
-        assert!(backend.info.capabilities.is_empty());
+        for unimplemented in [
+            Capabilities::CAPTURE_INPUT,
+            Capabilities::INJECT_INPUT,
+            Capabilities::CLIPBOARD_TEXT,
+            Capabilities::CLIPBOARD_IMAGE,
+            Capabilities::FILE_TRANSFER,
+            Capabilities::SCREENSAVER_SYNC,
+            Capabilities::PRIVILEGED_INJECT,
+            Capabilities::VIDEO_SOURCE,
+            Capabilities::VIDEO_SINK,
+            Capabilities::RELAY,
+        ] {
+            assert!(
+                !backend.info.capabilities.contains(unimplemented),
+                "advertised {unimplemented:?} while it still returns Unsupported"
+            );
+        }
         assert_eq!(backend.info.display_server, DisplayServer::Wayland);
+    }
+
+    #[test]
+    fn screens_are_advertised_only_when_there_are_some() {
+        assert!(capabilities(true).contains(Capabilities::HAS_DISPLAYS));
+        assert!(!capabilities(false).contains(Capabilities::HAS_DISPLAYS));
+    }
+
+    #[test]
+    fn a_compositor_that_cannot_be_reached_is_not_fatal() {
+        // The headless CI runner takes this path. Losing the whole backend here
+        // would remove the node from the mesh over a missing compositor rather
+        // than just from the layout.
+        assert!(backend().is_ok());
     }
 
     #[test]
