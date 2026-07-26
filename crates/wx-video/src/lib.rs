@@ -1,10 +1,29 @@
-//! Optional screen streaming.
+//! Optional screen streaming. **Experimental, and not wired into `wx-agent`.**
+//!
+//! Read this paragraph before the other 2,900 lines: nothing depends on this
+//! crate. It is a workspace member and that is the entire extent of its
+//! integration — no other crate in the tree names `wx-video` in a `Cargo.toml`
+//! or a `use`. `wx-agent` does not construct a pipeline from it; it answers
+//! [`ControlMsg::VideoStart`](wx_proto::ControlMsg::VideoStart) and
+//! [`ControlMsg::VideoReconfigure`](wx_proto::ControlMsg::VideoReconfigure)
+//! with a hardcoded `VideoUnavailable` refusal. The refusal site is
+//! `crates/wx-agent/src/engine.rs:1395`.
+//!
+//! So the code here compiles and its tests pass, but no running agent reaches
+//! it. It is parked for the Linux/Wayland alpha rather than deleted: it is
+//! working, tested code, and rewriting it later would cost more than keeping it
+//! compiling. Revisit after alpha.
+//!
+//! # What it is meant to do
 //!
 //! Input sharing alone cannot drive a machine with no monitor attached. This
-//! crate closes that gap: a node advertising
-//! [`Capabilities::VIDEO_SOURCE`](wx_proto::Capabilities::VIDEO_SOURCE) can
-//! stream a screen to the UI, which is what makes a headless mini-PC usable
-//! rather than merely reachable.
+//! crate is intended to close that gap: a node advertising
+//! [`Capabilities::VIDEO_SOURCE`](wx_proto::Capabilities::VIDEO_SOURCE) would
+//! stream a screen to the UI, which is what would make a headless mini-PC
+//! usable rather than merely reachable. Nothing advertises that capability
+//! today — `wx-platform` deliberately does not
+//! (`windows/mod.rs::video_capabilities_are_left_to_the_video_crate`), and the
+//! agent refuses the request.
 //!
 //! Strictly optional — a mesh of machines that each have their own monitor never
 //! starts a stream, and pays nothing for this crate being present.
@@ -23,6 +42,7 @@
 //! | Encode | Lossless passthrough only (raw BGRA, optionally zstd). |
 //! | Real codecs | Not implemented. [`Encoder`] is the seam; [`encode`] says what a backend must do. |
 //! | Pipeline | Real, and the frame-dropping policy is the part that matters. |
+//! | Wired into `wx-agent` | **No.** See the note at the top of this page. |
 //!
 //! Passthrough is a LAN-only path — see [`encode`] for the bandwidth arithmetic.
 //! It exists so the whole chain is end-to-end functional and testable now, and so
