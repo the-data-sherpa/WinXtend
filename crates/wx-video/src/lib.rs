@@ -1,6 +1,6 @@
 //! Optional screen streaming. **Experimental, and not wired into `wx-agent`.**
 //!
-//! Read this paragraph before the other 2,900 lines: nothing depends on this
+//! Read this paragraph before the other 2,800 lines: nothing depends on this
 //! crate. It is a workspace member and that is the entire extent of its
 //! integration — no other crate in the tree names `wx-video` in a `Cargo.toml`
 //! or a `use`. `wx-agent` does not construct a pipeline from it; it answers

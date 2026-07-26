@@ -135,7 +135,7 @@ flowchart TD
 
 | Crate | Role | Tests |
 |---|---|---|
-| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. | 67 |
+| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. | 66 |
 | `wx-core` | Engine: global layout, edge crossing, virtual cursor, input routing. Pure logic. | 86 |
 | `wx-platform` | Platform abstraction: capture, injection, displays, clipboard. | 160 |
 | `wx-net` | QUIC transport, ed25519 identity, PIN pairing, mDNS discovery. | 102 |
@@ -143,8 +143,9 @@ flowchart TD
 | `wx-agent` | The headless daemon that wires it together, plus its IPC surface. | 139 |
 | `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. | — |
 
-Test counts are the Windows figures, where every backend compiles. On Linux
-`wx-platform` reports 70 — see [Testing](#why-the-test-count-differs-by-platform).
+Test counts are the Windows figures, where every backend compiles and every test
+runs; they sum to the 614 above. On Linux `wx-platform` reports 70 and `wx-agent`
+138 — see [Testing](#why-the-test-count-differs-by-platform).
 
 `wx-proto` and `wx-core` deliberately contain no I/O and no platform calls, which
 is why the interesting behaviour — edge crossings, split edges, stuck-modifier
@@ -312,14 +313,21 @@ every possible byte offset.
 is expected, not a broken checkout — a Rust test that is `#[cfg]`-gated to a
 platform is not compiled at all elsewhere, so it cannot be counted.
 
-Nearly the whole difference is the Windows backend: `crates/wx-platform/src/windows/`
+Nearly the whole 91-test gap is the Windows backend: `crates/wx-platform/src/windows/`
 sits behind `#[cfg(target_os = "windows")]` and carries **90 tests** that do not
 exist in a Linux build, which is exactly why `wx-platform` reports 70 tests on
-Linux against 160 on Windows. `crates/wx-video/tests/windows_capture_smoke.rs` is
-`#![cfg(target_os = "windows")]` too, though its cases are additionally `#[ignore]`d
-because they need an interactive desktop. The cross-platform crates — `wx-proto`,
-`wx-core`, `wx-net`, `wx-agent` — run the same tests everywhere, as does the rest
-of `wx-video` apart from that one file.
+Linux against 160 on Windows. The one remaining test is
+`registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`,
+which is `#[cfg_attr(not(windows), ignore)]`: it compiles everywhere but only runs
+where there is an autostart mechanism to exercise, so `wx-agent` reports 139
+passing on Windows and 138 passing plus one skipped on Linux. 90 + 1 is the whole
+difference.
+
+`crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
+too, but it moves neither total: its cases are additionally `#[ignore]`d because
+they need an interactive desktop, so they are skipped on Windows and absent on
+Linux. Everything else — `wx-proto`, `wx-core`, `wx-net`, and the rest of
+`wx-video` — runs the same tests on both.
 
 Once the Wayland backend has an implementation, the Linux number rises by its own
 tests; it will never converge with the Windows number, because each platform's
