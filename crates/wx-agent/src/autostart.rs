@@ -134,7 +134,7 @@ mod windows_impl {
     }
 
     /// A registry key handle that closes itself.
-    struct Key(HKEY);
+    pub(super) struct Key(HKEY);
 
     impl Drop for Key {
         fn drop(&mut self) {
@@ -155,8 +155,21 @@ mod windows_impl {
     /// often asked about — including GitHub's Windows runners, whose freshly
     /// provisioned profiles are how this was found.
     fn open_existing(access: REG_SAM_FLAGS) -> Result<Option<Key>, AutostartError> {
+        open_existing_at(RUN_KEY, access)
+    }
+
+    /// [`open_existing`] against an arbitrary `HKCU` subkey.
+    ///
+    /// Split out purely so a test can name a subkey that certainly does not
+    /// exist and reach the absent-key branch deterministically, without the
+    /// alternative — deleting the real Run key — which would wipe every other
+    /// application's startup entries on a developer's machine.
+    pub(super) fn open_existing_at(
+        subkey: &str,
+        access: REG_SAM_FLAGS,
+    ) -> Result<Option<Key>, AutostartError> {
         let mut key = HKEY::default();
-        let path = HSTRING::from(RUN_KEY);
+        let path = HSTRING::from(subkey);
         let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, access, &mut key) };
         if status == ERROR_FILE_NOT_FOUND {
             return Ok(None);
@@ -481,13 +494,18 @@ mod tests {
         }
     }
 
-    /// Guards the property that actually broke CI, on every platform.
+    /// With no autostart *value* registered, the answer is a plain no — and
+    /// installing works from there.
     ///
-    /// Asking whether autostart is registered is a question about *this* profile,
-    /// and "nothing has ever been registered here" is an answer to it, not a
-    /// failure to answer. On Windows that means an absent Run key reads as
-    /// `Ok(false)`; on a platform with no mechanism at all it means a refusal
-    /// that still says what to do by hand. Neither may be an unexplained error.
+    /// This covers the absent-value state, not the absent-*key* state that broke
+    /// CI: `uninstall` deletes the value and leaves the Run key standing, and
+    /// whether the key exists at all is decided by the profile the suite happens
+    /// to run on. [`an_absent_run_key_reads_as_absent_rather_than_erroring`] is
+    /// the one that reproduces the key condition deterministically.
+    ///
+    /// On a platform with no mechanism at all the same question earns a refusal
+    /// that still says what to write by hand. Neither may be an unexplained
+    /// error.
     #[test]
     fn asking_about_a_profile_that_has_never_registered_anything_is_answerable() {
         #[cfg(windows)]
@@ -510,6 +528,37 @@ mod tests {
             let err = is_registered().unwrap_err();
             assert!(matches!(err, AutostartError::Unsupported { .. }), "{err}");
         }
+    }
+
+    /// Guards the property that actually broke CI.
+    ///
+    /// `Os { operation: "opening HKCU Run", code: 2 }` — `ERROR_FILE_NOT_FOUND`
+    /// on the *key*, not the value — is what failed on the Windows runners,
+    /// because Windows creates `…\CurrentVersion\Run` lazily and a profile that
+    /// has never registered a startup entry has no such key. A key that is not
+    /// there holds no entry, so the reader's honest answer is `Ok(None)`.
+    ///
+    /// It is asked of a subkey that does not exist rather than of the real Run
+    /// key, because reproducing the condition on the real one would mean
+    /// deleting every other application's startup entries. That makes it
+    /// deterministic and independent of thread ordering and of whatever the
+    /// runner's profile happens to contain.
+    ///
+    /// It reads a key that is absent, so it creates nothing and deletes nothing
+    /// and needs no `RealRegistry` guard — deliberately, not by omission.
+    #[cfg(windows)]
+    #[test]
+    fn an_absent_run_key_reads_as_absent_rather_than_erroring() {
+        use windows::Win32::System::Registry::KEY_QUERY_VALUE;
+
+        // `expect` rather than a bare assertion so a regression names the OS
+        // error, which is what took three CI runs to read the first time.
+        let opened = windows_impl::open_existing_at(
+            r"Software\WinXtend\absent-key-regression-guard",
+            KEY_QUERY_VALUE,
+        )
+        .expect("a Run key that does not exist is an answer, not an error");
+        assert!(opened.is_none(), "there is no key there to hand back");
     }
 
     /// A developer's own autostart entry must survive a test run unchanged.
