@@ -327,13 +327,14 @@ every possible byte offset.
 
 `cargo test --workspace` reports **523 passing on Linux and 614 on Windows**.
 macOS reports 523 as well, for the same reason Linux does: both gates below are
-keyed on Windows, not on Linux. That is expected, not a broken checkout — a Rust test that is `#[cfg]`-gated to a
-platform is not compiled at all elsewhere, so it cannot be counted.
+keyed on Windows, not on Linux. That is expected, not a broken checkout — a Rust
+test that is `#[cfg]`-gated to a platform is not compiled at all elsewhere, so it
+cannot be counted.
 
 Nearly the whole 91-test gap is the Windows backend: `crates/wx-platform/src/windows/`
 sits behind `#[cfg(target_os = "windows")]` and carries **90 tests** that do not
-exist in a Linux build, which is exactly why `wx-platform` reports 70 tests on
-Linux against 160 on Windows. The one remaining test is
+exist in a Linux or macOS build, which is exactly why `wx-platform` reports 70
+tests on those against 160 on Windows. The one remaining test is
 `registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`,
 which is `#[cfg_attr(not(windows), ignore)]`: it compiles everywhere but only runs
 where there is an autostart mechanism to exercise, so `wx-agent` reports 139
@@ -341,10 +342,10 @@ passing on Windows and 138 passing plus one skipped on Linux and macOS alike.
 90 + 1 is the whole difference.
 
 `crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
-too, but it moves neither total: its cases are additionally `#[ignore]`d because
-they need an interactive desktop, so they are skipped on Windows and absent on
-Linux. Everything else — `wx-proto`, `wx-core`, `wx-net`, and the rest of
-`wx-video` — runs the same tests on both.
+too, but it moves no total: its cases are additionally `#[ignore]`d because
+they need an interactive desktop, so they are skipped on Windows itself and
+absent on Linux and macOS alike. Everything else — `wx-proto`, `wx-core`,
+`wx-net`, and the rest of `wx-video` — runs the same tests on all three.
 
 Once the Wayland backend has an implementation, the Linux number rises by its own
 tests; it will never converge with the Windows number, because each platform's
