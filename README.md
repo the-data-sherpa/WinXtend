@@ -1,5 +1,7 @@
 # WinXtend
 
+[![CI](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml/badge.svg)](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml)
+
 **Share one keyboard and mouse across every machine on your desk.** Move the cursor
 off the edge of one screen and it appears on the next machine — Windows, macOS, or
 Linux — with the clipboard following it and no KVM switch in sight.
