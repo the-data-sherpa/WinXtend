@@ -630,6 +630,7 @@ impl Failure {
     /// unsupported hides the one thing they could act on.
     fn from_ashpd(e: ashpd::Error, sent: TokenSent) -> Self {
         use ashpd::desktop::ResponseError;
+        use ashpd::PortalError;
 
         match e {
             ashpd::Error::Response(ResponseError::Cancelled) => {
@@ -649,16 +650,29 @@ impl Failure {
             ashpd::Error::RequiresVersion(needed, found) => Self::unsupported(format!(
                 "the desktop portal is version {found}; the libei transport needs {needed}"
             )),
-            ashpd::Error::Zbus(e) => {
+            // The portal rejected the request's arguments while we were sending a
+            // stored token — a corrupted or hand-edited token file, which nothing but
+            // forgetting it will ever clear. Deliberately narrow: this is the one
+            // error that plainly means "these arguments are not acceptable", and on
+            // the live portal a token that is not a valid UUID comes back exactly so.
+            // Widening it to failures that might not repeat would trade a wedged
+            // backend for a token deleted over a transient fault.
+            ashpd::Error::Portal(PortalError::InvalidArgument(detail))
+                if sent == TokenSent::Yes =>
+            {
+                Self::rejected_token(format!(
+                    "the desktop portal rejected the stored restore token: {detail}"
+                ))
+            }
+            // Every *method* error on a portal proxy is routed through `PortalError`,
+            // and the ones whose D-Bus name is not one of the portal's own are handed
+            // back through its `ZBus` variant — so "there is no portal on this bus"
+            // arrives here rather than as a bare `Error::Zbus`. A bare one still turns
+            // up from connecting to the bus in the first place, which is the headless
+            // case, so both shapes get the same reading.
+            ashpd::Error::Zbus(e) | ashpd::Error::Portal(PortalError::ZBus(e)) => {
                 if no_session_bus(&e) {
                     Self::unsupported(format!("no desktop session to ask for permission: {e}"))
-                } else if sent == TokenSent::Yes && rejected_arguments(&e) {
-                    // The portal rejected the request's arguments while we were
-                    // sending a stored token — a corrupted or hand-edited token file,
-                    // which nothing but forgetting it will ever clear.
-                    Self::rejected_token(format!(
-                        "the desktop portal rejected the stored restore token: {e}"
-                    ))
                 } else {
                     Self::broken(format!("talking to the desktop portal: {e}"))
                 }
@@ -706,22 +720,6 @@ fn no_session_bus(e: &ashpd::zbus::Error) -> bool {
     }
 }
 
-/// Whether a D-Bus error is the portal rejecting what was *in* the request, rather
-/// than failing to carry it out.
-///
-/// Deliberately narrow. Paired with [`TokenSent::Yes`] this is what throws the stored
-/// restore token away, so it is kept to the one error that plainly means "these
-/// arguments are not acceptable" — on the live portal, a token that is not a valid
-/// UUID comes back exactly this way. Widening it to failures that might not repeat
-/// would trade a wedged backend for a token deleted over a transient fault.
-fn rejected_arguments(e: &ashpd::zbus::Error) -> bool {
-    matches!(
-        e,
-        ashpd::zbus::Error::MethodError(name, _, _)
-            if name.as_str() == "org.freedesktop.portal.Error.InvalidArgument"
-    )
-}
-
 /// Adapts "maybe a stream" into a stream that simply never yields when absent.
 ///
 /// Lets the `select!` in [`pump`] treat a missing `Closed` watcher as a branch that
@@ -762,10 +760,14 @@ mod tests {
     /// What the portal answers with when a request's arguments are not acceptable.
     const INVALID_ARGUMENT: &str = "org.freedesktop.portal.Error.InvalidArgument";
 
-    /// The error the portal returns over D-Bus when it will not accept a request's
-    /// arguments. On the live portal a damaged restore token arrives exactly so:
-    /// `org.freedesktop.portal.Error.InvalidArgument: Restore token is not a valid
-    /// UUID string`.
+    /// A D-Bus error raised by a portal method call, in the shape `ashpd` actually
+    /// hands back.
+    ///
+    /// Built by running the raw `zbus` error through the same `PortalError`
+    /// conversion `ashpd` applies to every method call, so these tests cannot pass on
+    /// a shape the portal never produces. On the live portal a damaged restore token
+    /// arrives exactly so: `org.freedesktop.portal.Error.InvalidArgument: Restore
+    /// token is not a valid UUID string`.
     fn method_error(name: &str, detail: &str) -> ashpd::Error {
         let reply = ashpd::zbus::message::Message::method_call(
             "/org/freedesktop/portal/desktop",
@@ -774,11 +776,11 @@ mod tests {
         .unwrap()
         .build(&())
         .unwrap();
-        ashpd::Error::Zbus(ashpd::zbus::Error::MethodError(
+        ashpd::Error::Portal(ashpd::PortalError::from(ashpd::zbus::Error::MethodError(
             ashpd::zbus::names::OwnedErrorName::try_from(name.to_string()).unwrap(),
             Some(detail.to_string()),
             reply,
-        ))
+        )))
     }
 
     /// A session on a backend that advertises nothing without the portal, so
@@ -911,19 +913,20 @@ mod tests {
     #[test]
     fn a_headless_machine_is_still_unsupported_rather_than_a_rejected_token() {
         // The no-session-bus check has to keep winning over the new branch, or CI
-        // would report a missing desktop as a token problem.
+        // would report a missing desktop as a token problem. A bus with nothing
+        // implementing the portal answers a method call this way, and the name is not
+        // the portal's own, so `ashpd` passes it back through `PortalError::ZBus`.
         let failure = Failure::from_ashpd(
-            ashpd::Error::Zbus(ashpd::zbus::Error::MethodError(
-                ashpd::zbus::names::OwnedErrorName::try_from(
-                    "org.freedesktop.DBus.Error.ServiceUnknown".to_string(),
-                )
-                .unwrap(),
-                None,
-                ashpd::zbus::message::Message::method_call("/", "SelectDevices")
-                    .unwrap()
-                    .build(&())
-                    .unwrap(),
-            )),
+            method_error("org.freedesktop.DBus.Error.ServiceUnknown", "no such service"),
+            TokenSent::Yes,
+        );
+        assert!(matches!(failure.kind, FailureKind::Unsupported));
+        assert!(!failure.discards_token);
+
+        // And the case with no bus at all, which fails before any method call and so
+        // is the one shape that really does arrive as a bare `zbus` error.
+        let failure = Failure::from_ashpd(
+            ashpd::Error::Zbus(ashpd::zbus::Error::Address("no bus here".to_string())),
             TokenSent::Yes,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
