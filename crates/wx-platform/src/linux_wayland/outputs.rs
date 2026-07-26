@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_callback, wl_output, wl_registry};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 
 use super::display::{RawOutput, WL_OUTPUT_VERSION, XDG_OUTPUT_MANAGER_VERSION};
@@ -135,12 +135,13 @@ fn roundtrip(
     let _barrier = conn.display().sync(qh, ());
 
     loop {
-        queue.dispatch_pending(state).map_err(roundtrip_failed)?;
+        queue.dispatch_pending(state).map_err(dispatch_failed)?;
         if state.synced {
             return Ok(());
         }
 
-        conn.flush().map_err(roundtrip_failed)?;
+        conn.flush()
+            .map_err(|e| wayland_failed("flushing the connection", e))?;
 
         // `None` means the queue still holds events nobody has dispatched; going
         // round drains them rather than waiting for a socket that may stay quiet.
@@ -180,30 +181,63 @@ fn roundtrip(
             // Another thread beat us to the socket, or the readiness was spurious.
             // Either way the deadline still bounds the retry.
             Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(PlatformError::Other(format!("wayland read failed: {e}"))),
+            Err(e) => return Err(wayland_failed("reading from the socket", e)),
         }
     }
 }
 
-/// The one place the wording of a lost-connection failure lives.
+/// The one place the wording of a lost connection lives.
 ///
-/// [`is_self_healing`] matches on it, so a reworded copy elsewhere would silently
-/// stop being recognised.
-const ROUNDTRIP_FAILED: &str = "wayland roundtrip failed";
+/// A dead connection is reported rather than papered over: the compositor
+/// restarting is exactly the moment the layout must stop trusting its rectangles.
+/// The next call opens a new one, so this heals itself, and
+/// [`is_self_healing`] recognises it by this prefix.
+const CONNECTION_LOST: &str = "wayland connection lost";
+
+/// The one place the wording of a protocol failure lives.
+///
+/// Deliberately *not* self-healing. A message this client cannot decode, or a
+/// server-side error raised against one of its objects, means this client asked
+/// for something wrong — a version the compositor rejects, a request on a
+/// destroyed object, an unknown opcode. Reconnecting repeats it.
+const PROTOCOL_FAILED: &str = "wayland protocol error";
 
 /// The same, for the [`ENUMERATION_BUDGET`] deadline.
 const ENUMERATION_TIMED_OUT: &str = "wayland enumeration timed out";
 
-/// A dead connection is reported rather than papered over: the compositor
-/// restarting is exactly the moment the layout must stop trusting its rectangles.
-/// The next call opens a new connection, so this is self-healing.
-fn roundtrip_failed(e: impl std::fmt::Display) -> PlatformError {
-    PlatformError::Other(format!("{ROUNDTRIP_FAILED}: {e}"))
+/// Split a connection failure by what actually went wrong rather than by which
+/// call reported it: the IO half is the compositor going away, the protocol half
+/// is a bug on this side of the socket.
+fn wayland_failed(during: &str, e: WaylandError) -> PlatformError {
+    match e {
+        WaylandError::Io(e) => {
+            PlatformError::Other(format!("{CONNECTION_LOST} while {during}: {e}"))
+        }
+        WaylandError::Protocol(e) => {
+            PlatformError::Other(format!("{PROTOCOL_FAILED} while {during}: {e}"))
+        }
+    }
 }
 
-/// A compositor that stopped answering is reported the same way, and for the same
-/// reason: enumeration failure is already non-fatal upstream, so the node simply
-/// publishes no screens until the compositor recovers.
+/// `BadMessage` is an event this client failed to decode, which is the same class
+/// of bug as a protocol error and is classified with it.
+fn dispatch_failed(e: DispatchError) -> PlatformError {
+    match e {
+        DispatchError::Backend(e) => wayland_failed("dispatching events", e),
+        DispatchError::BadMessage {
+            sender_id,
+            interface,
+            opcode,
+        } => PlatformError::Other(format!(
+            "{PROTOCOL_FAILED} while dispatching events: undecodable {interface} event \
+             (opcode {opcode}) from {sender_id}"
+        )),
+    }
+}
+
+/// A compositor that stopped answering is reported the same way as one that went
+/// away, and for the same reason: enumeration failure is already non-fatal
+/// upstream, so the node simply publishes no screens until it recovers.
 fn timed_out() -> PlatformError {
     PlatformError::Other(format!(
         "{ENUMERATION_TIMED_OUT} after {}ms",
@@ -214,16 +248,17 @@ fn timed_out() -> PlatformError {
 /// Whether an [`enumerate`] failure is one the next call is expected to recover
 /// from on its own.
 ///
-/// Deliberately narrow: only the two failures the doc comments above call
-/// transient, matched against the constants their constructors format from rather
-/// than against a repeated literal. This is not
-/// [`PlatformError::is_transient`] — that one drives the clipboard poller's retry
+/// Positive recognition only: a losable connection and the deadline, matched
+/// against the constants their constructors format from rather than against a
+/// repeated literal. Everything else — protocol errors, undecodable messages,
+/// a `poll` that failed — is unrecognised and therefore not self-healing. This is
+/// not [`PlatformError::is_transient`], which drives the clipboard poller's retry
 /// loop for every backend and is not widened for this.
 #[cfg(test)]
 fn is_self_healing(e: &PlatformError) -> bool {
     match e {
         PlatformError::Other(msg) => {
-            msg.starts_with(ROUNDTRIP_FAILED) || msg.starts_with(ENUMERATION_TIMED_OUT)
+            msg.starts_with(CONNECTION_LOST) || msg.starts_with(ENUMERATION_TIMED_OUT)
         }
         _ => false,
     }
@@ -414,7 +449,40 @@ mod tests {
     use super::*;
     use crate::traits::DisplayEnumerator;
     use std::collections::HashSet;
+    use wayland_client::backend::protocol::ProtocolError;
+    use wayland_client::backend::ObjectId;
     use wx_proto::Monitor;
+
+    #[test]
+    fn a_lost_connection_is_self_healing_and_a_client_bug_is_not() {
+        assert!(is_self_healing(&timed_out()));
+        assert!(is_self_healing(&wayland_failed(
+            "flushing the connection",
+            WaylandError::Io(std::io::Error::from(ErrorKind::BrokenPipe)),
+        )));
+
+        // The distinction the skip in `session_monitors` rests on: these mean this
+        // client asked for something wrong, and a live compositor is the only
+        // place that shows up. Skipping them would let the assertions below pass
+        // against a backend that enumerates nothing.
+        let protocol = wayland_failed(
+            "dispatching events",
+            WaylandError::Protocol(ProtocolError {
+                code: 0,
+                object_id: 7,
+                object_interface: "wl_output".into(),
+                message: "invalid version".into(),
+            }),
+        );
+        assert!(!is_self_healing(&protocol), "{protocol}");
+
+        let bad_message = dispatch_failed(DispatchError::BadMessage {
+            sender_id: ObjectId::null(),
+            interface: "zxdg_output_v1",
+            opcode: 3,
+        });
+        assert!(!is_self_healing(&bad_message), "{bad_message}");
+    }
 
     /// The monitors of this session, or `None` when there is nothing to assert
     /// against.
@@ -427,10 +495,13 @@ mod tests {
     /// `gnome-shell --headless` with no `--virtual-monitor` — the harness AGENTS.md
     /// recommends — is exactly the first of them.
     ///
-    /// The two [`is_self_healing`] failures skip as well. The deadline exists to
-    /// stop a wedged compositor freezing the engine loop; a compositor that
-    /// hiccups past it under a parallel `cargo test` would otherwise turn that
-    /// robustness bound into a flaky suite. Anything else still panics.
+    /// The [`is_self_healing`] failures skip as well. The deadline exists to stop
+    /// a wedged compositor freezing the engine loop; a compositor that hiccups
+    /// past it under a parallel `cargo test` would otherwise turn that robustness
+    /// bound into a flaky suite. Anything else — a protocol error above all, which
+    /// would mean this client is the broken one — still panics, because a live
+    /// compositor is the only place that bug is visible and skipping would let
+    /// every assertion below pass on an empty vector.
     fn session_monitors() -> Option<Vec<Monitor>> {
         if Connection::connect_to_env().is_err() {
             eprintln!("skipped: no wayland session");

@@ -28,21 +28,20 @@ Fix the lint on the platform that reports it rather than dropping the flag.
 
 ## A Linux test count below the README's is expected
 
-The README quotes a Windows-run total, so a `cargo test --workspace` on Linux
-legitimately reports fewer. `wx-platform` is where the gap lives: a large block of
-its tests is `cfg(windows)`-gated and never runs here, a handful are
-`cfg(target_os = "linux")` and never run there, and one is
-`#[cfg_attr(not(windows), ignore)]` so it counts as ignored off Windows. Whether a
-given figure still holds is a question for the compiler, not this file:
+The README quotes a Windows-run total, so `cargo test --workspace` on Linux
+legitimately reports fewer. Three things account for the gap:
 
-```sh
-cargo test --workspace                 # the total for this platform
-cargo test -p wx-platform --lib        # the crate the gap comes from
-grep -rn 'cfg(windows)\|cfg(target_os = "linux")\|cfg_attr(not(windows)' crates/wx-platform/src
-```
+- a large block of `wx-platform` tests is gated `#[cfg(target_os = "windows")]`
+  and does not run on Linux;
+- a smaller number of tests in `wx-platform`'s Wayland backend are gated
+  `cfg(target_os = "linux")` and do not run on Windows;
+- one test, in `crates/wx-agent/src/autostart.rs`, is
+  `#[cfg_attr(not(windows), ignore)]`, so anywhere but Windows it is counted as
+  ignored rather than passed.
 
-A lower Linux number is not evidence the README is stale. Confirm with the above
-before "fixing" it — and don't copy a fresh number back into this file.
+A Linux total below a Windows-run total is therefore expected, and is not evidence
+that a quoted number is stale or wrong. `cargo test --workspace` is the only
+authority on what the current figure is — don't copy one back into this file.
 
 ## Testing Linux/Wayland backends without a second machine
 
