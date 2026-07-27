@@ -59,6 +59,17 @@ impl Capabilities {
     pub const PRIVILEGED_INJECT: Self = Self(1 << 9);
     /// Can relay traffic between peers that cannot reach each other directly.
     pub const RELAY: Self = Self(1 << 10);
+    /// Understands [`crate::ControlMsg::CapabilitiesChanged`].
+    ///
+    /// A statement about this build's wire implementation rather than about the
+    /// machine it runs on, and the thing that makes appending that variant safe
+    /// under the policy at the top of this file: peers ignore capability bits they
+    /// do not recognise, so a build that predates the message simply never
+    /// advertises this and is never sent it. Without the bit there would be no way
+    /// to honour "never send a variant the other side did not advertise support
+    /// for", and an older peer would meet a variant it cannot decode on a stream
+    /// where a decode failure ends the session.
+    pub const CAPABILITY_UPDATES: Self = Self(1 << 11);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -87,7 +98,7 @@ impl Capabilities {
     ///
     /// Ordered by bit so that two machines' capability lists can be read side by
     /// side without re-sorting them in the reader's head.
-    const NAMED: [(Self, &'static str); 11] = [
+    const NAMED: [(Self, &'static str); 12] = [
         (Self::CAPTURE_INPUT, "CAPTURE_INPUT"),
         (Self::INJECT_INPUT, "INJECT_INPUT"),
         (Self::HAS_DISPLAYS, "HAS_DISPLAYS"),
@@ -99,6 +110,7 @@ impl Capabilities {
         (Self::SCREENSAVER_SYNC, "SCREENSAVER_SYNC"),
         (Self::PRIVILEGED_INJECT, "PRIVILEGED_INJECT"),
         (Self::RELAY, "RELAY"),
+        (Self::CAPABILITY_UPDATES, "CAPABILITY_UPDATES"),
     ];
 
     /// Names of the bits that are set.
@@ -200,21 +212,29 @@ pub fn check_version(peer_version: u16) -> VersionCheck {
 mod tests {
     use super::*;
 
+    /// Every bit this build defines, in one place.
+    ///
+    /// One list rather than one per test: the bug this guards against is a bit
+    /// added to the impl and forgotten somewhere else, and a second copy of the
+    /// list is just another place to forget it.
+    const ALL: [Capabilities; 12] = [
+        Capabilities::CAPTURE_INPUT,
+        Capabilities::INJECT_INPUT,
+        Capabilities::HAS_DISPLAYS,
+        Capabilities::CLIPBOARD_TEXT,
+        Capabilities::CLIPBOARD_IMAGE,
+        Capabilities::FILE_TRANSFER,
+        Capabilities::VIDEO_SOURCE,
+        Capabilities::VIDEO_SINK,
+        Capabilities::SCREENSAVER_SYNC,
+        Capabilities::PRIVILEGED_INJECT,
+        Capabilities::RELAY,
+        Capabilities::CAPABILITY_UPDATES,
+    ];
+
     #[test]
     fn capability_bits_are_distinct() {
-        let all = [
-            Capabilities::CAPTURE_INPUT,
-            Capabilities::INJECT_INPUT,
-            Capabilities::HAS_DISPLAYS,
-            Capabilities::CLIPBOARD_TEXT,
-            Capabilities::CLIPBOARD_IMAGE,
-            Capabilities::FILE_TRANSFER,
-            Capabilities::VIDEO_SOURCE,
-            Capabilities::VIDEO_SINK,
-            Capabilities::SCREENSAVER_SYNC,
-            Capabilities::PRIVILEGED_INJECT,
-            Capabilities::RELAY,
-        ];
+        let all = ALL;
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
                 if i != j {
@@ -255,21 +275,10 @@ mod tests {
     #[test]
     fn every_known_bit_has_a_name() {
         // A bit added without a name would be reported as "bit N" in a refusal,
-        // which tells the user nothing about what their machine cannot do.
-        let all = [
-            Capabilities::CAPTURE_INPUT,
-            Capabilities::INJECT_INPUT,
-            Capabilities::HAS_DISPLAYS,
-            Capabilities::CLIPBOARD_TEXT,
-            Capabilities::CLIPBOARD_IMAGE,
-            Capabilities::FILE_TRANSFER,
-            Capabilities::VIDEO_SOURCE,
-            Capabilities::VIDEO_SINK,
-            Capabilities::SCREENSAVER_SYNC,
-            Capabilities::PRIVILEGED_INJECT,
-            Capabilities::RELAY,
-        ];
-        for cap in all {
+        // which tells the user nothing about what their machine cannot do. The
+        // fallback is there for a *peer* built against a newer protocol, so a bit
+        // this build advertises itself reaching it is always a mistake.
+        for cap in ALL {
             let names = cap.names();
             assert_eq!(names.len(), 1, "{cap:?} named {names:?}");
             assert!(!names[0].starts_with("bit "), "{cap:?} has no name");

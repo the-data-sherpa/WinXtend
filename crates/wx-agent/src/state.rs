@@ -877,6 +877,53 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_that_did_not_advertise_the_message_is_never_sent_it() {
+        // An older build has no `CapabilitiesChanged` variant to decode into, and
+        // the control stream tears down when a decode fails. Skipping that peer
+        // costs it one update; sending it would cost it the session. The bit in the
+        // handshake is the only statement it makes about which it is.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        let older = info(2, vec![]);
+        assert!(
+            !older
+                .capabilities
+                .contains(Capabilities::CAPABILITY_UPDATES),
+            "the older build advertises nothing about this message"
+        );
+        state.on_session(older.clone(), true, now);
+
+        assert!(
+            state.is_reachable(node(2)),
+            "an older peer is still a peer, and still gets everything else"
+        );
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(Capabilities::CAPABILITY_UPDATES));
+
+        // The same machine on a build that does understand the message.
+        let newer = NodeInfo {
+            capabilities: older.capabilities.union(Capabilities::CAPABILITY_UPDATES),
+            ..older
+        };
+        state.on_session(newer, true, now);
+        assert!(state
+            .peer_capabilities(node(2))
+            .contains(Capabilities::CAPABILITY_UPDATES));
+    }
+
+    #[test]
+    fn a_peer_that_has_not_introduced_itself_is_sent_nothing_optional() {
+        // A peer known only from discovery has advertised nothing, so the answer
+        // has to be no rather than an assumption.
+        let now = Instant::now();
+        let (state, _, _) = state_with_peer(1, 2, now);
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(Capabilities::CAPABILITY_UPDATES));
+    }
+
+    #[test]
     fn an_unpaired_session_is_not_treated_as_reachable() {
         // A pairing-mode session must not be able to inject input; the whole
         // point of admitting it is to show the user a PIN prompt.

@@ -11,7 +11,7 @@
 //! | Windows | `WH_KEYBOARD_LL` / `WH_MOUSE_LL` | `SendInput` | implemented |
 //! | macOS | `CGEventTap` | `CGEventPost` | skeleton |
 //! | Linux/X11 | XInput2 raw events | XTEST | skeleton |
-//! | Linux/Wayland | libei via portal | libei | displays implemented, input skeleton |
+//! | Linux/Wayland | libei via portal | libei | displays, portal session and libei transport implemented; event translation still a skeleton |
 //! | Linux headless | evdev | uinput | skeleton |
 //!
 //! Wayland matters: it is the default on current Fedora, Ubuntu, and Steam Deck,
@@ -62,6 +62,10 @@ pub use traits::{
     ScreenSaverControl,
 };
 
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use wx_proto::{Capabilities, DisplayServer, Platform};
 
 /// What a node advertises about itself in the handshake.
@@ -70,11 +74,46 @@ use wx_proto::{Capabilities, DisplayServer, Platform};
 /// theoretically supports: on macOS the same binary reports different capabilities
 /// depending on which permissions the user has granted, and a peer needs the real
 /// answer to decide whether to offer clipboard sync.
+///
+/// This is the answer *at startup*. Where a backend's permissions can be granted
+/// or withdrawn while the process runs, [`PlatformBackend::current_capabilities`]
+/// is the authority — see [`LiveCapabilities`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformInfo {
     pub platform: Platform,
     pub display_server: DisplayServer,
     pub capabilities: Capabilities,
+}
+
+/// A capability set that can change after startup.
+///
+/// Most backends know at construction what they can do and never revise it. The
+/// Wayland backend cannot: its capture and injection permissions live in an
+/// `xdg-desktop-portal` session that the user grants through a dialog and that the
+/// compositor may revoke at any moment. A node that advertised `CAPTURE_INPUT`
+/// once at startup and never corrected itself would keep telling peers it can
+/// drive them long after the user said no.
+///
+/// Shared rather than copied, so the thread that owns the permission can publish
+/// a change without a channel back to whoever is advertising.
+#[derive(Clone, Debug)]
+pub struct LiveCapabilities(Arc<AtomicU32>);
+
+impl LiveCapabilities {
+    /// For a backend whose capabilities are decided once and never change.
+    pub fn fixed(capabilities: Capabilities) -> Self {
+        Self(Arc::new(AtomicU32::new(capabilities.0)))
+    }
+
+    pub fn get(&self) -> Capabilities {
+        Capabilities(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Publish a new set. Returns whether it differs from what was published
+    /// before, so a caller can re-advertise only on a real change.
+    pub fn set(&self, capabilities: Capabilities) -> bool {
+        self.0.swap(capabilities.0, Ordering::Relaxed) != capabilities.0
+    }
 }
 
 /// The assembled backend for this machine.
@@ -91,11 +130,26 @@ pub struct PlatformInfo {
 /// attempt.
 pub struct PlatformBackend {
     pub info: PlatformInfo,
+    /// Capabilities as they stand now, which on some backends is not what
+    /// `info.capabilities` said at startup. Read it through
+    /// [`PlatformBackend::current_capabilities`].
+    pub live_capabilities: LiveCapabilities,
     pub displays: Box<dyn DisplayEnumerator>,
     pub capture: Box<dyn InputCapture>,
     pub injector: Box<dyn InputInjector>,
     pub clipboard: Box<dyn ClipboardAccess>,
     pub screensaver: Box<dyn ScreenSaverControl>,
+}
+
+impl PlatformBackend {
+    /// What this backend can honour right now.
+    ///
+    /// The value to advertise to peers. Callers should re-read it rather than
+    /// caching `info.capabilities`, because on Wayland it drops to nothing the
+    /// moment the portal session is revoked.
+    pub fn current_capabilities(&self) -> Capabilities {
+        self.live_capabilities.get()
+    }
 }
 
 impl core::fmt::Debug for PlatformBackend {
@@ -108,11 +162,19 @@ impl core::fmt::Debug for PlatformBackend {
     }
 }
 
-/// Build the backend for the compile target.
+/// Build the backend for the compile target, without acquiring any permission.
 ///
 /// On Linux the choice is made at runtime rather than compile time, because one
 /// binary has to serve X11, Wayland, and headless machines — see
 /// [`detect_display_server`].
+///
+/// # Why this does not prompt
+///
+/// Constructing a backend must be free of side effects the user can see. On
+/// Wayland, acquiring input permission means an `xdg-desktop-portal` consent
+/// dialog; a `cargo test` run that popped one on the developer's desktop would be
+/// indefensible. The daemon therefore calls [`current_platform_in`], which is the
+/// same thing plus permission acquisition.
 pub fn current_platform() -> Result<PlatformBackend> {
     #[cfg(target_os = "windows")]
     {
@@ -137,6 +199,29 @@ pub fn current_platform() -> Result<PlatformBackend> {
             backend: "unknown",
         })
     }
+}
+
+/// Build the backend and start acquiring whatever OS permissions it needs.
+///
+/// The daemon's entry point. `config_dir` is the per-user directory holding the
+/// identity key and trust store, and is where a backend persists anything it needs
+/// between runs — on Wayland, the portal restore token that keeps the consent
+/// dialog to a one-off.
+///
+/// Acquisition is asynchronous and never blocks: the Wayland consent dialog can sit
+/// on screen for as long as the user takes to read it, and an agent that could not
+/// answer `--status` until then would look hung. Capabilities appear in
+/// [`PlatformBackend::current_capabilities`] once permission is granted, and vanish
+/// again if it is withdrawn.
+pub fn current_platform_in(config_dir: &Path) -> Result<PlatformBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        if detect_display_server(&EnvVars::from_process()) == DisplayServer::Wayland {
+            return linux_wayland::backend_in(config_dir);
+        }
+    }
+    let _ = config_dir;
+    current_platform()
 }
 
 /// The environment variables that decide which Linux backend to use.

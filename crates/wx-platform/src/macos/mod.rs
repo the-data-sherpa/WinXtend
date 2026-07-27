@@ -211,6 +211,7 @@ pub fn backend() -> Result<PlatformBackend> {
             display_server: DisplayServer::Quartz,
             capabilities: Capabilities::NONE,
         },
+        live_capabilities: crate::LiveCapabilities::fixed(Capabilities::NONE),
         displays: Box::new(MacDisplays),
         capture: Box::new(MacCapture),
         injector: Box::new(MacInjector),

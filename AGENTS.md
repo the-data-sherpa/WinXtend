@@ -26,6 +26,21 @@ Related: clippy's `-D warnings` fires per-target because those `cfg` blocks diff
 lint can be clean on Linux and fail on Windows or macOS (or the reverse — see `f41c426`).
 Fix the lint on the platform that reports it rather than dropping the flag.
 
+## Constructing a platform backend must not prompt
+
+`wx_platform::current_platform()` builds a backend and acquires nothing. Only
+`current_platform_in(config_dir)` — which the daemon calls, and nothing else does — is
+allowed to ask the OS for permission. The split exists because acquiring input
+permission on Wayland means an `xdg-desktop-portal` consent dialog, and several tests
+call `current_platform()`; a `cargo test` run that put a dialog on the developer's
+screen would be indefensible. Any new backend with a permission step must keep that
+line. See the doc comments on both functions.
+
+`PlatformInfo::capabilities` is only the answer at startup. Where permission can be
+granted or withdrawn while the process runs, `PlatformBackend::current_capabilities()`
+is the authority, and `Engine::sync_capabilities` re-advertises to peers when it
+changes.
+
 ## A test total that differs by platform is expected
 
 `cargo test --workspace` legitimately reports a different total on Linux, Windows and
@@ -72,6 +87,12 @@ real compositor on one box, with no extra packages:
 
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
+
+The backend is split to keep that reachable from CI: the parts needing no desktop —
+restore-token persistence in `token.rs`, the session state machine in `session.rs` —
+are deliberately separated from everything touching D-Bus or libei (`driver.rs`, behind
+`cfg(target_os = "linux")` with a stub alongside), so this crate compiles and tests on
+all three platforms with no session. Keep that division.
 
 ## Windows-only code can be checked from Linux
 

@@ -626,9 +626,13 @@ pub use crate::config::SavedPlacement as PlacementSpec;
 /// `advertised` is what this machine has actually told the mesh it can do, and has
 /// to be passed in rather than read from `platform`: `PlatformInfo::capabilities`
 /// is fixed when the backend is built, while the advertisement is recomputed on
-/// every display hotplug. The snapshot's `capabilities` is the row a user reads
-/// when a feature is not happening between two machines, so it has to be the set
-/// peers were given, not the one this process booted with.
+/// every display hotplug and whenever permission is granted or withdrawn — on
+/// Wayland the portal grants input long after the backend was built, and takes it
+/// away again. A UI rendered from the startup value would show a machine with a
+/// live portal session as unable to capture or inject. The snapshot's
+/// `capabilities` is the row a user reads when a feature is not happening between
+/// two machines, so it has to be the set peers were given, not the one this
+/// process booted with.
 #[allow(clippy::too_many_arguments)]
 pub fn status_snapshot(
     state: &AgentState,
@@ -1291,6 +1295,56 @@ mod tests {
             serde_json::from_str::<RequestEnvelope>(r#"{"request":{"kind":"status"}}"#).is_err()
         );
         assert!(serde_json::from_str::<Request>("null").is_err());
+    }
+
+    #[test]
+    fn the_status_snapshot_reports_the_permission_this_machine_holds_now() {
+        // The UI renders what this machine can do from this field. On Wayland the
+        // portal grants input permission long after the backend was built, so a
+        // snapshot built from `PlatformInfo::capabilities` — the startup answer —
+        // would show a node with a live portal session as unable to capture or
+        // inject, which is the software misdescribing itself in the very view built
+        // to stop it doing that.
+        let startup = wx_platform::PlatformInfo {
+            platform: wx_proto::Platform::Linux,
+            display_server: wx_proto::DisplayServer::Wayland,
+            capabilities: wx_proto::Capabilities::HAS_DISPLAYS,
+        };
+        let granted = wx_proto::Capabilities::HAS_DISPLAYS
+            .union(wx_proto::Capabilities::CAPTURE_INPUT)
+            .union(wx_proto::Capabilities::INJECT_INPUT);
+
+        let now = std::time::Instant::now();
+        let state = AgentState::new(NodeId([1u8; 32]), "desk".into(), now);
+        let snapshot = status_snapshot(
+            &state,
+            &Config::default(),
+            &Layout::default(),
+            &startup,
+            granted,
+            "0.1.0",
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(snapshot.capabilities, granted.0);
+        assert_ne!(snapshot.capabilities, startup.capabilities.0);
+
+        // And the other direction: a session revoked after startup has to disappear
+        // from the snapshot too, or the UI keeps offering to drive a machine that
+        // has just lost the permission to be driven.
+        let revoked = status_snapshot(
+            &state,
+            &Config::default(),
+            &Layout::default(),
+            &wx_platform::PlatformInfo {
+                capabilities: granted,
+                ..startup
+            },
+            wx_proto::Capabilities::HAS_DISPLAYS,
+            "0.1.0",
+            Duration::from_secs(1),
+        );
+        assert_eq!(revoked.capabilities, wx_proto::Capabilities::HAS_DISPLAYS.0);
     }
 
     #[test]

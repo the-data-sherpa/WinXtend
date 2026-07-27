@@ -175,6 +175,7 @@ pub fn backend() -> Result<PlatformBackend> {
             display_server: DisplayServer::X11,
             capabilities: Capabilities::NONE,
         },
+        live_capabilities: crate::LiveCapabilities::fixed(Capabilities::NONE),
         displays: Box::new(X11Displays),
         capture: Box::new(X11Capture),
         injector: Box::new(X11Injector),

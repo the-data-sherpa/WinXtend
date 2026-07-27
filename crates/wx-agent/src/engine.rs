@@ -671,7 +671,11 @@ impl Engine {
             "starting WinXtend agent {AGENT_VERSION}"
         );
 
-        let platform = wx_platform::current_platform()?;
+        // `current_platform_in` rather than `current_platform`: this is the daemon,
+        // so it is the one caller allowed to acquire OS permissions — on Wayland,
+        // the portal consent dialog — and the config directory is where the backend
+        // keeps what it needs between runs.
+        let platform = wx_platform::current_platform_in(&config_dir)?;
         let monitors = platform.displays.monitors().unwrap_or_else(|e| {
             // Not fatal. A node with no readable displays still forwards input to
             // its peers, and taking the whole machine out of the mesh over a
@@ -1405,14 +1409,45 @@ impl Engine {
                     tracing::warn!(error = %e, "could not release input after a yield");
                 }
             }
+            ControlMsg::CapabilitiesChanged { capabilities } => {
+                // A peer whose portal session was revoked, most likely. Recording it
+                // keeps the peer's own account of what it can do current, which is
+                // what `publish_peer` below shows the user.
+                let before = self.state.peer_capabilities(node);
+                if let Some(info) = self.peer_info_mut(node) {
+                    if info.capabilities == capabilities {
+                        return;
+                    }
+                    tracing::info!(peer = %node, capabilities = capabilities.0, "a peer's capabilities changed");
+                    info.capabilities = capabilities;
+                }
+                self.publish_peer(node);
+
+                if strands_the_cursor(before, capabilities, self.router.owner() == node) {
+                    // The remote half of the rescue `sync_capabilities` performs for
+                    // this machine when it loses `CAPTURE_INPUT`. The cursor is on a
+                    // machine that has just said it can no longer inject, so every
+                    // pointer and key frame from here on lands nowhere, and anything
+                    // it is holding down would stay down. Bringing the cursor home is
+                    // the same action, and it is also what tells the peer to let go.
+                    let name = self.peer_label(node);
+                    tracing::warn!(
+                        peer = %node,
+                        machine = %name,
+                        capabilities = %capabilities.describe(),
+                        "the machine holding the cursor can no longer receive input; taking it back"
+                    );
+                    let local = self.local;
+                    let actions = reclaim_cursor(&mut self.router, local, |n| n == local);
+                    self.execute(actions, Origin::Remote).await;
+                    self.notice(
+                        ipc::NoticeLevel::Warning,
+                        format!("{name} can no longer receive input; control returned here"),
+                    );
+                }
+            }
             ControlMsg::MonitorsChanged { monitors } => {
-                let now = Instant::now();
-                let name = self
-                    .state
-                    .peer(&node)
-                    .map(|p| p.advertised_name.clone())
-                    .unwrap_or_default();
-                if let Some(info) = self.state.entry(node, &name, now).info.as_mut() {
+                if let Some(info) = self.peer_info_mut(node) {
                     info.monitors = monitors.clone();
                 }
                 // `MonitorsChanged` carries monitors and not capabilities, so the
@@ -1890,6 +1925,87 @@ impl Engine {
         self.publish_peer(driver);
     }
 
+    /// Notice that what this machine can do has changed, and tell everyone.
+    ///
+    /// Separate from the display check above, because the two change for unrelated
+    /// reasons. A Wayland node loses `CAPTURE_INPUT` and `INJECT_INPUT` the moment
+    /// the portal revokes its session — screen locked, dialog dismissed, session
+    /// expired — with every monitor still exactly where it was. Left to the display
+    /// path, that would go unannounced until somebody unplugged something.
+    ///
+    /// Polled rather than pushed: the backend that loses a permission is on its own
+    /// thread with no route into this loop, and a tick is soon enough for a change
+    /// the user just made by hand.
+    async fn sync_capabilities(&mut self) {
+        let now = capabilities_for(&self.platform, self.state.local_monitors());
+        let before = {
+            let mut info = self.local_info.lock().expect("local info lock");
+            let before = info.capabilities;
+            info.capabilities = now;
+            before
+        };
+        if before == now {
+            return;
+        }
+
+        let lost = Capabilities(before.0 & !now.0);
+        let gained = Capabilities(now.0 & !before.0);
+        tracing::info!(
+            before = before.0,
+            now = now.0,
+            "local capabilities changed; re-advertising"
+        );
+        // Only to peers that advertised they understand it. One that did not is
+        // left with the capability set it learned at the handshake, which is
+        // exactly what a build predating this message has always done.
+        self.broadcast_control_capable(
+            Capabilities::CAPABILITY_UPDATES,
+            ControlMsg::CapabilitiesChanged { capabilities: now },
+        );
+
+        if gained.contains(Capabilities::CAPTURE_INPUT) {
+            // The permission this machine needs to capture may arrive long after
+            // startup — a Wayland consent dialog is answered whenever the user gets
+            // to it — and the one `start_capture` at boot has already failed by then.
+            // No guard is needed: this only fires on a bit that was absent and is now
+            // present, which is a fresh grant rather than a retry against a refusal.
+            tracing::info!("this machine can capture input again; starting capture");
+            self.start_capture();
+        }
+
+        if lost.contains(Capabilities::CAPTURE_INPUT) {
+            // Before anything else: if the cursor is out on a peer, this machine
+            // has just lost the only way to steer it back, and whatever it was
+            // holding down there would stay down forever. Same rescue as the
+            // reclaim hotkey, which is also the path that tells the peer to let go.
+            let local = self.local;
+            let actions = reclaim_cursor(&mut self.router, local, |n| n == local);
+            self.execute(actions, Origin::Remote).await;
+
+            // Stopped, not restarted. The usual reason to lose this is a user who
+            // refused, and a daemon that answered by asking again would put the
+            // consent dialog back on their screen forever.
+            if let Err(e) = self.platform.capture.stop() {
+                tracing::debug!(error = %e, "input capture was already stopped");
+            }
+            tracing::warn!("this machine can no longer capture input");
+            self.notice(
+                ipc::NoticeLevel::Warning,
+                "this machine can no longer send input to other machines".to_string(),
+            );
+        }
+        if lost.contains(Capabilities::INJECT_INPUT) {
+            // Whatever a peer was holding down here is never coming up on its own.
+            if let Err(e) = self.platform.injector.release_all() {
+                tracing::debug!(error = %e, "nothing to release");
+            }
+            self.notice(
+                ipc::NoticeLevel::Warning,
+                "this machine can no longer be controlled by other machines".to_string(),
+            );
+        }
+    }
+
     async fn on_tick(&mut self) {
         let now = Instant::now();
 
@@ -1898,9 +2014,13 @@ impl Engine {
             if self.state.set_local_monitors(monitors.clone()) {
                 tracing::info!(count = monitors.len(), "local displays changed");
                 {
+                    // Capabilities are deliberately not touched here: unplugging the
+                    // last display drops `HAS_DISPLAYS`, and `sync_capabilities`
+                    // below is the one place that notices and tells peers. Setting
+                    // them here as well would make that call see no change and stay
+                    // quiet.
                     let mut info = self.local_info.lock().expect("local info lock");
                     info.monitors = monitors.clone();
-                    info.capabilities = capabilities_for(&self.platform, &monitors);
                 }
                 let mut layout = self.router.layout().clone();
                 if needs_placement(&layout, self.local, &monitors)
@@ -1916,6 +2036,8 @@ impl Engine {
                 });
             }
         }
+
+        self.sync_capabilities().await;
 
         // Round-trip times, for the UI and for diagnosing a slow link.
         let rtts: Vec<(NodeId, Duration)> = self
@@ -2070,6 +2192,10 @@ impl Engine {
                     &self.config,
                     &self.router.layout().to_layout(),
                     &self.platform.info,
+                    // The live advertisement, not `info.capabilities`: on Wayland
+                    // the portal grants input permission long after the backend was
+                    // built, and the UI reads this field to decide what this machine
+                    // can do.
                     self.advertised_by(self.local),
                     AGENT_VERSION,
                     self.state.uptime(Instant::now()),
@@ -2505,6 +2631,45 @@ impl Engine {
         }
     }
 
+    /// Broadcast a message only to the peers that advertised support for it.
+    ///
+    /// Skipping a peer costs it one piece of news. Sending it anyway costs it the
+    /// session: a variant its build does not have is a decode error, and a control
+    /// stream that fails to decode is torn down by construction. So a message
+    /// added after a peer's build might have been made goes out through here,
+    /// keyed to the capability bit that says the peer can decode it.
+    ///
+    /// [`Engine::peer_supports`] is the predicate rather than
+    /// [`Engine::broadcast_optional`] because a peer missing the bit is an older
+    /// build rather than a feature being refused, and this fires every time a
+    /// portal session comes or goes — the helper's per-peer warning would be
+    /// repeated noise about something nobody can act on.
+    fn broadcast_control_capable(&mut self, required: Capabilities, msg: ControlMsg) {
+        let peers: Vec<NodeId> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|n| self.state.is_reachable(*n) && self.peer_supports(*n, required))
+            .collect();
+        for node in peers {
+            self.send_to(node, Outbound::Control(msg.clone()));
+        }
+    }
+
+    /// The `NodeInfo` a peer sent at its handshake, ready to be amended.
+    ///
+    /// `None` until the peer has actually introduced itself: a control message from
+    /// one that has not creates the entry but has nothing to amend.
+    fn peer_info_mut(&mut self, node: NodeId) -> Option<&mut NodeInfo> {
+        let now = Instant::now();
+        let name = self
+            .state
+            .peer(&node)
+            .map(|p| p.advertised_name.clone())
+            .unwrap_or_default();
+        self.state.entry(node, &name, now).info.as_mut()
+    }
+
     fn publish_peer(&self, node: NodeId) {
         if let Some(peer) = self.state.peer(&node) {
             let _ = self.events.send(Event::PeerChanged {
@@ -2567,7 +2732,19 @@ impl Engine {
 /// the lid shut and no external screen would otherwise advertise `HAS_DISPLAYS`
 /// for the rest of the session, and peers would place monitors it does not have.
 fn capabilities_for(platform: &PlatformBackend, monitors: &[Monitor]) -> Capabilities {
-    with_displays(platform.info.capabilities, !monitors.is_empty())
+    // The live set, not `info.capabilities`: on Wayland input capture and injection
+    // exist only while the portal session does, and the value fixed at startup would
+    // keep telling peers this machine can drive them after the user revoked it.
+    //
+    // `CAPABILITY_UPDATES` is added unconditionally because it describes this
+    // build's wire implementation rather than the machine: every node understands
+    // the message on every platform, whatever its portal has or has not granted.
+    with_displays(
+        platform
+            .current_capabilities()
+            .union(Capabilities::CAPABILITY_UPDATES),
+        !monitors.is_empty(),
+    )
 }
 
 /// `base` with `HAS_DISPLAYS` set to match whether a screen is actually attached.
@@ -2585,6 +2762,33 @@ fn with_displays(base: Capabilities, has_displays: bool) -> Capabilities {
         // rebuilding the mask, since `Capabilities` has no removal operation.
         Capabilities(base.0 & !Capabilities::HAS_DISPLAYS.0)
     }
+}
+
+/// Whether a peer's new capability set leaves the cursor somewhere it cannot be
+/// used.
+///
+/// The mirror of the losing edge in [`Engine::sync_capabilities`]: that one reclaims
+/// when *this* machine loses `CAPTURE_INPUT` and so can no longer steer the cursor
+/// home; this one reclaims when the machine *holding* the cursor announces it can no
+/// longer take input. Both leave the user with a cursor that answers to nothing, and
+/// on the remote side the only recovery without this is a hotkey they may not know
+/// exists.
+///
+/// Keyed on the losing edge rather than on the absence of the bit, so that a peer
+/// which never advertised injection — a headless forwarder, say — does not have the
+/// cursor snatched off it every time it re-advertises anything else.
+///
+/// Pure, and separate from the engine, so both answers can be tested: losing
+/// injection while holding the cursor has to reclaim, and any other change has to
+/// leave the cursor where it is.
+fn strands_the_cursor(
+    before: Capabilities,
+    now: Capabilities,
+    peer_holds_the_cursor: bool,
+) -> bool {
+    peer_holds_the_cursor
+        && before.contains(Capabilities::INJECT_INPUT)
+        && !now.contains(Capabilities::INJECT_INPUT)
 }
 
 /// Whether an optional feature may be attempted against a machine, refusing out
@@ -3133,6 +3337,48 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_that_loses_injection_while_holding_the_cursor_gives_it_back() {
+        // A Wayland peer whose portal session is revoked announces the loss over
+        // `CapabilitiesChanged` while the cursor is sitting on it. Every frame sent
+        // from here on would land on a machine that cannot inject it, and the user
+        // would be left with a cursor that answers to nothing.
+        let has_input = Capabilities::HAS_DISPLAYS | Capabilities::INJECT_INPUT;
+        let revoked = Capabilities::HAS_DISPLAYS;
+        assert!(strands_the_cursor(has_input, revoked, true));
+
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(2, 0));
+        let actions = reclaim_cursor(&mut router, node(1), |n| n == node(1));
+        assert!(router.owns_cursor());
+        assert!(!actions.is_empty(), "the cursor was left on the peer");
+    }
+
+    #[test]
+    fn an_unrelated_capability_change_leaves_the_cursor_where_it_is() {
+        // The guard on the rescue: it has to fire on the losing edge of injection and
+        // on nothing else, or the cursor would be yanked home whenever a peer plugged
+        // in a monitor or its clipboard support landed.
+        let base = Capabilities::HAS_DISPLAYS | Capabilities::INJECT_INPUT;
+        assert!(!strands_the_cursor(
+            base,
+            base | Capabilities::CLIPBOARD_TEXT,
+            true
+        ));
+        assert!(!strands_the_cursor(base, Capabilities::INJECT_INPUT, true));
+        // Losing it while the cursor is elsewhere is somebody else's problem.
+        assert!(!strands_the_cursor(base, Capabilities::HAS_DISPLAYS, false));
+        // And a peer that never advertised injection has nothing to lose, so a
+        // re-advertisement must not read as a revocation.
+        let never = Capabilities::HAS_DISPLAYS;
+        assert!(!strands_the_cursor(never, never, true));
+        assert!(!strands_the_cursor(
+            never,
+            never | Capabilities::CLIPBOARD_TEXT,
+            true
+        ));
+    }
+
+    #[test]
     fn a_peers_displays_and_its_advertised_set_are_derived_the_same_way() {
         // Both sides of the wire turn a monitor list into `HAS_DISPLAYS`, because
         // `MonitorsChanged` carries the list and not the bit. Two rules would drift.
@@ -3154,6 +3400,55 @@ mod tests {
         assert!(!caps.contains(Capabilities::HAS_DISPLAYS));
         let caps = capabilities_for(&platform, &[mon(0, 0, 1920)]);
         assert!(caps.contains(Capabilities::HAS_DISPLAYS));
+    }
+
+    #[test]
+    fn what_a_node_advertises_follows_the_permission_it_holds_now() {
+        // On Wayland input permission arrives — and vanishes — long after startup,
+        // so what peers are told has to come from the live set rather than from the
+        // `PlatformInfo` fixed when the backend was built. Reading the startup value
+        // here would leave a node whose portal session was revoked still inviting
+        // peers to push their cursor onto it.
+        let platform = wx_platform::current_platform().unwrap();
+        let screens = [mon(0, 0, 1920)];
+
+        platform
+            .live_capabilities
+            .set(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT);
+        let granted = capabilities_for(&platform, &screens);
+        assert!(granted.contains(Capabilities::CAPTURE_INPUT));
+        assert!(granted.contains(Capabilities::INJECT_INPUT));
+
+        platform.live_capabilities.set(Capabilities::NONE);
+        let revoked = capabilities_for(&platform, &screens);
+        assert!(!revoked.contains(Capabilities::CAPTURE_INPUT));
+        assert!(!revoked.contains(Capabilities::INJECT_INPUT));
+        assert!(
+            revoked.contains(Capabilities::HAS_DISPLAYS),
+            "screens are not a portal permission and must survive a revocation"
+        );
+    }
+
+    #[test]
+    fn every_node_advertises_that_it_understands_capability_updates() {
+        // The bit peers gate `CapabilitiesChanged` on. It describes this build's
+        // wire implementation, not the machine, so it has to be advertised on every
+        // platform, with or without displays, and whatever the portal has granted —
+        // a node that dropped it while its permission was gone would stop being
+        // told about its peers' permissions too.
+        let platform = wx_platform::current_platform().unwrap();
+
+        platform
+            .live_capabilities
+            .set(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT);
+        assert!(capabilities_for(&platform, &[mon(0, 0, 1920)])
+            .contains(Capabilities::CAPABILITY_UPDATES));
+
+        platform.live_capabilities.set(Capabilities::NONE);
+        assert!(
+            capabilities_for(&platform, &[]).contains(Capabilities::CAPABILITY_UPDATES),
+            "a headless node with no permission still understands the message"
+        );
     }
 
     #[test]

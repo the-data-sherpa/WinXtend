@@ -167,6 +167,46 @@ async fn a_key_event_arrives_on_the_reliable_plane() {
 }
 
 #[tokio::test]
+async fn a_revoked_portal_session_reaches_the_peer_over_a_real_control_stream() {
+    // `CapabilitiesChanged` is the one variant appended to `ControlMsg` after the
+    // format was already in use, and the wire format is positional. Getting that
+    // wrong does not fail politely: a control message that will not decode tears
+    // the stream down, so the Wayland machine that just lost its portal session
+    // would lose its peer as well. The in-memory round trip pins the tag; this
+    // pins that quinn, the framing and the codec agree on it too.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (client, _ce) = client.expect("client handshake");
+    let (_server, mut server_events) = server.expect("server handshake");
+
+    // A Wayland node whose consent was withdrawn: it keeps its screens, and loses
+    // everything that needed the portal.
+    let revoked = ControlMsg::CapabilitiesChanged {
+        capabilities: Capabilities::HAS_DISPLAYS | Capabilities::CAPABILITY_UPDATES,
+    };
+    client.send_control(&revoked).await.unwrap();
+    assert_eq!(
+        next_event(&mut server_events).await,
+        SessionEvent::Control(revoked)
+    );
+
+    // And the grant arriving late, which is the other direction the same machine
+    // moves in once the user answers the dialog.
+    let granted = ControlMsg::CapabilitiesChanged {
+        capabilities: Capabilities::HAS_DISPLAYS
+            | Capabilities::CAPABILITY_UPDATES
+            | Capabilities::CAPTURE_INPUT
+            | Capabilities::INJECT_INPUT,
+    };
+    client.send_control(&granted).await.unwrap();
+    assert_eq!(
+        next_event(&mut server_events).await,
+        SessionEvent::Control(granted)
+    );
+}
+
+#[tokio::test]
 async fn both_planes_are_usable_on_the_same_connection() {
     // Regression guard for the stream layout: if reliable input shared the
     // control stream, or the input stream tag were mismatched, one of these two
