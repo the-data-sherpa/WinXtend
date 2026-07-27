@@ -1041,9 +1041,60 @@ impl Engine {
                 self.execute(actions, Origin::Remote).await;
             }
             HotkeyAction::LockAll => {
-                self.broadcast_control(ControlMsg::LockSession);
-                if let Err(e) = self.platform.screensaver.lock_session() {
+                let mut unlocked = self.broadcast_optional(
+                    Capabilities::SCREENSAVER_SYNC,
+                    "lock the session",
+                    ControlMsg::LockSession,
+                );
+                // This machine is asked the same question as a peer, and through the
+                // same check, because the notice below names the machines still on
+                // screen and this one is no less on screen for being the one the
+                // hotkey was pressed on.
+                let local = self.local;
+                let label = self.peer_label(local);
+                // A machine that can lock but just failed to is a different fact from
+                // one that cannot lock at all, and only this one carries an error the
+                // user can act on, so it is reported separately rather than folded
+                // into the list above.
+                let mut local_failure = None;
+                if !permit_optional(
+                    self.advertised_by(local),
+                    Capabilities::SCREENSAVER_SYNC,
+                    local,
+                    &label,
+                    "lock this session",
+                ) {
+                    unlocked.push(label);
+                } else if let Err(e) = self.platform.screensaver.lock_session() {
                     tracing::warn!(error = %e, "could not lock this session");
+                    local_failure = Some(format!("{label} was left unlocked: {e}"));
+                }
+                unlocked.sort();
+                // The hotkey is invisible by design, so a machine left unlocked would
+                // otherwise be discovered by walking over to it and finding the
+                // desktop still on screen.
+                let mut message = if unlocked.is_empty() {
+                    String::new()
+                } else if unlocked.len() == 1 {
+                    format!(
+                        "{} was left unlocked: it cannot lock its own session",
+                        unlocked[0]
+                    )
+                } else {
+                    format!(
+                        "These machines were left unlocked, because they cannot lock \
+                         their own sessions: {}",
+                        unlocked.join(", ")
+                    )
+                };
+                if let Some(failure) = local_failure {
+                    if !message.is_empty() {
+                        message.push_str(". ");
+                    }
+                    message.push_str(&failure);
+                }
+                if !message.is_empty() {
+                    self.notice(ipc::NoticeLevel::Warning, message);
                 }
             }
         }
@@ -1234,6 +1285,31 @@ impl Engine {
         // Asked for as well as sent: whichever side has the higher revision wins,
         // and a reconnecting node with a stale copy needs the other's.
         self.send_to(node, Outbound::Control(ControlMsg::LayoutRequest));
+
+        // A machine with a place in the layout that cannot take input is the exact
+        // failure capability negotiation exists to make visible: the cursor crosses
+        // onto it and the keyboard goes dead with nothing anywhere to say why. It is
+        // a legitimate state during the alpha, because the Linux backends land one
+        // capability at a time, so it is said once when the session comes up rather
+        // than refused outright.
+        if self.peer_supports(node, Capabilities::HAS_DISPLAYS)
+            && !self.peer_supports(node, Capabilities::INJECT_INPUT)
+        {
+            let name = self.peer_label(node);
+            tracing::warn!(
+                peer = %node,
+                machine = %name,
+                capabilities = %info.capabilities.describe(),
+                "this machine has screens but does not advertise input injection"
+            );
+            self.notice(
+                ipc::NoticeLevel::Warning,
+                format!(
+                    "{name} has screens in the layout but cannot accept input yet, \
+                     so the cursor can reach it and typing will do nothing"
+                ),
+            );
+        }
     }
 
     async fn on_peer_event(&mut self, node: NodeId, event: SessionEvent) {
@@ -1339,6 +1415,21 @@ impl Engine {
                 if let Some(info) = self.state.entry(node, &name, now).info.as_mut() {
                     info.monitors = monitors.clone();
                 }
+                // `MonitorsChanged` carries monitors and not capabilities, so the
+                // peer's advertised set has to be brought in line here or a machine
+                // whose last screen was unplugged keeps `HAS_DISPLAYS` for the rest
+                // of the session. Exactly the correction `capabilities_for` makes on
+                // this side of the wire when the local displays change, which is why
+                // both go through `with_displays`.
+                let refreshed =
+                    with_displays(self.state.peer_capabilities(node), !monitors.is_empty());
+                if self.state.set_peer_capabilities(node, refreshed) {
+                    tracing::info!(
+                        peer = %node,
+                        capabilities = %refreshed.describe(),
+                        "a peer changed what it says it can do"
+                    );
+                }
                 let mut layout = self.router.layout().clone();
                 if needs_placement(&layout, node, &monitors)
                     && autolayout::apply(&mut layout, node, &monitors)
@@ -1408,15 +1499,25 @@ impl Engine {
                 tracing::info!(peer = %node, %reason, "peer said goodbye");
                 self.on_peer_gone(node, None).await;
             }
+            ControlMsg::FileTransferOffer { .. }
+            | ControlMsg::FileTransferAccept { .. }
+            | ControlMsg::FileTransferDecline { .. }
+            | ControlMsg::FileTransferProgress { .. }
+            | ControlMsg::FileTransferDone { .. } => {
+                // No backend advertises `FILE_TRANSFER`, so a peer sending one of
+                // these has ignored the handshake. Said out loud rather than dropped
+                // at debug: the peer is waiting on an answer no code path here
+                // produces, and that silence is the whole of the failure.
+                tracing::warn!(
+                    peer = %node,
+                    capability = %Capabilities::FILE_TRANSFER.describe(),
+                    "ignoring a file transfer: this build never advertised the capability it needs"
+                );
+            }
             ControlMsg::ClipboardOffer { .. }
             | ControlMsg::ClipboardRequest { .. }
             | ControlMsg::ClipboardData { .. }
             | ControlMsg::ClipboardStale { .. }
-            | ControlMsg::FileTransferOffer { .. }
-            | ControlMsg::FileTransferAccept { .. }
-            | ControlMsg::FileTransferDecline { .. }
-            | ControlMsg::FileTransferProgress { .. }
-            | ControlMsg::FileTransferDone { .. }
             | ControlMsg::VideoStop { .. }
             | ControlMsg::VideoUnavailable { .. } => {
                 tracing::debug!(peer = %node, "ignoring a message this build does not handle");
@@ -1488,10 +1589,7 @@ impl Engine {
                     ipc::NoticeLevel::Warning,
                     format!(
                         "{} disconnected while holding the cursor; control returned here",
-                        self.state
-                            .peer(&node)
-                            .map(|p| p.display_name().to_string())
-                            .unwrap_or_else(|| node.short())
+                        self.peer_label(node)
                     ),
                 );
             }
@@ -1710,11 +1808,7 @@ impl Engine {
             // the peer is not immediately redialled into the same silence.
             self.state
                 .on_disconnected(owner, Some("stopped responding".into()), now);
-            let name = self
-                .state
-                .peer(&owner)
-                .map(|p| p.display_name().to_string())
-                .unwrap_or_else(|| owner.short());
+            let name = self.peer_label(owner);
             self.notice(
                 ipc::NoticeLevel::Warning,
                 format!("{name} stopped responding; control returned here"),
@@ -1783,11 +1877,7 @@ impl Engine {
         }
         self.state
             .on_disconnected(driver, Some("stopped responding".into()), now);
-        let name = self
-            .state
-            .peer(&driver)
-            .map(|p| p.display_name().to_string())
-            .unwrap_or_else(|| driver.short());
+        let name = self.peer_label(driver);
         self.notice(
             ipc::NoticeLevel::Warning,
             format!("{name} stopped responding; the keys it was holding were released"),
@@ -1980,6 +2070,7 @@ impl Engine {
                     &self.config,
                     &self.router.layout().to_layout(),
                     &self.platform.info,
+                    self.advertised_by(self.local),
                     AGENT_VERSION,
                     self.state.uptime(Instant::now()),
                 )),
@@ -2308,6 +2399,100 @@ impl Engine {
         }
     }
 
+    // -- capability negotiation -------------------------------------------
+
+    /// What a machine says it can do.
+    ///
+    /// The local node answers from its own advertisement rather than being assumed
+    /// capable of everything, so that a feature needing both ends — clipboard sync
+    /// needs `CLIPBOARD_TEXT` here as well as there — asks about this machine in
+    /// exactly the same way it asks about a peer.
+    fn advertised_by(&self, node: NodeId) -> Capabilities {
+        if node == self.local {
+            self.local_info
+                .lock()
+                .expect("local info lock")
+                .capabilities
+        } else {
+            self.state.peer_capabilities(node)
+        }
+    }
+
+    /// Whether a machine advertised a capability.
+    ///
+    /// The one question an optional feature asks before it does anything. A machine
+    /// that has not introduced itself advertises nothing, so the answer is no.
+    fn peer_supports(&self, node: NodeId, cap: Capabilities) -> bool {
+        self.advertised_by(node).contains(cap)
+    }
+
+    /// Label for a machine, for a log line or a notice a user has to act on.
+    ///
+    /// A hex node id names nothing anyone recognises; the local label is what they
+    /// typed into the Devices screen.
+    fn peer_label(&self, node: NodeId) -> String {
+        if node == self.local {
+            return self.state.local_name().to_string();
+        }
+        self.state
+            .peer(&node)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_else(|| node.short())
+    }
+
+    /// Send a control message to one peer, but only if the peer advertised what it
+    /// needs to act on it. Reports whether the message went.
+    ///
+    /// The seam every optional feature goes through before it sends. Clipboard,
+    /// file transfer, video and session locking all have a capability bit, and
+    /// sending one of their messages to a machine that never claimed the bit is how
+    /// a feature comes to fail with nothing in any log to attribute it to.
+    fn send_optional(
+        &mut self,
+        node: NodeId,
+        cap: Capabilities,
+        feature: &str,
+        msg: ControlMsg,
+    ) -> bool {
+        if !permit_optional(
+            self.advertised_by(node),
+            cap,
+            node,
+            &self.peer_label(node),
+            feature,
+        ) {
+            return false;
+        }
+        self.send_to(node, Outbound::Control(msg));
+        true
+    }
+
+    /// Send to every reachable peer that advertises the capability.
+    ///
+    /// Returns the machines that were skipped, in a stable order, so that a
+    /// user-initiated action can say which of them will not be doing it.
+    fn broadcast_optional(
+        &mut self,
+        cap: Capabilities,
+        feature: &str,
+        msg: ControlMsg,
+    ) -> Vec<String> {
+        let peers: Vec<NodeId> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|n| self.state.is_reachable(*n))
+            .collect();
+        let mut refused = Vec::new();
+        for node in peers {
+            if !self.send_optional(node, cap, feature, msg.clone()) {
+                refused.push(self.peer_label(node));
+            }
+        }
+        refused.sort();
+        refused
+    }
+
     fn broadcast_control(&mut self, msg: ControlMsg) {
         let peers: Vec<NodeId> = self
             .sessions
@@ -2382,14 +2567,57 @@ impl Engine {
 /// the lid shut and no external screen would otherwise advertise `HAS_DISPLAYS`
 /// for the rest of the session, and peers would place monitors it does not have.
 fn capabilities_for(platform: &PlatformBackend, monitors: &[Monitor]) -> Capabilities {
-    let base = platform.info.capabilities;
-    if monitors.is_empty() {
+    with_displays(platform.info.capabilities, !monitors.is_empty())
+}
+
+/// `base` with `HAS_DISPLAYS` set to match whether a screen is actually attached.
+///
+/// Shared by the local advertisement and by the refresh of a peer's set when it
+/// reports a hotplug, and that sharing is the point: `ControlMsg::MonitorsChanged`
+/// carries monitors and not capabilities, so each side has to derive the bit from
+/// the list itself, and two copies of that rule would eventually disagree about
+/// whether a machine has a place in the layout.
+fn with_displays(base: Capabilities, has_displays: bool) -> Capabilities {
+    if has_displays {
+        base.union(Capabilities::HAS_DISPLAYS)
+    } else {
         // No display, so no place in the layout. Clearing the bit is done by
         // rebuilding the mask, since `Capabilities` has no removal operation.
         Capabilities(base.0 & !Capabilities::HAS_DISPLAYS.0)
-    } else {
-        base.union(Capabilities::HAS_DISPLAYS)
     }
+}
+
+/// Whether an optional feature may be attempted against a machine, refusing out
+/// loud when it may not.
+///
+/// The enforcement half of capability negotiation. `warn` rather than `debug`, and
+/// both the machine and the capability named, because the alternative is what this
+/// replaces: a message dropped quietly, a feature that does nothing, and a user
+/// with no way to find out which of their machines declined or what it was missing.
+/// It is the same principle the video path already follows — a build that cannot
+/// stream refuses honestly instead of accepting a start it will never honour.
+///
+/// Pure, and separate from the engine, so that both answers can be tested: a
+/// capability that was advertised has to let the attempt through untouched, and one
+/// that was not has to produce a line naming the machine and the bit.
+fn permit_optional(
+    advertised: Capabilities,
+    cap: Capabilities,
+    node: NodeId,
+    machine: &str,
+    feature: &str,
+) -> bool {
+    if advertised.contains(cap) {
+        return true;
+    }
+    tracing::warn!(
+        peer = %node,
+        machine,
+        capability = %cap.describe(),
+        advertises = %advertised.describe(),
+        "refusing to {feature}: this machine does not advertise the capability it needs"
+    );
+    false
 }
 
 /// Permits limiting how much of one peer's inbound traffic can be in flight
@@ -2793,6 +3021,128 @@ mod tests {
         assert!(!accept_layout(&fuller, &mine));
         // And an identical layout is never re-adopted, so the exchange terminates.
         assert!(!accept_layout(&fuller, &fuller.clone()));
+    }
+
+    /// Capture what `tracing` emitted while `body` ran, as plain text.
+    ///
+    /// The refusal is a log line and nothing else — it deliberately sends no
+    /// message and returns no error — so the only way to test that it names the
+    /// machine and the capability is to read what was written. The subscriber is
+    /// installed per thread, so tests running in parallel do not see each other's.
+    fn captured_logs(body: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buffer.0.lock().expect("log buffer lock").clone();
+        String::from_utf8(bytes).expect("log output is text")
+    }
+
+    #[test]
+    fn a_feature_the_peer_advertises_is_attempted() {
+        let advertised = Capabilities::INJECT_INPUT | Capabilities::SCREENSAVER_SYNC;
+        let mut allowed = false;
+        let logs = captured_logs(|| {
+            allowed = permit_optional(
+                advertised,
+                Capabilities::SCREENSAVER_SYNC,
+                node(2),
+                "workshop-mac",
+                "lock the session",
+            );
+        });
+        assert!(allowed, "a capability the peer advertised was refused");
+        // Nothing is said about a feature that simply works; a warning per lock
+        // would train the user to ignore the ones that matter.
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    #[test]
+    fn a_feature_the_peer_does_not_advertise_is_refused_and_named() {
+        // The failure this replaces: the message went out, the other machine
+        // ignored it, and nothing anywhere said which machine or what was missing.
+        let advertised = Capabilities::INJECT_INPUT | Capabilities::HAS_DISPLAYS;
+        let mut allowed = true;
+        let logs = captured_logs(|| {
+            allowed = permit_optional(
+                advertised,
+                Capabilities::SCREENSAVER_SYNC,
+                node(2),
+                "workshop-mac",
+                "lock the session",
+            );
+        });
+        assert!(
+            !allowed,
+            "a capability the peer never claimed was attempted"
+        );
+        assert!(logs.contains("WARN"), "refused at the wrong level: {logs}");
+        assert!(
+            logs.contains("SCREENSAVER_SYNC"),
+            "the capability was not named: {logs}"
+        );
+        assert!(
+            logs.contains("workshop-mac") && logs.contains(&node(2).short()),
+            "the machine was not named: {logs}"
+        );
+    }
+
+    #[test]
+    fn a_machine_that_advertises_nothing_refuses_everything() {
+        // The state every peer is in before its handshake, and the state a Linux
+        // backend is in for most of the alpha.
+        let mut allowed = true;
+        let logs = captured_logs(|| {
+            allowed = permit_optional(
+                Capabilities::NONE,
+                Capabilities::CLIPBOARD_TEXT,
+                node(3),
+                "pi",
+                "sync the clipboard",
+            );
+        });
+        assert!(!allowed);
+        assert!(logs.contains("CLIPBOARD_TEXT"), "{logs}");
+        // And says so: an empty set has to read as a claim, not as a missing field.
+        assert!(logs.contains("nothing"), "{logs}");
+    }
+
+    #[test]
+    fn a_peers_displays_and_its_advertised_set_are_derived_the_same_way() {
+        // Both sides of the wire turn a monitor list into `HAS_DISPLAYS`, because
+        // `MonitorsChanged` carries the list and not the bit. Two rules would drift.
+        let base = Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT;
+        assert!(with_displays(base, true).contains(Capabilities::HAS_DISPLAYS));
+        assert!(!with_displays(base, false).contains(Capabilities::HAS_DISPLAYS));
+        // A peer that unplugs its last screen loses the bit and keeps the rest.
+        let dropped = with_displays(base.union(Capabilities::HAS_DISPLAYS), false);
+        assert!(!dropped.contains(Capabilities::HAS_DISPLAYS));
+        assert!(dropped.contains(Capabilities::INJECT_INPUT));
     }
 
     #[test]

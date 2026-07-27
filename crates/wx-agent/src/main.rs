@@ -236,6 +236,14 @@ async fn show_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
         }
     );
 
+    // What this machine tells the mesh it can do. The agent now refuses features a
+    // peer has not advertised, so the advertised set is the first thing to look at
+    // when something is not happening between two machines.
+    println!(
+        "can do    {}",
+        wx_proto::Capabilities(status.capabilities).describe()
+    );
+
     if status.peers.is_empty() {
         println!("\nno peers seen yet");
     } else {

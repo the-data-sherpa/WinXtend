@@ -369,7 +369,9 @@ pub enum HotkeyAction {
     ToggleLock,
     /// Bring the cursor back to this machine from wherever it is.
     ReclaimCursor,
-    /// Lock this session and ask every peer to lock theirs.
+    /// Lock this session and every peer's, skipping machines that have not
+    /// advertised they can. Runs the same path as [`crate::ipc::Request::LockAll`],
+    /// which states the contract.
     LockAll,
 }
 

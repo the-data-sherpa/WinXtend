@@ -283,4 +283,25 @@ mod tests {
             .contains(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT));
         let _ = backend;
     }
+
+    #[test]
+    fn no_backend_claims_a_capability_nothing_implements() {
+        // Runs on every target, so the claim cannot come back on one platform while
+        // a test on another goes on passing. `FILE_TRANSFER` has no implementation
+        // anywhere in the agent: a peer that believed the claim would offer a file
+        // and wait for an answer no code path produces. The bit itself stays defined
+        // — protocol enums and their capabilities are append-only — it is only never
+        // advertised.
+        let backend = current_platform().unwrap();
+        assert!(!backend
+            .info
+            .capabilities
+            .contains(Capabilities::FILE_TRANSFER));
+        // Same rule, already relied on by the Windows backend's own tests: reaching
+        // the secure desktop needs a service this process is not.
+        assert!(!backend
+            .info
+            .capabilities
+            .contains(Capabilities::PRIVILEGED_INJECT));
+    }
 }

@@ -65,6 +65,63 @@ export function displayServerLabel(server) {
   }
 }
 
+/// Every capability bit this build knows, in plain words.
+///
+/// Kept in bit order and mirroring `Capabilities` in `crates/wx-proto/src/caps.rs`,
+/// which is the definition. Decoded here rather than sent as text by the agent for
+/// the reason the snapshot's own comment gives: the bits cross as a raw `u32`, so a
+/// UI newer than the agent it is talking to can name a capability that agent has
+/// never heard of.
+const CAPABILITIES = [
+  [1 << 0, "Captures input"],
+  [1 << 1, "Accepts input"],
+  [1 << 2, "Has displays"],
+  [1 << 3, "Clipboard: text"],
+  [1 << 4, "Clipboard: images"],
+  [1 << 5, "File transfer"],
+  [1 << 6, "Sends video"],
+  [1 << 7, "Shows video"],
+  [1 << 8, "Locks with you"],
+  [1 << 9, "Types at the lock screen"],
+  [1 << 10, "Relays for others"],
+];
+
+/// What a machine says it can do, one label per bit it claims.
+///
+/// A bit this build has never heard of is listed as `bit N` rather than dropped.
+/// The point of showing this at all is that the software describes itself
+/// honestly, and quietly hiding a claim would undo that.
+export function capabilityLabels(bits) {
+  const mask = Number.isSafeInteger(bits) && bits > 0 ? bits : 0;
+  const labels = [];
+  let known = 0;
+  for (const [bit, label] of CAPABILITIES) {
+    known |= bit;
+    // >>> 0 keeps the comparison unsigned; bit 31 is negative under & alone.
+    if ((mask & bit) >>> 0) labels.push(label);
+  }
+  for (let index = 0; index < 32; index += 1) {
+    const bit = (1 << index) >>> 0;
+    if ((mask & bit) >>> 0 && !((known & bit) >>> 0)) labels.push(`bit ${index}`);
+  }
+  return labels;
+}
+
+/// The same list as one line, for a row under a machine's name.
+///
+/// An empty set means two different things, and `connected` — whether the machine
+/// has completed a handshake — is what tells them apart. A peer that has only been
+/// discovered has claimed nothing yet; one that has introduced itself and claimed
+/// no bits is reporting that it can do nothing, which is the ordinary case for
+/// every Linux and macOS peer in this build rather than an oddity. `Capabilities`
+/// in crates/wx-proto/src/caps.rs draws the same distinction, describing an empty
+/// set as "nothing".
+export function capabilitiesText(bits, connected = false) {
+  const labels = capabilityLabels(bits);
+  if (labels.length) return labels.join("  ·  ");
+  return connected ? "Reports it can do nothing" : "Nothing reported yet";
+}
+
 /// Human form of a peer's connection state, plus the class the pill is styled with.
 export function connectionState(status) {
   const state = status && typeof status === "object" ? status.state : undefined;

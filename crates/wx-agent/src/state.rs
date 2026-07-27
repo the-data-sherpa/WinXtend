@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use wx_core::layout::GlobalLayout;
 use wx_net::{DiscoveredPeer, TrustStore};
-use wx_proto::{GlobalMonitorId, Monitor, NodeId, NodeInfo, Rect};
+use wx_proto::{Capabilities, GlobalMonitorId, Monitor, NodeId, NodeInfo, Rect};
 
 /// Longest wait between reconnection attempts.
 ///
@@ -136,6 +136,21 @@ impl PeerState {
             .unwrap_or(&[])
     }
 
+    /// What this peer says it can do, or nothing at all before a session exists.
+    ///
+    /// Derived from `info` rather than kept beside it. Two copies of one fact is
+    /// how a peer's advertised set and the handshake it came from end up
+    /// disagreeing, which is the same failure the module docs give for keeping one
+    /// copy of the cursor — and here the consequence is a feature attempted against
+    /// a machine that withdrew the capability a minute ago. `info` is the peer's own
+    /// account of itself and is updated in place as the peer reports changes.
+    pub fn capabilities(&self) -> Capabilities {
+        self.info
+            .as_ref()
+            .map(|i| i.capabilities)
+            .unwrap_or(Capabilities::NONE)
+    }
+
     /// Whether this peer should participate in the mesh at all.
     pub fn is_eligible(&self) -> bool {
         self.paired && !self.blocked && self.enabled
@@ -238,6 +253,40 @@ impl AgentState {
         self.peers
             .entry(node)
             .or_insert_with(|| PeerState::new(node, name.to_string(), now))
+    }
+
+    /// What a peer says it can do, or nothing for a machine with no session.
+    ///
+    /// The one place a peer's advertised set is read from. Whether a feature is
+    /// permitted is asked in exactly one spelling, `Engine::peer_supports`, which
+    /// answers it from here; a second predicate at this level would be a seam a
+    /// caller could reach for that knows nothing about this machine.
+    pub fn peer_capabilities(&self, node: NodeId) -> Capabilities {
+        self.peers
+            .get(&node)
+            .map(PeerState::capabilities)
+            .unwrap_or(Capabilities::NONE)
+    }
+
+    /// Record what a peer now says it can do, reporting whether it changed.
+    ///
+    /// A capability set is not fixed for the life of a session: a peer whose last
+    /// screen is unplugged stops having displays, and during the alpha a peer picks
+    /// up injection or clipboard support as its backend lands. Nothing arrives to
+    /// re-run the handshake when that happens, so the stored set has to be
+    /// refreshed in place or every decision made against it is a minute out of date.
+    ///
+    /// Does nothing for a peer with no session: there is no advertised set to amend
+    /// until the machine has introduced itself.
+    pub fn set_peer_capabilities(&mut self, node: NodeId, caps: Capabilities) -> bool {
+        let Some(info) = self.peers.get_mut(&node).and_then(|p| p.info.as_mut()) else {
+            return false;
+        };
+        if info.capabilities == caps {
+            return false;
+        }
+        info.capabilities = caps;
+        true
     }
 
     /// Whether a peer can be sent input right now.
@@ -836,6 +885,64 @@ mod tests {
         state.on_session(info(2, vec![]), false, now);
         assert_eq!(state.peer(&node(2)).unwrap().status, ConnStatus::Pairing);
         assert!(!state.is_reachable(node(2)));
+    }
+
+    #[test]
+    fn a_peers_advertised_capabilities_survive_the_handshake() {
+        // The whole point of storing them: something has to be able to ask what a
+        // peer can do without holding the handshake message it arrived in.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![mon(0, 0, 0, 1920, 1080)]), true, now);
+
+        let caps = state.peer_capabilities(node(2));
+        assert!(caps.contains(wx_proto::Capabilities::INJECT_INPUT));
+        assert!(caps.contains(wx_proto::Capabilities::HAS_DISPLAYS));
+        // Never advertised, so never assumed.
+        assert!(!caps.contains(wx_proto::Capabilities::CLIPBOARD_TEXT));
+        assert!(!caps.contains(wx_proto::Capabilities::SCREENSAVER_SYNC));
+    }
+
+    #[test]
+    fn a_machine_that_has_not_introduced_itself_advertises_nothing() {
+        // Discovery supplies an address and a name and nothing else. Assuming a
+        // capability here would have the agent attempt a feature before the peer
+        // has ever said it can do it.
+        let now = Instant::now();
+        let (state, _, _) = state_with_peer(1, 2, now);
+        assert_eq!(
+            state.peer_capabilities(node(2)),
+            wx_proto::Capabilities::NONE
+        );
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(wx_proto::Capabilities::INJECT_INPUT));
+        // And a machine that is not known at all is not a special case.
+        assert_eq!(
+            state.peer_capabilities(node(7)),
+            wx_proto::Capabilities::NONE
+        );
+    }
+
+    #[test]
+    fn a_peer_that_withdraws_a_capability_is_believed() {
+        // A peer whose last screen was unplugged stops having displays. Holding the
+        // handshake's answer for the life of the session would keep the agent
+        // placing monitors on a machine that no longer has any.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![mon(0, 0, 0, 1920, 1080)]), true, now);
+
+        let reduced = wx_proto::Capabilities::CAPTURE_INPUT | wx_proto::Capabilities::INJECT_INPUT;
+        assert!(state.set_peer_capabilities(node(2), reduced));
+        assert!(!state
+            .peer_capabilities(node(2))
+            .contains(wx_proto::Capabilities::HAS_DISPLAYS));
+        // An unchanged set is not reported as a change, so nothing downstream
+        // re-renders or re-broadcasts on every tick.
+        assert!(!state.set_peer_capabilities(node(2), reduced));
+        // A peer with no session has nothing to amend.
+        assert!(!state.set_peer_capabilities(node(7), reduced));
     }
 
     #[test]

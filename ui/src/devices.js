@@ -7,7 +7,14 @@
 
 import { call, callOk, log, refreshStatus, store, changed } from "./agent.js";
 import { h, replace } from "./dom.js";
-import { connectionState, nodeColor, pinGroups, platformLabel, shortId } from "./format.js";
+import {
+  capabilitiesText,
+  connectionState,
+  nodeColor,
+  pinGroups,
+  platformLabel,
+  shortId,
+} from "./format.js";
 
 let root = null;
 /// Node id currently being renamed, so a redraw does not close the editor.
@@ -229,6 +236,21 @@ function nameCell(peer) {
   );
 }
 
+/// What a machine has told the mesh it can do.
+///
+/// Shown on every row, including this one, because the agent now refuses to attempt
+/// a feature against a machine that has not advertised it — and a refusal the user
+/// cannot see the reason for is no better than the silent failure it replaced. It is
+/// also the cheapest guard against the software claiming something it cannot do: an
+/// untrue line here is visible on the first screen of the app.
+function capabilityRow(bits, connected) {
+  return h(
+    "div",
+    { class: "facts capabilities", title: "What this machine has told the others it can do" },
+    capabilitiesText(bits, connected)
+  );
+}
+
 function peerRow(peer) {
   const state = connectionState(peer.status);
   const swatch = h("span", {
@@ -324,7 +346,8 @@ function peerRow(peer) {
       "div",
       { class: "device-main" },
       nameCell(peer),
-      h("div", { class: "facts" }, facts.join("  ·  "))
+      h("div", { class: "facts" }, facts.join("  ·  ")),
+      capabilityRow(peer.capabilities, peer.status?.state === "connected")
     ),
     h(
       "div",
@@ -366,7 +389,8 @@ function localRow() {
           `${status.monitors.length} display(s)`,
           `port ${status.port}`,
         ].join("  ·  ")
-      )
+      ),
+      capabilityRow(status.capabilities, true)
     ),
     h(
       "div",

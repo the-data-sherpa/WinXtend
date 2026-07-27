@@ -41,6 +41,13 @@ impl Capabilities {
     pub const HAS_DISPLAYS: Self = Self(1 << 2);
     pub const CLIPBOARD_TEXT: Self = Self(1 << 3);
     pub const CLIPBOARD_IMAGE: Self = Self(1 << 4);
+    /// Defined, but advertised by no backend: nothing implements the
+    /// `FileTransfer*` half of the protocol, and `wx-platform`'s
+    /// `no_backend_claims_a_capability_nothing_implements` keeps it that way.
+    /// The bit itself stays. Reusing a bit index would read an older peer's
+    /// advertisement as a capability it never claimed, so a capability that
+    /// turns out to be unimplemented stops being advertised rather than being
+    /// removed.
     pub const FILE_TRANSFER: Self = Self(1 << 5);
     /// Can encode and send its screen as video.
     pub const VIDEO_SOURCE: Self = Self(1 << 6);
@@ -63,14 +70,69 @@ impl Capabilities {
 
     /// Capabilities both nodes share.
     ///
-    /// The basis for every feature decision: clipboard images are only attempted
-    /// when both ends advertise them, and so on.
+    /// For reporting what two machines have in common. It is not where a feature
+    /// is permitted or refused: that is done one machine at a time, by
+    /// `Engine::peer_supports` in `crates/wx-agent/src/engine.rs`, so that the
+    /// refusal can name which machine was missing which bit. A feature needing
+    /// both ends — clipboard images, say — asks about each end in turn.
     pub const fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// Every bit this build knows, with the name used in logs and in the UI.
+    ///
+    /// Ordered by bit so that two machines' capability lists can be read side by
+    /// side without re-sorting them in the reader's head.
+    const NAMED: [(Self, &'static str); 11] = [
+        (Self::CAPTURE_INPUT, "CAPTURE_INPUT"),
+        (Self::INJECT_INPUT, "INJECT_INPUT"),
+        (Self::HAS_DISPLAYS, "HAS_DISPLAYS"),
+        (Self::CLIPBOARD_TEXT, "CLIPBOARD_TEXT"),
+        (Self::CLIPBOARD_IMAGE, "CLIPBOARD_IMAGE"),
+        (Self::FILE_TRANSFER, "FILE_TRANSFER"),
+        (Self::VIDEO_SOURCE, "VIDEO_SOURCE"),
+        (Self::VIDEO_SINK, "VIDEO_SINK"),
+        (Self::SCREENSAVER_SYNC, "SCREENSAVER_SYNC"),
+        (Self::PRIVILEGED_INJECT, "PRIVILEGED_INJECT"),
+        (Self::RELAY, "RELAY"),
+    ];
+
+    /// Names of the bits that are set.
+    ///
+    /// A bit this build has never heard of is reported as `bit N` rather than
+    /// dropped. A peer built against a newer protocol advertising something new is
+    /// exactly the case where "I do not know what that is" beats silence: the whole
+    /// reason these strings exist is so that a refusal, or a UI row, names what was
+    /// actually claimed.
+    pub fn names(self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (bit, name) in Self::NAMED {
+            if self.contains(bit) {
+                out.push(name.to_string());
+            }
+        }
+        let known = Self::NAMED.iter().fold(0u32, |acc, (bit, _)| acc | bit.0);
+        for index in 0..u32::BITS {
+            let bit = 1u32 << index;
+            if self.0 & bit != 0 && known & bit == 0 {
+                out.push(format!("bit {index}"));
+            }
+        }
+        out
+    }
+
+    /// The set as one line of prose, for a log field or a status row.
+    pub fn describe(self) -> String {
+        let names = self.names();
+        if names.is_empty() {
+            "nothing".to_string()
+        } else {
+            names.join(", ")
+        }
     }
 }
 
@@ -187,6 +249,55 @@ mod tests {
         assert_eq!(
             postcard::from_bytes::<Capabilities>(&bytes).unwrap(),
             future
+        );
+    }
+
+    #[test]
+    fn every_known_bit_has_a_name() {
+        // A bit added without a name would be reported as "bit N" in a refusal,
+        // which tells the user nothing about what their machine cannot do.
+        let all = [
+            Capabilities::CAPTURE_INPUT,
+            Capabilities::INJECT_INPUT,
+            Capabilities::HAS_DISPLAYS,
+            Capabilities::CLIPBOARD_TEXT,
+            Capabilities::CLIPBOARD_IMAGE,
+            Capabilities::FILE_TRANSFER,
+            Capabilities::VIDEO_SOURCE,
+            Capabilities::VIDEO_SINK,
+            Capabilities::SCREENSAVER_SYNC,
+            Capabilities::PRIVILEGED_INJECT,
+            Capabilities::RELAY,
+        ];
+        for cap in all {
+            let names = cap.names();
+            assert_eq!(names.len(), 1, "{cap:?} named {names:?}");
+            assert!(!names[0].starts_with("bit "), "{cap:?} has no name");
+        }
+    }
+
+    #[test]
+    fn names_are_listed_lowest_bit_first() {
+        let caps = Capabilities::SCREENSAVER_SYNC | Capabilities::CAPTURE_INPUT;
+        assert_eq!(caps.names(), vec!["CAPTURE_INPUT", "SCREENSAVER_SYNC"]);
+    }
+
+    #[test]
+    fn an_unknown_bit_is_reported_rather_than_dropped() {
+        // A peer built against a newer protocol claims something this build has
+        // never heard of. Showing the bit index is the honest answer; showing an
+        // empty list would make the peer look less capable than it is.
+        let future = Capabilities(1 << 30) | Capabilities::INJECT_INPUT;
+        assert_eq!(future.names(), vec!["INJECT_INPUT", "bit 30"]);
+    }
+
+    #[test]
+    fn an_empty_set_describes_itself_as_nothing() {
+        // Used in log lines, where an empty string would read as a missing field.
+        assert_eq!(Capabilities::NONE.describe(), "nothing");
+        assert_eq!(
+            (Capabilities::CAPTURE_INPUT | Capabilities::RELAY).describe(),
+            "CAPTURE_INPUT, RELAY"
         );
     }
 
