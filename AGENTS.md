@@ -100,14 +100,66 @@ real compositor on one box, with no extra packages:
   directory. The UI honours `WINXTEND_CONFIG_DIR` and `WINXTEND_AGENT` for the
   same reason.
 
+  Two agents on one host bring up, pair and lay themselves out fine — the
+  first-pass layout does **not** reliably put the second machine on the right, so
+  read the placements rather than assuming a direction. Passing the *cursor*
+  between them on one host is a different matter and is confounded, not merely
+  fiddly: both agents arm pointer barriers on every edge of the same screen and
+  the compositor allows only one active capture, and they then fight over one
+  physical pointer, because the "remote" machine's injection warps the very
+  pointer the "local" machine's capture has pinned. Budget for that before
+  spending a captain's afternoon on it; a second machine is the honest test, which
+  is what issue #11 is for.
+
+  A capture session pins the pointer and swallows the keyboard, so a test that
+  wedges leaves whoever is at the machine unable to recover. Never start one
+  without a bounded lifetime and a way to kill the agents from another terminal,
+  and say so before you run it.
+
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
 
 The backend is split to keep that reachable from CI: the parts needing no desktop —
-restore-token persistence in `token.rs`, the session state machine in `session.rs` —
-are deliberately separated from everything touching D-Bus or libei (`driver.rs`, behind
-`cfg(target_os = "linux")` with a stub alongside), so this crate compiles and tests on
-all three platforms with no session. Keep that division.
+restore-token persistence in `token.rs`, the session state machine in `session.rs`, the
+event translation in `capture.rs` — are deliberately separated from everything touching
+D-Bus or libei (`driver.rs` and `capture_driver.rs`, behind `cfg(target_os = "linux")`
+with a stub alongside each), so this crate compiles and tests on all three platforms
+with no session. Keep that division.
+
+## Wayland input needs two portals, and they are not interchangeable
+
+`org.freedesktop.portal.RemoteDesktop` **drives** a desktop and cannot capture from
+one: its session has no zones, barriers, `Enable`/`Release` or activation, and its
+libei devices are client-owned emulation devices. Capture is
+`org.freedesktop.portal.InputCapture`, which GNOME 50 is the first release to ship.
+So the backend holds two sessions and the user answers two consent dialogs per
+launch; only `RemoteDesktop` has a restore token at the versions the alpha target
+has. `SharedSession` in `crates/wx-platform/src/linux_wayland/session.rs` is
+parameterised by which capability bit it owns precisely so one being revoked cannot
+unadvertise the other.
+
+Everything measured about the capture side — that suppression is real and
+exclusive, that the compositor sends a capturing client no modifier state and no
+absolute pointer motion, that it emits no `Deactivated` for a client-initiated
+`Release`, and the barrier geometry it silently refuses — is in the module docs of
+`crates/wx-platform/src/linux_wayland/capture.rs` and `capture_driver.rs`. Read
+those before changing anything there; each line of them cost a run on real
+hardware, and every one of those failures is silent.
+
+## One keymap index serves both directions, and reads three spellings
+
+`crates/wx-platform/src/linux_wayland/keymap.rs` answers both "which key produces
+this character" (injection) and "what does this key produce" (capture) from one
+parse, so the two cannot disagree. It is hand-written rather than bound to
+`libxkbcommon`, and the reason is in its module docs — it applies to the X11
+backend too, which should reuse it rather than link the C library.
+
+Keymaps arrive in more than one legal spelling and the differences fail *silently*.
+mutter writes `map[Shift]= 2` and numeric keysyms; `xkbcomp -xkb` writes
+`map[Shift]= Level2` and names like `dead_diaeresis`. Missing either leaves shifted
+levels or dead keys unreachable while everything still appears to work — `Å` simply
+types as `å`. `keymap.rs` has fixtures for all three; add one rather than widening a
+match if a fourth turns up.
 
 ## Wayland text injection has one route, and it has a hard limit
 

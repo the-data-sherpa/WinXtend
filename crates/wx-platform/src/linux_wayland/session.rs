@@ -58,12 +58,19 @@ impl SessionState {
     }
 }
 
-/// The session as the rest of the backend sees it.
+/// One portal session's state, as the rest of the backend sees it.
 ///
-/// One of these is shared by [`super::WaylandCapture`] and [`super::WaylandInjector`]:
-/// `SelectDevices` asks for keyboard and pointer together and the portal grants one
-/// session for both, so building a second would put a second dialog on screen and
-/// leave two sessions to revoke.
+/// Two of these exist, because the desktop has two portals and they are not
+/// interchangeable. [`super::WaylandInjector`] rides on
+/// `org.freedesktop.portal.RemoteDesktop`, whose devices are *emulation* devices;
+/// [`super::WaylandCapture`] rides on `org.freedesktop.portal.InputCapture`, which
+/// is the only interface with zones, barriers and an activation to suppress local
+/// input with. Measured on the alpha target: `RemoteDesktop` delivers no captured
+/// events at all, in either handshake mode.
+///
+/// So this type is parameterised by what it owns rather than hard-coding it. Each
+/// session sets and clears exactly its own capability bit and leaves the other
+/// session's — and the backend's own `HAS_DISPLAYS` — untouched.
 #[derive(Debug)]
 pub struct SharedSession {
     status: Mutex<Status>,
@@ -73,6 +80,10 @@ pub struct SharedSession {
     /// transition, and a session going live or being revoked must not take
     /// `HAS_DISPLAYS` down with it: the screens are still there either way.
     base: Capabilities,
+    /// The bits this session governs, and the only ones it may ever set or clear.
+    owned: Capabilities,
+    /// The portal interface, for the messages the user reads.
+    portal: &'static str,
 }
 
 #[derive(Debug)]
@@ -82,36 +93,37 @@ struct Status {
     detail: String,
 }
 
-/// The bits this session governs, and the only ones it may ever set or clear.
+/// What a live `RemoteDesktop` session is worth to peers.
 ///
-/// Both, from one session: the portal's `SelectDevices` grants keyboard and pointer
-/// access that serves capture and injection alike. Fixed for the life of the type —
-/// it is the mask [`SharedSession::publish`] applies, so it says what the session
-/// *owns*, not what it currently grants. Anything outside it belongs to somebody
-/// else and survives every transition untouched.
-pub const SESSION_OWNED_CAPABILITIES: Capabilities =
-    Capabilities::CAPTURE_INPUT.union(Capabilities::INJECT_INPUT);
+/// [`Capabilities::INJECT_INPUT`], and only that. The portal grants keyboard and
+/// pointer access, but its devices are emulation devices — the seat offers
+/// "WinXtend virtual keyboard" and friends — so what this session buys is the
+/// ability to *be driven*. Capture comes from the other portal entirely; see
+/// [`INPUT_CAPTURE_CAPABILITIES`].
+pub const REMOTE_DESKTOP_CAPABILITIES: Capabilities = Capabilities::INJECT_INPUT;
 
-/// What a live portal session contributes to the advertised set.
+/// What a live `InputCapture` session is worth to peers.
 ///
-/// [`Capabilities::INJECT_INPUT`] and, for now, only that. The portal grants
-/// keyboard and pointer access that serves both directions, but a capability bit
-/// is a promise about what this backend can *do*, and today it can be driven and
-/// not drive: `WaylandInjector` translates the whole of [`wx_proto::InputEvent`]
-/// onto libei, while `WaylandCapture::start` still returns `Unsupported` because
-/// the reverse translation is a skeleton. Advertising capture here would have peers
-/// wait for input from a machine that will never send any.
-///
-/// This is the one switch, and the capture slice (#7) is what flips the other half
-/// of it to [`SESSION_OWNED_CAPABILITIES`]; the lifecycle above — activation,
-/// revocation, re-advertisement — publishes whatever it is set to with nothing
-/// else to change.
-pub const SESSION_CAPABILITIES: Capabilities = Capabilities::INJECT_INPUT;
+/// [`Capabilities::CAPTURE_INPUT`]. Advertised only while the session is actually
+/// live, and dropped the moment it is revoked, because a peer told this machine
+/// can drive it will sit waiting for input that will never come.
+pub const INPUT_CAPTURE_CAPABILITIES: Capabilities = Capabilities::CAPTURE_INPUT;
+
+/// The portal interfaces the two sessions speak, for the messages a user reads.
+pub const PORTAL_REMOTE_DESKTOP: &str = "RemoteDesktop";
+pub const PORTAL_INPUT_CAPTURE: &str = "InputCapture";
 
 impl SharedSession {
     /// `base` is what the backend advertises without a session, which this type
-    /// preserves across every transition.
-    pub fn new(live: LiveCapabilities, base: Capabilities) -> Self {
+    /// preserves across every transition. `owned` is the bit this session governs
+    /// and the only one it may set or clear; `portal` names the interface in the
+    /// errors a user reads.
+    pub fn new(
+        live: LiveCapabilities,
+        base: Capabilities,
+        owned: Capabilities,
+        portal: &'static str,
+    ) -> Self {
         Self {
             status: Mutex::new(Status {
                 state: SessionState::Idle,
@@ -119,6 +131,8 @@ impl SharedSession {
             }),
             live,
             base,
+            owned,
+            portal,
         }
     }
 
@@ -171,7 +185,10 @@ impl SharedSession {
         let status = self.lock();
         let detail = || {
             if status.detail.is_empty() {
-                "the xdg-desktop-portal RemoteDesktop session is not available".to_string()
+                format!(
+                    "the xdg-desktop-portal {} session is not available",
+                    self.portal
+                )
             } else {
                 status.detail.clone()
             }
@@ -179,13 +196,17 @@ impl SharedSession {
         match status.state {
             SessionState::Active => None,
             SessionState::Denied => Some(PlatformError::PermissionDenied(detail())),
+            // The operation string has to be `'static`, so the two portals get one
+            // wording rather than a leaked per-session string; the detail above
+            // names which one wherever it matters.
             SessionState::Unsupported => Some(PlatformError::Unsupported {
-                operation: "the xdg-desktop-portal RemoteDesktop session",
+                operation: "the xdg-desktop-portal input session",
                 backend: BACKEND,
             }),
-            SessionState::Idle => Some(PlatformError::Other(
-                "the xdg-desktop-portal RemoteDesktop session was never started".into(),
-            )),
+            SessionState::Idle => Some(PlatformError::Other(format!(
+                "the xdg-desktop-portal {} session was never started",
+                self.portal
+            ))),
             SessionState::Starting => Some(PlatformError::Other(
                 "waiting for the desktop portal consent dialog".into(),
             )),
@@ -197,7 +218,7 @@ impl SharedSession {
     /// touched.
     ///
     /// Written as a read-modify-write over the published set rather than as
-    /// `base | granted`, because this type owns [`SESSION_OWNED_CAPABILITIES`] and
+    /// `base | granted`, because this type owns [`REMOTE_DESKTOP_CAPABILITIES`] and
     /// nothing more. `base` is the floor it can never publish less than; a bit
     /// somebody else put on the live set — one that describes the build rather
     /// than the portal — is not this type's to clear, and replacing the whole set
@@ -205,13 +226,13 @@ impl SharedSession {
     /// or went away. Only the session's own bits are set here, and `granted` is
     /// masked so a caller cannot smuggle a foreign bit in through it either.
     ///
-    /// Masked against what the session *owns* rather than against what it currently
-    /// grants, so that the clear on the way out stays real while
-    /// [`SESSION_CAPABILITIES`] is empty.
+    /// Masked against what the session *owns* rather than against what it
+    /// currently grants, so the clear on the way out stays real however small the
+    /// grant was — and so the two sessions cannot overwrite each other's bit.
     fn publish(&self, granted: Capabilities) {
         let held = self.live.get().union(self.base);
         self.live.set(Capabilities(
-            (held.0 & !SESSION_OWNED_CAPABILITIES.0) | (granted.0 & SESSION_OWNED_CAPABILITIES.0),
+            (held.0 & !self.owned.0) | (granted.0 & self.owned.0),
         ));
     }
 
@@ -267,10 +288,40 @@ mod tests {
         with_base(Capabilities::NONE)
     }
 
-    /// A session on a backend that already advertises `base` without any portal.
+    /// The `RemoteDesktop` session on a backend that already advertises `base`
+    /// without any portal.
     fn with_base(base: Capabilities) -> (SharedSession, LiveCapabilities) {
         let live = LiveCapabilities::fixed(base);
-        (SharedSession::new(live.clone(), base), live)
+        (
+            SharedSession::new(
+                live.clone(),
+                base,
+                REMOTE_DESKTOP_CAPABILITIES,
+                PORTAL_REMOTE_DESKTOP,
+            ),
+            live,
+        )
+    }
+
+    /// The two sessions sharing one published set, which is what the backend
+    /// really has.
+    fn both(base: Capabilities) -> (SharedSession, SharedSession, LiveCapabilities) {
+        let live = LiveCapabilities::fixed(base);
+        (
+            SharedSession::new(
+                live.clone(),
+                base,
+                REMOTE_DESKTOP_CAPABILITIES,
+                PORTAL_REMOTE_DESKTOP,
+            ),
+            SharedSession::new(
+                live.clone(),
+                base,
+                INPUT_CAPTURE_CAPABILITIES,
+                PORTAL_INPUT_CAPTURE,
+            ),
+            live,
+        )
     }
 
     #[test]
@@ -283,41 +334,65 @@ mod tests {
 
     #[test]
     fn a_live_session_publishes_exactly_what_it_was_granted() {
-        // Drives the mechanism with an explicit non-empty grant rather than with
-        // whatever `SESSION_CAPABILITIES` happens to be today, so the publish path
-        // stays proven while the shipped contribution is empty — and so the slices
-        // that repopulate it inherit a test that already covers them.
         let (s, live) = session();
         s.starting();
         assert!(
             live.get().is_empty(),
             "nothing is granted until Start returns"
         );
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert_eq!(s.state(), SessionState::Active);
-        assert!(live.get().contains(Capabilities::CAPTURE_INPUT));
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
         assert!(s.error().is_none());
     }
 
     #[test]
-    fn a_live_session_advertises_injection_and_not_capture() {
-        // Today's truth, and the reason it is true: injection is implemented and
-        // capture is not, so a granted session must tell peers this machine can be
-        // driven without also claiming it can drive.
-        assert!(SESSION_CAPABILITIES.contains(Capabilities::INJECT_INPUT));
-        assert!(!SESSION_CAPABILITIES.contains(Capabilities::CAPTURE_INPUT));
+    fn each_portal_advertises_its_own_half_and_only_that() {
+        // The two sessions are separate grants on separate portals, with separate
+        // consent dialogs, and either can be refused on its own. A machine that
+        // may be driven but cannot drive is the ordinary headless case; a machine
+        // that can drive but not be driven is what a user who said no to one
+        // dialog has. Both have to be sayable.
+        assert!(REMOTE_DESKTOP_CAPABILITIES.contains(Capabilities::INJECT_INPUT));
+        assert!(!REMOTE_DESKTOP_CAPABILITIES.contains(Capabilities::CAPTURE_INPUT));
+        assert!(INPUT_CAPTURE_CAPABILITIES.contains(Capabilities::CAPTURE_INPUT));
+        assert!(!INPUT_CAPTURE_CAPABILITIES.contains(Capabilities::INJECT_INPUT));
 
-        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
-        s.starting();
-        s.activate(SESSION_CAPABILITIES);
-        assert_eq!(s.state(), SessionState::Active);
+        let (inject, capture, live) = both(Capabilities::HAS_DISPLAYS);
+        inject.starting();
+        inject.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
         assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+
+        capture.starting();
+        capture.activate(INPUT_CAPTURE_CAPABILITIES);
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(live.get().contains(Capabilities::CAPTURE_INPUT));
         assert!(
             live.get().contains(Capabilities::HAS_DISPLAYS),
-            "the screens are real whatever the portal answered"
+            "the screens are real whatever either portal answered"
         );
+    }
+
+    #[test]
+    fn losing_one_portal_does_not_unadvertise_the_other() {
+        // The failure this parameterisation exists to prevent. Both sessions
+        // publish into one set, and a shared mask would have the capture session's
+        // revocation clear injection — leaving a machine that can still perfectly
+        // well be driven telling its peers it cannot.
+        let (inject, capture, live) = both(Capabilities::HAS_DISPLAYS);
+        inject.starting();
+        inject.activate(REMOTE_DESKTOP_CAPABILITIES);
+        capture.starting();
+        capture.activate(INPUT_CAPTURE_CAPABILITIES);
+
+        capture.denied("the user closed the sharing indicator");
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+        assert!(
+            live.get().contains(Capabilities::INJECT_INPUT),
+            "capture being revoked stopped this machine being driven"
+        );
+        assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
     }
 
     #[test]
@@ -327,7 +402,7 @@ mod tests {
         // moment the portal takes the session back.
         let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
         s.starting();
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
         s.denied("the desktop portal revoked the session");
         assert!(!live.get().contains(Capabilities::INJECT_INPUT));
@@ -341,7 +416,7 @@ mod tests {
         // UI turns into an actionable prompt.
         let (s, live) = session();
         s.starting();
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         s.denied("the desktop portal revoked the session");
 
         assert_eq!(s.state(), SessionState::Denied);
@@ -361,7 +436,7 @@ mod tests {
         s.denied("dialog dismissed");
 
         s.starting();
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
 
         assert_eq!(s.state(), SessionState::Denied);
         assert!(
@@ -376,7 +451,7 @@ mod tests {
         // a permission problem they need to act on.
         let (s, _) = session();
         s.starting();
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         s.stopped();
         s.denied("revoked");
         assert_eq!(s.state(), SessionState::Stopped);
@@ -429,7 +504,7 @@ mod tests {
 
     #[test]
     fn the_sessions_transitions_leave_display_capability_alone() {
-        // The session owns capture and injection and nothing else. Publishing its
+        // A session owns its own input bit and nothing else. Publishing its
         // grant used to replace the whole set, which silently unadvertised the
         // screens found by display enumeration the moment the portal answered —
         // and again when it was revoked, taking the node out of peers' layouts
@@ -440,9 +515,9 @@ mod tests {
         s.starting();
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
 
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
-        assert!(live.get().contains(SESSION_OWNED_CAPABILITIES));
+        assert!(live.get().contains(REMOTE_DESKTOP_CAPABILITIES));
 
         s.denied("the desktop portal revoked the session");
         assert!(
@@ -457,16 +532,16 @@ mod tests {
     fn a_bit_this_session_does_not_own_survives_every_transition() {
         // `CAPABILITY_UPDATES` says what this build's wire implementation
         // understands, so it is true on a machine whose portal never answered and
-        // must not blink off when one does. The session owns capture and injection
-        // and nothing else; anything else on the published set is somebody's to
-        // keep, not this type's to overwrite.
+        // must not blink off when one does. A session owns its own input bit and
+        // nothing else; anything else on the published set is somebody's to keep,
+        // not this type's to overwrite.
         let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
         live.set(Capabilities::HAS_DISPLAYS.union(Capabilities::CAPABILITY_UPDATES));
 
         s.starting();
-        s.activate(SESSION_OWNED_CAPABILITIES);
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));
-        assert!(live.get().contains(SESSION_OWNED_CAPABILITIES));
+        assert!(live.get().contains(REMOTE_DESKTOP_CAPABILITIES));
 
         s.denied("the desktop portal revoked the session");
         assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));

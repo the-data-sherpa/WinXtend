@@ -9,10 +9,12 @@
 //!
 //! # What the backends must supply
 //!
-//! Each OS backend does the syscall part — `ToUnicodeEx` on Windows,
-//! `UCKeyTranslate` on macOS, `xkb_state_key_get_utf8` on X11/Wayland — and hands
-//! the result over as a [`RawKey`]. Everything after that is platform-independent
-//! and lives here, so the composition rules cannot drift between backends.
+//! Each OS backend does the layout part — `ToUnicodeEx` on Windows,
+//! `UCKeyTranslate` on macOS, and on Wayland the compositor's own xkb keymap,
+//! read in pure Rust by [`crate::linux_wayland::keymap`], which the X11 backend is
+//! to reuse rather than link `libxkbcommon` — and hands the result over as a
+//! [`RawKey`]. Everything after that is platform-independent and lives here, so
+//! the composition rules cannot drift between backends.
 //!
 //! The one thing here that runs on the *receiving* side is [`decompose`], the
 //! inverse of [`compose`]: an injector whose layout has no single key for `é` types
@@ -228,15 +230,24 @@ impl KeyResolver {
         // A pending accent that cannot compose with this key (a function key, an
         // arrow, an unmapped code) is flushed rather than discarded: the user
         // typed it and losing input silently is worse than an extra character.
-        if self.pending_dead.is_some() && !matches!(payload, KeyPayload::Text(_)) {
+        //
+        // A level modifier is not one of those keys: see [`holds_composition`].
+        let composing = matches!(payload, KeyPayload::Text(_))
+            || matches!(payload, KeyPayload::Special(k) if holds_composition(k));
+        if self.pending_dead.is_some() && !composing {
             if let Some(previous) = self.pending_dead.take() {
                 out.extend(flush_accent(previous));
             }
         }
 
-        let payload = match (self.pending_dead.take(), payload) {
-            (Some(accent), KeyPayload::Text(text)) => KeyPayload::Text(compose(accent, &text)),
-            (_, payload) => payload,
+        let payload = match payload {
+            KeyPayload::Text(text) => match self.pending_dead.take() {
+                Some(accent) => KeyPayload::Text(compose(accent, &text)),
+                None => KeyPayload::Text(text),
+            },
+            // The accent stays pending across a level modifier; every other payload
+            // has already flushed it above.
+            payload => payload,
         };
 
         self.record_down(raw, Some(payload.clone()));
@@ -322,6 +333,32 @@ impl KeyResolver {
         self.pending_dead = None;
         self.down.clear();
     }
+}
+
+/// Whether a bare modifier press leaves a composition in progress alone.
+///
+/// The *level* modifiers, and only those. Nothing cancels or commits a composition
+/// because the user reached for the shift that types the letter the accent is going
+/// to compose with: `^` then Shift then `E` is `Ê` on every desktop, not `^E`, and
+/// on a European layout the accent itself is often reached through AltGr.
+///
+/// Ctrl, Alt and Super are the opposite case and are deliberately excluded. Holding
+/// one of those means a shortcut, and composing the accent onto the shortcut's
+/// letter sends the peer a character its layout cannot resolve, carrying the CTRL
+/// bit — so the shortcut silently never fires. A stray accent is a blemish; a dead
+/// `Ctrl+S` is a broken feature. GTK draws the same line: it declines to feed a
+/// keypress into the compose table while Ctrl or Alt is held.
+///
+/// The residual wart, accepted rather than overlooked: on a layout where right Alt
+/// is a plain Alt rather than AltGr, a pending accent survives an `AltRight` chord.
+/// The alternative is deciding by which physical key it is rather than by what it
+/// means, which would break AltGr composition on every European layout — the far
+/// commoner case.
+fn holds_composition(key: SpecialKey) -> bool {
+    matches!(
+        key,
+        SpecialKey::ShiftLeft | SpecialKey::ShiftRight | SpecialKey::AltRight
+    )
 }
 
 /// Emit a pending accent as a standalone character, press and release together.
@@ -786,14 +823,65 @@ mod tests {
 
     #[test]
     fn a_pending_accent_is_flushed_before_a_key_it_cannot_compose_with() {
+        // An arrow, a function key, Enter: none of them composes, and the accent
+        // the user typed is emitted rather than dropped, because losing input
+        // silently is worse than an extra character.
+        for key in [SpecialKey::Right, SpecialKey::F5, SpecialKey::Enter] {
+            let mut kb = FakeKeyboard::new();
+            kb.press_dead('~');
+            let out = kb.press_special(key, Modifiers::NONE);
+            assert_eq!(texts(&out), vec!["~"], "{key:?}");
+            assert_eq!(out.last().unwrap().payload, KeyPayload::Special(key));
+            assert!(!kb.resolver.has_pending_composition(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_chord_modifier_flushes_the_accent_rather_than_composing_onto_the_shortcut() {
+        // Keeping it pending would compose the accent onto the shortcut's letter,
+        // so the peer receives a character its layout cannot resolve carrying the
+        // CTRL bit, and Save never fires. The stray `^` is the lesser harm.
+        for modifier in [
+            SpecialKey::CtrlLeft,
+            SpecialKey::AltLeft,
+            SpecialKey::SuperLeft,
+        ] {
+            let mut kb = FakeKeyboard::new();
+            kb.press_dead('^');
+            let out = kb.press_special(modifier, Modifiers::NONE);
+            assert_eq!(texts(&out), vec!["^"], "{modifier:?}");
+            assert_eq!(out.last().unwrap().payload, KeyPayload::Special(modifier));
+            assert!(!kb.resolver.has_pending_composition(), "{modifier:?}");
+        }
+
+        // And the shortcut itself still arrives intact.
         let mut kb = FakeKeyboard::new();
-        kb.press_dead('~');
-        let out = kb.press_special(SpecialKey::Right, Modifiers::NONE);
-        assert_eq!(texts(&out), vec!["~"]);
-        assert_eq!(
-            out.last().unwrap().payload,
-            KeyPayload::Special(SpecialKey::Right)
-        );
+        kb.press_dead('^');
+        kb.press_special(SpecialKey::CtrlLeft, Modifiers::NONE);
+        let save = kb.press_text("s", Modifiers::CTRL);
+        assert_eq!(texts(&save), vec!["s"]);
+        assert_eq!(save[0].modifiers, Modifiers::CTRL);
+    }
+
+    #[test]
+    fn reaching_for_a_modifier_does_not_break_a_composition_in_progress() {
+        // The AZERTY case: `^`, then Shift, then E is `Ê` on every desktop. Nothing
+        // cancels a composition because the user reached for the shift that types
+        // the letter it is going to compose with — and a level-3 shift arrives here
+        // as `AltRight`, so an accent reached with AltGr would flush itself.
+        for modifier in [SpecialKey::ShiftLeft, SpecialKey::AltRight] {
+            let mut kb = FakeKeyboard::new();
+            kb.press_dead('^');
+            let out = kb.press_special(modifier, Modifiers::NONE);
+            assert!(texts(&out).is_empty(), "{modifier:?} flushed the accent");
+            assert_eq!(out.last().unwrap().payload, KeyPayload::Special(modifier));
+            assert!(kb.resolver.has_pending_composition(), "{modifier:?}");
+            assert_eq!(
+                texts(&kb.press_text("E", Modifiers::SHIFT)),
+                vec!["Ê"],
+                "{modifier:?}"
+            );
+        }
     }
 
     #[test]

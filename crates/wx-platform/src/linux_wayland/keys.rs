@@ -131,6 +131,35 @@ pub fn dead_keysym(combining: char) -> Option<u32> {
     })
 }
 
+/// The combining accent an `XK_dead_*` keysym stands for.
+///
+/// The inverse of [`dead_keysym`], and the capture side's half of the same
+/// contract: a keymap that puts `dead_acute` on a key must be reported upwards as
+/// [`crate::keyres::RawKey::dead`] so [`crate::keyres::KeyResolver`] can compose
+/// it with the next keystroke, rather than as a character nobody typed.
+///
+/// Written as its own match rather than by searching [`dead_keysym`] so that the
+/// two are checked against each other by test — a table walked in both directions
+/// hides a wrong entry, because it is wrong identically each way.
+pub fn dead_accent(keysym: u32) -> Option<char> {
+    Some(match keysym {
+        0xfe50 => '\u{0300}', // dead_grave
+        0xfe51 => '\u{0301}', // dead_acute
+        0xfe52 => '\u{0302}', // dead_circumflex
+        0xfe53 => '\u{0303}', // dead_tilde
+        0xfe54 => '\u{0304}', // dead_macron
+        0xfe55 => '\u{0306}', // dead_breve
+        0xfe56 => '\u{0307}', // dead_abovedot
+        0xfe57 => '\u{0308}', // dead_diaeresis
+        0xfe58 => '\u{030a}', // dead_abovering
+        0xfe59 => '\u{030b}', // dead_doubleacute
+        0xfe5a => '\u{030c}', // dead_caron
+        0xfe5b => '\u{0327}', // dead_cedilla
+        0xfe5c => '\u{0328}', // dead_ogonek
+        _ => return None,
+    })
+}
+
 /// The evdev keycode for a key with no textual meaning.
 ///
 /// `None` for keys Linux has no code for, which is reported as
@@ -193,6 +222,115 @@ pub fn evdev_from_special(key: SpecialKey) -> Option<u32> {
     })
 }
 
+/// The semantic key an evdev keycode stands for, if it has no textual meaning.
+///
+/// The inverse of [`evdev_from_special`], and the first question capture asks of
+/// every keycode: a [`SpecialKey`] beats whatever the layout would resolve the key
+/// to, because a receiver injecting `\t` as a character does not move focus and
+/// one injecting `\r` does not press a button. [`crate::keyres::RawKey`] states
+/// the same precedence.
+///
+/// `None` means "ask the layout" — every letter, digit and punctuation key lands
+/// here, which is the whole point: those are the keys whose meaning depends on the
+/// keyboard the user actually has.
+///
+/// Written as its own match rather than derived from [`evdev_from_special`] so
+/// that a keycode is never silently claimed by two keys; the round trip is a test.
+pub fn special_from_evdev(code: u32) -> Option<SpecialKey> {
+    Some(match code {
+        1 => SpecialKey::Escape,
+        14 => SpecialKey::Backspace,
+        15 => SpecialKey::Tab,
+        28 => SpecialKey::Enter,
+        111 => SpecialKey::Delete,
+        110 => SpecialKey::Insert,
+        102 => SpecialKey::Home,
+        107 => SpecialKey::End,
+        104 => SpecialKey::PageUp,
+        109 => SpecialKey::PageDown,
+        103 => SpecialKey::Up,
+        108 => SpecialKey::Down,
+        105 => SpecialKey::Left,
+        106 => SpecialKey::Right,
+        59 => SpecialKey::F1,
+        60 => SpecialKey::F2,
+        61 => SpecialKey::F3,
+        62 => SpecialKey::F4,
+        63 => SpecialKey::F5,
+        64 => SpecialKey::F6,
+        65 => SpecialKey::F7,
+        66 => SpecialKey::F8,
+        67 => SpecialKey::F9,
+        68 => SpecialKey::F10,
+        87 => SpecialKey::F11,
+        88 => SpecialKey::F12,
+        KEY_LEFTSHIFT => SpecialKey::ShiftLeft,
+        54 => SpecialKey::ShiftRight,
+        KEY_LEFTCTRL => SpecialKey::CtrlLeft,
+        97 => SpecialKey::CtrlRight,
+        KEY_LEFTALT => SpecialKey::AltLeft,
+        KEY_RIGHTALT => SpecialKey::AltRight,
+        KEY_LEFTMETA => SpecialKey::SuperLeft,
+        126 => SpecialKey::SuperRight,
+        58 => SpecialKey::CapsLock,
+        69 => SpecialKey::NumLock,
+        70 => SpecialKey::ScrollLock,
+        99 => SpecialKey::PrintScreen,
+        119 => SpecialKey::Pause,
+        127 => SpecialKey::Menu,
+        115 => SpecialKey::VolumeUp,
+        114 => SpecialKey::VolumeDown,
+        113 => SpecialKey::VolumeMute,
+        164 => SpecialKey::MediaPlayPause,
+        163 => SpecialKey::MediaNext,
+        165 => SpecialKey::MediaPrev,
+        166 => SpecialKey::MediaStop,
+        225 => SpecialKey::BrightnessUp,
+        224 => SpecialKey::BrightnessDown,
+        _ => return None,
+    })
+}
+
+/// The semantic key a *modifier* keysym stands for.
+///
+/// A layout is free to put a modifier on any keycode it likes — `lv3:lsgt_switch`
+/// puts `ISO_Level3_Shift` on the key beside left Shift, `ctrl:nocaps` puts Control
+/// where Caps Lock is — and [`special_from_evdev`] only knows the usual positions.
+/// Without this the key falls through to the layout, resolves to a keysym no
+/// character can be made of, and leaves this backend as a raw keycode: the peer
+/// then presses whatever *its* keyboard has at that position, which types a stray
+/// character rather than modifying anything. [`crate`] states the rule this keeps:
+/// a backend that hands raw keycodes upwards has moved the problem to the wrong
+/// side of the wire.
+///
+/// The mapping is by intent rather than by name. `ISO_Level3_Shift` and
+/// `Mode_switch` both become [`SpecialKey::AltRight`], which is where every
+/// receiver's AltGr is, and which `wx_core`'s router already pairs with
+/// `ALT | ALT_GR` so releasing it clears both. That loses nothing: the sender has
+/// already resolved its text through its own layout, so a receiver never needs a
+/// level-3 shift to *produce* a character — only to know the modifier is down.
+///
+/// The locks are deliberately absent. Caps Lock and Num Lock are toggles this
+/// backend tracks from the evdev code, and a payload without the matching state
+/// change would put the two sides out of step about which level is live.
+pub fn special_from_keysym(keysym: u32) -> Option<SpecialKey> {
+    Some(match keysym {
+        XK_ISO_LEVEL3_SHIFT => SpecialKey::AltRight,
+        0xff7e => SpecialKey::AltRight, // Mode_switch, the older spelling of AltGr
+        0xffe1 => SpecialKey::ShiftLeft,
+        0xffe2 => SpecialKey::ShiftRight,
+        0xffe3 => SpecialKey::CtrlLeft,
+        0xffe4 => SpecialKey::CtrlRight,
+        // Meta is where X11 put the Alt keys on PC hardware, and keymaps still
+        // write it there.
+        0xffe7 | 0xffe9 => SpecialKey::AltLeft,
+        0xffe8 | 0xffea => SpecialKey::AltRight,
+        0xffeb => SpecialKey::SuperLeft,
+        0xffec => SpecialKey::SuperRight,
+        _ => return None,
+    })
+}
+
 /// `BTN_LEFT`. The mouse button block starts here.
 const BTN_LEFT: u32 = 0x110;
 /// `BTN_SIDE` and `BTN_EXTRA`: what a mouse's thumb buttons report, and what
@@ -225,6 +363,30 @@ pub fn evdev_from_button(button: MouseButton) -> Option<u32> {
             }
             code
         }
+    })
+}
+
+/// The wire mouse button an evdev button code stands for.
+///
+/// The inverse of [`evdev_from_button`], and deliberately narrow: `BTN_BACK` and
+/// `BTN_FORWARD` are *not* mapped to [`MouseButton::Back`]/[`MouseButton::Forward`]
+/// here even though their names invite it, because [`evdev_from_button`] sends
+/// those two on `BTN_SIDE`/`BTN_EXTRA` and a capture that disagreed would round
+/// trip a thumb button onto a different one. They arrive as
+/// [`MouseButton::Extra`], which is what they are.
+///
+/// `None` for a code outside the block — a gaming mouse's macro keys, a digitiser
+/// stylus — because there is no wire button to call them and inventing one would
+/// have a peer click something.
+pub fn button_from_evdev(code: u32) -> Option<MouseButton> {
+    Some(match code {
+        BTN_LEFT => MouseButton::Left,
+        0x111 => MouseButton::Right,
+        0x112 => MouseButton::Middle,
+        BTN_SIDE => MouseButton::Back,
+        BTN_EXTRA => MouseButton::Forward,
+        c if (BTN_FORWARD..=BTN_TASK).contains(&c) => MouseButton::Extra((c - BTN_FORWARD) as u8),
+        _ => return None,
     })
 }
 
@@ -302,61 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn a_modifier_keysym_resolves_to_the_modifier_and_not_to_a_position() {
+        // The keysym block a layout uses when it moves a modifier off its usual
+        // key. Left unmapped, each of these leaves capture as a raw keycode and has
+        // the peer press whatever its own keyboard has at that position.
+        assert_eq!(
+            special_from_keysym(XK_ISO_LEVEL3_SHIFT),
+            Some(SpecialKey::AltRight)
+        );
+        assert_eq!(special_from_keysym(0xff7e), Some(SpecialKey::AltRight));
+        assert_eq!(special_from_keysym(0xffe1), Some(SpecialKey::ShiftLeft));
+        assert_eq!(special_from_keysym(0xffe4), Some(SpecialKey::CtrlRight));
+        assert_eq!(special_from_keysym(0xffe9), Some(SpecialKey::AltLeft));
+        assert_eq!(special_from_keysym(0xffeb), Some(SpecialKey::SuperLeft));
+
+        // Characters and the locks are not this function's business: the first are
+        // text, and the second are toggles tracked from the evdev code.
+        assert_eq!(special_from_keysym(keysym_for_char('a')), None);
+        assert_eq!(special_from_keysym(0xffe5), None);
+    }
+
+    #[test]
     fn every_special_key_has_a_linux_keycode() {
         // The table is the whole reason `SpecialKey` exists, so a variant added to
         // the protocol without a code here would silently become uninjectable.
-        for key in [
-            SpecialKey::Escape,
-            SpecialKey::Backspace,
-            SpecialKey::Tab,
-            SpecialKey::Enter,
-            SpecialKey::Delete,
-            SpecialKey::Insert,
-            SpecialKey::Home,
-            SpecialKey::End,
-            SpecialKey::PageUp,
-            SpecialKey::PageDown,
-            SpecialKey::Up,
-            SpecialKey::Down,
-            SpecialKey::Left,
-            SpecialKey::Right,
-            SpecialKey::F1,
-            SpecialKey::F2,
-            SpecialKey::F3,
-            SpecialKey::F4,
-            SpecialKey::F5,
-            SpecialKey::F6,
-            SpecialKey::F7,
-            SpecialKey::F8,
-            SpecialKey::F9,
-            SpecialKey::F10,
-            SpecialKey::F11,
-            SpecialKey::F12,
-            SpecialKey::ShiftLeft,
-            SpecialKey::ShiftRight,
-            SpecialKey::CtrlLeft,
-            SpecialKey::CtrlRight,
-            SpecialKey::AltLeft,
-            SpecialKey::AltRight,
-            SpecialKey::SuperLeft,
-            SpecialKey::SuperRight,
-            SpecialKey::CapsLock,
-            SpecialKey::NumLock,
-            SpecialKey::ScrollLock,
-            SpecialKey::PrintScreen,
-            SpecialKey::Pause,
-            SpecialKey::Menu,
-            SpecialKey::VolumeUp,
-            SpecialKey::VolumeDown,
-            SpecialKey::VolumeMute,
-            SpecialKey::MediaPlayPause,
-            SpecialKey::MediaNext,
-            SpecialKey::MediaPrev,
-            SpecialKey::MediaStop,
-            SpecialKey::BrightnessUp,
-            SpecialKey::BrightnessDown,
-        ] {
-            assert!(evdev_from_special(key).is_some(), "{key:?} has no keycode");
+        for key in EVERY_SPECIAL {
+            assert!(evdev_from_special(*key).is_some(), "{key:?} has no keycode");
         }
     }
 
@@ -391,6 +524,141 @@ mod tests {
         // BTN_BACK/BTN_FORWARD that share their names.
         assert_eq!(evdev_from_button(MouseButton::Back), Some(BTN_SIDE));
         assert_eq!(evdev_from_button(MouseButton::Forward), Some(BTN_EXTRA));
+    }
+
+    /// Every `SpecialKey`, so a variant added to the protocol is caught by the
+    /// exhaustive match in `evdev_from_special` and by the round trips below.
+    const EVERY_SPECIAL: &[SpecialKey] = &[
+        SpecialKey::Escape,
+        SpecialKey::Backspace,
+        SpecialKey::Tab,
+        SpecialKey::Enter,
+        SpecialKey::Delete,
+        SpecialKey::Insert,
+        SpecialKey::Home,
+        SpecialKey::End,
+        SpecialKey::PageUp,
+        SpecialKey::PageDown,
+        SpecialKey::Up,
+        SpecialKey::Down,
+        SpecialKey::Left,
+        SpecialKey::Right,
+        SpecialKey::F1,
+        SpecialKey::F2,
+        SpecialKey::F3,
+        SpecialKey::F4,
+        SpecialKey::F5,
+        SpecialKey::F6,
+        SpecialKey::F7,
+        SpecialKey::F8,
+        SpecialKey::F9,
+        SpecialKey::F10,
+        SpecialKey::F11,
+        SpecialKey::F12,
+        SpecialKey::ShiftLeft,
+        SpecialKey::ShiftRight,
+        SpecialKey::CtrlLeft,
+        SpecialKey::CtrlRight,
+        SpecialKey::AltLeft,
+        SpecialKey::AltRight,
+        SpecialKey::SuperLeft,
+        SpecialKey::SuperRight,
+        SpecialKey::CapsLock,
+        SpecialKey::NumLock,
+        SpecialKey::ScrollLock,
+        SpecialKey::PrintScreen,
+        SpecialKey::Pause,
+        SpecialKey::Menu,
+        SpecialKey::VolumeUp,
+        SpecialKey::VolumeDown,
+        SpecialKey::VolumeMute,
+        SpecialKey::MediaPlayPause,
+        SpecialKey::MediaNext,
+        SpecialKey::MediaPrev,
+        SpecialKey::MediaStop,
+        SpecialKey::BrightnessUp,
+        SpecialKey::BrightnessDown,
+    ];
+
+    #[test]
+    fn a_captured_keycode_resolves_to_the_key_injection_would_send_it_on() {
+        // The two tables are hand-written on purpose — see the note on
+        // `special_from_evdev` — so this is what stops them drifting. A gap makes
+        // a key that can be injected but not captured, which reads as "F5 does
+        // nothing when I press it here but works from the other machine".
+        for key in EVERY_SPECIAL {
+            let code = evdev_from_special(*key).unwrap();
+            assert_eq!(
+                special_from_evdev(code),
+                Some(*key),
+                "{key:?} on evdev {code} came back as something else"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_a_layout_owns_are_left_to_the_layout() {
+        // Letters, digits and punctuation must fall through to the keymap, or the
+        // cross-layout guarantee never gets a chance: a Norwegian `å` would be
+        // reported as whatever the US layout calls that position.
+        for code in [
+            30, // KEY_A
+            2,  // KEY_1
+            26, // KEY_LEFTBRACE — `å` on a Norwegian layout
+            57, // KEY_SPACE
+            39, // KEY_SEMICOLON — `ø` on a Norwegian layout
+        ] {
+            assert_eq!(special_from_evdev(code), None, "keycode {code}");
+        }
+    }
+
+    #[test]
+    fn the_dead_key_tables_are_inverses_of_each_other() {
+        // A gap here composes on one side and not the other: the sender emits a
+        // combining accent the receiver has no key for, or worse, capture reports
+        // a standalone `´` where the user meant to start composing `á`.
+        for combining in [
+            '\u{0300}', '\u{0301}', '\u{0302}', '\u{0303}', '\u{0304}', '\u{0306}', '\u{0307}',
+            '\u{0308}', '\u{030a}', '\u{030b}', '\u{030c}', '\u{0327}', '\u{0328}',
+        ] {
+            let keysym = dead_keysym(combining).expect("a combining mark with no dead keysym");
+            assert_eq!(dead_accent(keysym), Some(combining), "{keysym:#x}");
+        }
+    }
+
+    #[test]
+    fn a_keysym_that_is_not_a_dead_key_is_not_treated_as_one() {
+        // The block sits just below the modifier keysyms, and `ISO_Level3_Shift`
+        // is the neighbour that would otherwise arrive as a stray accent.
+        assert_eq!(dead_accent(XK_ISO_LEVEL3_SHIFT), None);
+        assert_eq!(dead_accent('a' as u32), None);
+        assert_eq!(dead_accent(0xff0d), None); // Return
+    }
+
+    #[test]
+    fn a_captured_button_code_resolves_to_the_button_injection_sends_it_on() {
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+            MouseButton::Extra(0),
+            MouseButton::Extra(1),
+            MouseButton::Extra(2),
+        ] {
+            let code = evdev_from_button(button).unwrap();
+            assert_eq!(button_from_evdev(code), Some(button), "{button:?}");
+        }
+    }
+
+    #[test]
+    fn a_button_outside_the_block_is_reported_as_nothing_rather_than_guessed() {
+        // A stylus tip, a joystick trigger, a macro key. Mapping one onto Left
+        // would have a peer click where the user only put a pen down.
+        assert_eq!(button_from_evdev(0x100), None); // BTN_0
+        assert_eq!(button_from_evdev(0x140), None); // BTN_TOOL_PEN
+        assert_eq!(button_from_evdev(0), None);
     }
 
     #[test]
