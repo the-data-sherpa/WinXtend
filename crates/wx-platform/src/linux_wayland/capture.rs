@@ -202,6 +202,44 @@ impl Zone {
         };
         Point::new(span(p.x, self.x, self.w), span(p.y, self.y, self.h))
     }
+
+    /// Whether `p` is on this screen, the half-open way everything above this
+    /// counts a monitor rectangle.
+    fn contains(self, p: Point) -> bool {
+        let inside = |v: f64, origin: i32, extent: i32| {
+            v >= f64::from(origin) && v < f64::from(origin) + f64::from(extent)
+        };
+        self.w > 0 && self.h > 0 && inside(p.x, self.x, self.w) && inside(p.y, self.y, self.h)
+    }
+
+    /// The same, with the boundary line counted in.
+    ///
+    /// The set of points an activation can name: the portal reports the line, which
+    /// is one past the last pixel of the screen the pointer is actually on.
+    fn touches(self, p: Point) -> bool {
+        let inside = |v: f64, origin: i32, extent: i32| {
+            v >= f64::from(origin) && v <= f64::from(origin) + f64::from(extent)
+        };
+        self.w > 0 && self.h > 0 && inside(p.x, self.x, self.w) && inside(p.y, self.y, self.h)
+    }
+}
+
+/// Which zone an activation position belongs to.
+///
+/// The barrier the compositor names is the better answer where there is one — it
+/// says which screen the pointer left, not merely which one the coordinate lands
+/// on — but an activation the compositor did not attribute to a barrier still has
+/// to be clamped onto a real screen, or the position that exists to resynchronise
+/// the cursor resynchronises nothing. See [`Zone::clamp`].
+///
+/// Containment first, then the boundary line, so a point on a seam belongs to the
+/// screen it is really on rather than to the one it just left.
+pub fn zone_at(zones: &[Zone], p: Point) -> Option<Zone> {
+    zones
+        .iter()
+        .copied()
+        .find(|z| z.contains(p))
+        .or_else(|| zones.iter().copied().find(|z| z.touches(p)))
 }
 
 /// One barrier to ask the compositor for.
@@ -216,7 +254,8 @@ pub struct BarrierPlan {
     pub zone: Zone,
 }
 
-/// A barrier on every edge of every zone, in the geometry the compositor accepts.
+/// A barrier on every edge of the *outer* boundary of the zone set, in the
+/// geometry the compositor accepts.
 ///
 /// The two coordinates are not symmetric, which is not obvious and was measured
 /// rather than guessed. The barrier *line* sits on the zone boundary, so the far
@@ -225,14 +264,28 @@ pub struct BarrierPlan {
 /// the edge, though, must stay inside the zone: a top barrier running to x=3072 is
 /// refused where one running to x=3071 is accepted.
 ///
-/// Every edge is armed, not just the ones with a peer beyond them, because nothing
-/// at this layer knows the global layout — a barrier is the only way the
+/// Every outer edge is armed, not just the ones with a peer beyond them, because
+/// nothing at this layer knows the global layout — a barrier is the only way the
 /// compositor will tell us the pointer reached an edge at all. An edge with
 /// nothing behind it is handled where it becomes knowable: see
 /// [`RELEASE_PULLBACK`], which hands the pointer straight back.
+///
+/// An edge with *another local screen* behind it is a different case, and the one
+/// this skips. Two side-by-side monitors would otherwise both put a barrier on
+/// their shared line, so moving between the user's own two screens activates
+/// capture: the pointer pins at the seam, local windows are suppressed, and the
+/// router walks the virtual cursor onto local monitor 2 with no handoff — so
+/// `owns_cursor()` stays true and `wanted` stays false. Worse, the pull-back guard
+/// measures the axis in the crossing direction, so a user carrying on across their
+/// own seam accumulates nothing and stays stuck until they deliberately drag a
+/// quarter-screen back.
+///
+/// The tradeoff, stated plainly: a peer can never be reached across a physically
+/// internal seam. That costs nothing today because the global layout model does not
+/// express that placement anyway.
 pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
     let mut out = Vec::new();
-    for zone in zones {
+    for (index, zone) in zones.iter().enumerate() {
         // A zero-extent zone has no edge to put anything on, and `size - 1` would
         // run the barrier backwards.
         if zone.w <= 0 || zone.h <= 0 {
@@ -245,10 +298,13 @@ pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
             (BarrierEdge::Left, (x, y, x, y + h - 1)),
             (BarrierEdge::Right, (x + w, y, x + w, y + h - 1)),
         ] {
+            if is_internal_seam(zones, index, *zone, edge) {
+                continue;
+            }
             out.push(BarrierPlan {
-                // 1-based: the portal's `BarrierID` is a `NonZeroU32`, and an id
-                // the compositor cannot name is a barrier whose failure cannot be
-                // attributed.
+                // 1-based and gap-free, over the barriers actually planned: the
+                // portal's `BarrierID` is a `NonZeroU32`, and an id the compositor
+                // cannot name is a barrier whose failure cannot be attributed.
                 id: out.len() as u32 + 1,
                 edge,
                 position,
@@ -257,6 +313,39 @@ pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
         }
     }
     out
+}
+
+/// Whether another zone in the same set sits flush against this edge, so the line
+/// the barrier would run along is inside the desktop rather than around it.
+fn is_internal_seam(zones: &[Zone], index: usize, zone: Zone, edge: BarrierEdge) -> bool {
+    zones.iter().enumerate().any(|(other_index, other)| {
+        if other_index == index || other.w <= 0 || other.h <= 0 {
+            return false;
+        }
+        match edge {
+            BarrierEdge::Right => {
+                other.x == zone.x.saturating_add(zone.w)
+                    && overlap(zone.y, zone.h, other.y, other.h)
+            }
+            BarrierEdge::Left => {
+                other.x.saturating_add(other.w) == zone.x
+                    && overlap(zone.y, zone.h, other.y, other.h)
+            }
+            BarrierEdge::Bottom => {
+                other.y == zone.y.saturating_add(zone.h)
+                    && overlap(zone.x, zone.w, other.x, other.w)
+            }
+            BarrierEdge::Top => {
+                other.y.saturating_add(other.h) == zone.y
+                    && overlap(zone.x, zone.w, other.x, other.w)
+            }
+        }
+    })
+}
+
+/// Whether two half-open spans share any pixel.
+fn overlap(a: i32, a_len: i32, b: i32, b_len: i32) -> bool {
+    a.max(b) < a.saturating_add(a_len).min(b.saturating_add(b_len))
 }
 
 /// What the trait side asks the driver thread to do.
@@ -808,7 +897,10 @@ impl Keyboard {
         match special {
             Some(SpecialKey::CapsLock) if pressed => self.caps = !self.caps,
             Some(SpecialKey::NumLock) if pressed => self.num = !self.num,
-            _ if is_level_modifier(keycode) || is_chord_modifier(keycode) => {
+            _ if is_level_modifier(keycode)
+                || is_chord_modifier(keycode)
+                || self.keymap.is_level3(keycode) =>
+            {
                 self.hold(keycode, pressed);
             }
             _ => {}
@@ -934,12 +1026,15 @@ const SHIFT_RIGHT: u32 = 54;
 const CTRL_RIGHT: u32 = 97;
 const SUPER_RIGHT: u32 = 126;
 
-/// Whether a keycode can change which level of a key is produced.
+/// Whether a keycode can change which level of a key is produced, whatever the
+/// layout says.
 ///
-/// Only Shift is fixed. The level-3 key is decided by the keymap, so it is asked
-/// about separately — but its state still has to be tracked, and a keymap that
-/// puts `ISO_Level3_Shift` on an unusual key would otherwise never record it as
-/// held.
+/// Only Shift is really fixed; right Alt is here because it is where a level-3
+/// shift usually sits, and holding it costs nothing on a layout that makes it a
+/// plain Alt. Which key *is* this layout's level-3 shift is the keymap's answer,
+/// and [`Keyboard::raw`] asks it directly — measured on the alpha target, mutter's
+/// own US keymap puts `ISO_Level3_Shift` on keycode 84, not on right Alt, so a
+/// hardcoded set alone leaves every level-3 character resolving to its base level.
 fn is_level_modifier(keycode: u32) -> bool {
     matches!(keycode, KEY_LEFTSHIFT | SHIFT_RIGHT | KEY_RIGHTALT)
 }

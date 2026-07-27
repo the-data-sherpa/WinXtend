@@ -65,7 +65,7 @@ use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::{mpsc, oneshot};
 use wx_proto::Point;
 
-use super::capture::{barriers_for, BarrierEdge, CaptureState, Command, Zone};
+use super::capture::{barriers_for, zone_at, BarrierEdge, CaptureState, Command, Zone};
 use super::session::{SharedSession, INPUT_CAPTURE_CAPABILITIES};
 
 /// Name this client reports to the compositor. User-visible in the shell's
@@ -162,7 +162,7 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
 
     tracing::info!(
         capabilities = ?live.granted,
-        zones = live.zones,
+        zones = live.zones.len(),
         barriers = live.barriers,
         "the desktop portal granted an InputCapture session"
     );
@@ -192,7 +192,10 @@ struct Live {
     /// activation knows which way the pointer came in — and therefore which way is
     /// back out, and which screen it is really on.
     edges: Vec<(BarrierID, BarrierEdge, Zone)>,
-    zones: usize,
+    /// Every region the portal reported, kept rather than counted so an activation
+    /// the compositor did not attribute to a barrier can still be clamped onto a
+    /// screen that exists.
+    zones: Vec<Zone>,
     barriers: usize,
 }
 
@@ -277,7 +280,7 @@ struct Negotiated {
     connection: reis::event::Connection,
     events: reis::tokio::EiConvertEventStream,
     edges: Vec<(BarrierID, BarrierEdge, Zone)>,
-    zones: usize,
+    zones: Vec<Zone>,
     barriers: usize,
 }
 
@@ -295,14 +298,8 @@ async fn negotiate(
         .response()
         .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?;
 
-    let placed = barriers_for(
-        &zones
-            .regions()
-            .iter()
-            .copied()
-            .map(zone_of)
-            .collect::<Vec<_>>(),
-    );
+    let regions: Vec<Zone> = zones.regions().iter().copied().map(zone_of).collect();
+    let placed = barriers_for(&regions);
     // A plan whose id the portal cannot express is one this build asked for and
     // cannot name; dropping it loses an edge, which is far better than shifting
     // every later id and mis-attributing a refusal.
@@ -358,7 +355,7 @@ async fn negotiate(
     Ok(Negotiated {
         connection,
         events,
-        zones: zones.regions().len(),
+        zones: regions,
         barriers: edges.len(),
         edges,
     })
@@ -461,11 +458,19 @@ async fn pump(
                     _ => None,
                 };
                 match position {
+                    // The zone falls back to whichever region the position lands
+                    // on, so an activation the compositor did not attribute to a
+                    // barrier is still clamped onto a screen that exists. Without
+                    // it the boundary coordinate reaches the engine unclamped and
+                    // the resynchronisation is silently dropped — the precise
+                    // failure `Zone::clamp` was added for.
                     Some(position) => capture.activated(
                         signal.activation_id(),
                         position,
                         barrier.map(|(edge, _)| edge),
-                        barrier.map(|(_, zone)| zone),
+                        barrier
+                            .map(|(_, zone)| zone)
+                            .or_else(|| zone_at(&live.zones, position)),
                     ),
                     // Every activation observed on the alpha target carried one.
                     // Without it there is no honest absolute position to report, and

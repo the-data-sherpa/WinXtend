@@ -40,6 +40,37 @@ xkb_symbols "pc" {
 };
 "#;
 
+/// A layout whose level-3 shift is *not* right Alt.
+///
+/// `lv3:lsgt_switch` puts `ISO_Level3_Shift` on the key between left Shift and Z,
+/// which is evdev 86. Not a curiosity: measured on the alpha target, mutter's own
+/// US keymap reports the level-3 shift on keycode 84 rather than on right Alt, so a
+/// backend that only ever tracks right Alt resolves every level-3 character to its
+/// base level.
+const LV3_ELSEWHERE: &str = r#"
+xkb_keymap {
+xkb_keycodes "evdev" {
+	<AE08> = 17;
+	<LSGT> = 94;
+};
+xkb_types "complete" {
+	type "FOUR_LEVEL" {
+		modifiers= Shift+LevelThree;
+		map[Shift]= 2;
+		map[LevelThree]= 3;
+		map[Shift+LevelThree]= 4;
+	};
+};
+xkb_symbols "pc" {
+	key <AE08> {
+		type= "FOUR_LEVEL",
+		symbols[1]= [ 7, slash, braceleft, NoSymbol ]
+	};
+	key <LSGT> { [ ISO_Level3_Shift ] };
+};
+};
+"#;
+
 /// The screen the harness pretends to be on: one 1920x1080 zone at the origin.
 const SCREEN: Zone = Zone {
     x: 0,
@@ -135,6 +166,117 @@ impl Harness {
             })
             .collect()
     }
+}
+
+// -- barriers ----------------------------------------------------------
+
+/// The screen to the right of [`SCREEN`], sharing its whole right-hand edge.
+const SCREEN_RIGHT: Zone = Zone {
+    x: 1920,
+    y: 0,
+    w: 1920,
+    h: 1080,
+};
+
+#[test]
+fn a_barrier_line_sits_on_the_boundary_and_its_extent_stops_one_short() {
+    // Measured against the live compositor, and asymmetric in a way that is not
+    // guessable: the line is at `offset + size`, the extent along it stops at
+    // `offset + size - 1`. Both wrong forms are refused *silently*, losing that
+    // edge and with it the only way the cursor leaves by it.
+    let plans = barriers_for(&[SCREEN]);
+    assert_eq!(
+        plans.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "the ids must stay 1-based and gap-free; the driver maps them back to edges"
+    );
+    let at = |edge| plans.iter().find(|p| p.edge == edge).unwrap().position;
+    assert_eq!(at(BarrierEdge::Top), (0, 0, 1919, 0));
+    assert_eq!(at(BarrierEdge::Bottom), (0, 1080, 1919, 1080));
+    assert_eq!(at(BarrierEdge::Left), (0, 0, 0, 1079));
+    assert_eq!(at(BarrierEdge::Right), (1920, 0, 1920, 1079));
+    assert!(plans.iter().all(|p| p.zone == SCREEN));
+}
+
+#[test]
+fn the_seam_between_two_of_the_users_own_screens_is_left_unarmed() {
+    // Both zones would otherwise put a barrier on the same line, and moving between
+    // the user's own two monitors would activate capture: the pointer pins at the
+    // seam, local windows go quiet, and nothing claims the cursor — so the pull-back
+    // guard, which measures the axis in the crossing direction, never fires for a
+    // user carrying on across their own desktop.
+    let plans = barriers_for(&[SCREEN, SCREEN_RIGHT]);
+    let armed: Vec<(Zone, BarrierEdge)> = plans.iter().map(|p| (p.zone, p.edge)).collect();
+    assert!(!armed.contains(&(SCREEN, BarrierEdge::Right)));
+    assert!(!armed.contains(&(SCREEN_RIGHT, BarrierEdge::Left)));
+
+    // Everything on the outer boundary still is: the desktop as a whole is still
+    // enclosed, which is what lets the cursor reach a peer at all.
+    for edge in [BarrierEdge::Top, BarrierEdge::Bottom, BarrierEdge::Left] {
+        assert!(armed.contains(&(SCREEN, edge)), "{edge:?}");
+    }
+    for edge in [BarrierEdge::Top, BarrierEdge::Bottom, BarrierEdge::Right] {
+        assert!(armed.contains(&(SCREEN_RIGHT, edge)), "{edge:?}");
+    }
+    assert_eq!(
+        plans.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn two_screens_that_only_share_a_line_are_both_still_enclosed() {
+    // Flush along the same x, but nowhere near each other: nothing crosses between
+    // them, so neither edge is internal and both stay armed.
+    let below = Zone {
+        x: 1920,
+        y: 4000,
+        w: 1920,
+        h: 1080,
+    };
+    let plans = barriers_for(&[SCREEN, below]);
+    let armed: Vec<(Zone, BarrierEdge)> = plans.iter().map(|p| (p.zone, p.edge)).collect();
+    assert!(armed.contains(&(SCREEN, BarrierEdge::Right)));
+    assert!(armed.contains(&(below, BarrierEdge::Left)));
+    assert_eq!(plans.len(), 8);
+}
+
+#[test]
+fn an_activation_the_compositor_did_not_attribute_still_lands_on_a_screen() {
+    // The clamp cannot depend on the barrier being recognised: an unattributed
+    // activation carries the same boundary coordinate, which belongs to no
+    // half-open monitor rectangle and is silently dropped by whatever was going to
+    // resynchronise against it.
+    let zones = [SCREEN, SCREEN_RIGHT];
+    // A seam point is on the screen it arrived at, not on the one it left.
+    assert_eq!(
+        zone_at(&zones, Point::new(1920.0, 540.0)),
+        Some(SCREEN_RIGHT)
+    );
+    // The outer boundary line belongs to the screen it bounds.
+    assert_eq!(
+        zone_at(&zones, Point::new(3840.0, 540.0)),
+        Some(SCREEN_RIGHT)
+    );
+    assert_eq!(zone_at(&zones, Point::new(600.0, 1080.0)), Some(SCREEN));
+    // Nowhere near any of them: no honest answer, so none is given.
+    assert_eq!(zone_at(&zones, Point::new(-5.0, 540.0)), None);
+
+    let h = Harness::us();
+    h.state.activated(
+        Some(1),
+        Point::new(3840.0, 540.0),
+        None,
+        zone_at(&zones, Point::new(3840.0, 540.0)),
+    );
+    assert_eq!(
+        h.drain(),
+        vec![CapturedEvent::PointerMotion {
+            dx: 0.0,
+            dy: 0.0,
+            position: Point::new(3839.0, 540.0),
+        }]
+    );
 }
 
 // -- the trait contract ------------------------------------------------
@@ -644,6 +786,26 @@ fn altgr_reaches_the_level_it_is_the_shift_for() {
     assert_eq!(altgr.payload, KeyPayload::Special(SpecialKey::AltRight));
     assert!(altgr.modifiers.contains(Modifiers::ALT_GR));
     assert_eq!(h.texts(30), vec!["á".to_string()]);
+}
+
+#[test]
+fn the_level_three_shift_is_followed_wherever_the_layout_puts_it() {
+    // The keymap decides which key is `ISO_Level3_Shift`, so which key is *held*
+    // has to be decided the same way. A hardcoded right-Alt-only set never records
+    // this key as down, `holding_level3()` stays false, and every level-3 character
+    // on the layout captures as its base level — `{` typing as `7`.
+    let h = Harness::with_layout(LV3_ELSEWHERE);
+    h.activate();
+    h.state.key(86, true); // KEY_102ND, this layout's AltGr
+    let pressed = h.drain();
+    let CapturedEvent::Key(lv3) = &pressed[0] else {
+        panic!("{pressed:?}");
+    };
+    assert!(lv3.modifiers.contains(Modifiers::ALT_GR));
+    assert!(!lv3.modifiers.contains(Modifiers::ALT));
+    assert_eq!(h.texts(9), vec!["{".to_string()]);
+    h.state.key(86, false);
+    assert_eq!(h.texts(9), vec!["7".to_string()]);
 }
 
 #[test]

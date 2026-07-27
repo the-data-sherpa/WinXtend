@@ -145,11 +145,7 @@ fn resync_cursor(
     if !router.owns_cursor() {
         return false;
     }
-    let Some(monitor) = monitors
-        .iter()
-        .find(|m| m.local_bounds.contains(position))
-        .cloned()
-    else {
+    let Some(monitor) = monitors.iter().find(|m| m.local_bounds.contains(position)) else {
         // A position on no monitor this machine has. Nothing to resynchronise
         // against, and guessing would be worse than the drift.
         return false;
