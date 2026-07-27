@@ -9,6 +9,13 @@ use crate::caps::{Capabilities, DisplayServer, Platform};
 use crate::geom::{Edge, Monitor, NormPos, Rect};
 use crate::ids::{GlobalMonitorId, MonitorId, NodeId, Signature};
 
+/// Protocol version a peer must advertise before it can be sent
+/// [`ControlMsg::CapabilitiesChanged`].
+///
+/// Kept next to the variant rather than inlined at the one send site, so that the
+/// version a message was introduced in travels with the message.
+pub const CAPABILITIES_CHANGED_SINCE: u16 = 2;
+
 /// Everything a peer needs to know about a node to place it in the mesh.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -284,6 +291,11 @@ pub enum ControlMsg {
     /// node-description messages, because the wire format is positional: inserting a
     /// variant anywhere else would renumber every one after it and break peers on an
     /// older build.
+    ///
+    /// Appending is only half of it. A build that predates this variant cannot
+    /// decode it either, and a control stream that fails to decode is torn down —
+    /// so this must only ever be sent to a peer that advertised at least
+    /// [`CAPABILITIES_CHANGED_SINCE`] in its handshake.
     CapabilitiesChanged {
         capabilities: Capabilities,
     },

@@ -115,6 +115,13 @@ pub struct Step {
 pub struct Established {
     pub role: Role,
     pub peer: NodeInfo,
+    /// Wire version the peer advertised in its `Hello` or `Welcome`.
+    ///
+    /// Kept rather than discarded once it has been checked, because compatibility
+    /// is not only a question of whether to talk to a peer at all: a message added
+    /// in a later version must not be *sent* to a build that predates it, and this
+    /// is the only statement the peer makes about which those are.
+    pub peer_protocol: u16,
     /// Nonce this side chose. Needed after the handshake to derive the pairing
     /// proof, which binds the PIN to this specific connection.
     pub local_nonce: [u8; 32],
@@ -183,6 +190,7 @@ pub struct Handshake {
     state: State,
     peer: Option<NodeInfo>,
     peer_nonce: Option<[u8; 32]>,
+    peer_protocol: Option<u16>,
     pairing_mode: bool,
 }
 
@@ -208,6 +216,7 @@ impl Handshake {
             },
             peer: None,
             peer_nonce: None,
+            peer_protocol: None,
             pairing_mode: false,
         }
     }
@@ -322,6 +331,9 @@ impl Handshake {
                 let peer_nonce = self
                     .peer_nonce
                     .expect("peer nonce is recorded before AwaitingProof");
+                let peer_protocol = self
+                    .peer_protocol
+                    .expect("peer protocol version is recorded before AwaitingProof");
                 // Verified against *this* session's binding, so a signature that is
                 // genuine but was produced on another connection — the relay case —
                 // is refused here rather than establishing a session with a machine
@@ -338,6 +350,7 @@ impl Handshake {
                     outcome: Outcome::Established(Box::new(Established {
                         role: self.role,
                         peer,
+                        peer_protocol,
                         local_nonce: self.local_nonce,
                         peer_nonce,
                         peer_was_paired,
@@ -406,6 +419,7 @@ impl Handshake {
 
         self.peer = Some(info.clone());
         self.peer_nonce = Some(*nonce);
+        self.peer_protocol = Some(protocol);
         None
     }
 
@@ -531,7 +545,7 @@ fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wx_proto::{Capabilities, DisplayServer, Platform};
+    use wx_proto::{Capabilities, DisplayServer, Platform, MIN_COMPATIBLE_VERSION};
 
     fn info(id: NodeId, name: &str) -> NodeInfo {
         NodeInfo {
@@ -622,6 +636,20 @@ mod tests {
         assert_eq!(b.peer_id(), p.alice.node_id());
         assert!(a.peer_was_paired);
         assert!(b.peer_was_paired);
+    }
+
+    #[test]
+    fn the_version_the_peer_advertised_survives_the_handshake() {
+        // Checking the version and then throwing it away is what makes a build
+        // send a peer a message it cannot decode. Both roles must keep it: the
+        // gate is on the sender, and either side may be the one that sends.
+        let p = paired();
+        let (a, b) = run_in_memory(
+            party(&p.alice, &p.alice_trust, "alice", [1u8; 32], false),
+            party(&p.bob, &p.bob_trust, "bob", [2u8; 32], false),
+        );
+        assert_eq!(established(&a.unwrap()).peer_protocol, PROTOCOL_VERSION);
+        assert_eq!(established(&b.unwrap()).peer_protocol, PROTOCOL_VERSION);
     }
 
     #[test]
@@ -1003,6 +1031,43 @@ mod tests {
                 expected: "Hello",
                 got: "AuthProof"
             }
+        );
+    }
+
+    #[test]
+    fn an_older_peer_is_remembered_as_older() {
+        // The case the gate exists for: a peer on the previous wire version is
+        // admitted, and what it can be sent afterwards depends on this number
+        // being its version rather than ours.
+        let p = paired();
+        let mut hs = Handshake::new(
+            Role::Responder,
+            info(p.bob.node_id(), "bob"),
+            [1u8; 32],
+            same_session(),
+        );
+        hs.on_message(
+            &ControlMsg::Hello {
+                protocol: MIN_COMPATIBLE_VERSION,
+                info: info(p.alice.node_id(), "alice"),
+                nonce: [2u8; 32],
+            },
+            &p.bob,
+            &p.bob_trust,
+        )
+        .unwrap();
+        let step = hs
+            .on_message(
+                &ControlMsg::AuthProof {
+                    signature: p.alice.sign_handshake(&same_session(), &[1u8; 32]),
+                },
+                &p.bob,
+                &p.bob_trust,
+            )
+            .unwrap();
+        assert_eq!(
+            established(&step.outcome).peer_protocol,
+            MIN_COMPATIBLE_VERSION
         );
     }
 

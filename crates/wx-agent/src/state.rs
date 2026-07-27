@@ -89,6 +89,12 @@ pub struct PeerState {
     pub addresses: Vec<SocketAddr>,
     /// Handshake details, once a session has been established.
     pub info: Option<NodeInfo>,
+    /// Wire version the peer advertised, once a session has been established.
+    ///
+    /// `None` before that, which is why [`PeerState::speaks`] answers no: a peer
+    /// that has not introduced itself has promised nothing about what it can
+    /// decode.
+    pub protocol: Option<u16>,
     pub rtt: Option<Duration>,
     /// Consecutive failed dials, driving the backoff.
     pub dial_failures: u32,
@@ -111,6 +117,7 @@ impl PeerState {
             status: ConnStatus::Offline,
             addresses: Vec::new(),
             info: None,
+            protocol: None,
             rtt: None,
             dial_failures: 0,
             next_dial: None,
@@ -149,6 +156,15 @@ impl PeerState {
             .as_ref()
             .map(|i| i.capabilities)
             .unwrap_or(Capabilities::NONE)
+    }
+
+    /// Whether this peer can decode a message introduced in `version`.
+    ///
+    /// The wire format is positional and a control stream that fails to decode is
+    /// torn down, so a message newer than the peer's build does not degrade — it
+    /// ends the session. Anything added after version 1 has to ask this first.
+    pub fn speaks(&self, version: u16) -> bool {
+        self.protocol.is_some_and(|p| p >= version)
     }
 
     /// Whether this peer should participate in the mesh at all.
@@ -289,6 +305,17 @@ impl AgentState {
         true
     }
 
+    /// Whether a peer can be sent a control message introduced in `version`.
+    ///
+    /// Stricter than [`AgentState::is_reachable`] in two ways, both deliberate: the
+    /// peer must have advertised a new enough wire version, and this node itself is
+    /// never a recipient — it has no session with itself to send over.
+    pub fn can_receive(&self, node: NodeId, version: u16) -> bool {
+        self.peers
+            .get(&node)
+            .is_some_and(|p| p.status.is_usable() && p.is_eligible() && p.speaks(version))
+    }
+
     /// Whether a peer can be sent input right now.
     pub fn is_reachable(&self, node: NodeId) -> bool {
         node == self.local
@@ -374,12 +401,16 @@ impl AgentState {
     }
 
     /// A session came up.
-    pub fn on_session(&mut self, info: NodeInfo, trusted: bool, now: Instant) {
+    ///
+    /// `protocol` is what the peer advertised at its handshake, not this build's
+    /// version: it decides which messages this peer may be sent.
+    pub fn on_session(&mut self, info: NodeInfo, protocol: u16, trusted: bool, now: Instant) {
         let node = info.id;
         let name = info.name.clone();
         let peer = self.entry(node, &name, now);
         peer.advertised_name = name;
         peer.info = Some(info);
+        peer.protocol = Some(protocol);
         peer.last_seen = now;
         peer.dial_failures = 0;
         peer.next_dial = None;
@@ -871,9 +902,47 @@ mod tests {
     fn a_connected_peer_is_not_dialled_again() {
         let now = Instant::now();
         let (mut state, _, _) = state_with_peer(1, 2, now);
-        state.on_session(info(2, vec![mon(0, 0, 0, 1920, 1080)]), true, now);
+        state.on_session(
+            info(2, vec![mon(0, 0, 0, 1920, 1080)]),
+            wx_proto::PROTOCOL_VERSION,
+            true,
+            now,
+        );
         assert!(state.dial_targets(now).is_empty());
         assert!(state.is_reachable(node(2)));
+    }
+
+    #[test]
+    fn a_peer_on_the_older_wire_version_is_not_sent_the_newer_messages() {
+        // `CapabilitiesChanged` did not exist in version 1, and the wire format is
+        // positional: a build that has never heard of it fails to decode, and a
+        // control stream that fails to decode is torn down. Skipping the peer costs
+        // it one update; sending it would cost it the session.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![]), 1, true, now);
+
+        assert!(state.is_reachable(node(2)), "a v1 peer is still a peer");
+        assert!(state.can_receive(node(2), 1));
+        assert!(!state.can_receive(node(2), wx_proto::CAPABILITIES_CHANGED_SINCE));
+
+        // The same peer on a build that does have the message.
+        state.on_session(
+            info(2, vec![]),
+            wx_proto::CAPABILITIES_CHANGED_SINCE,
+            true,
+            now,
+        );
+        assert!(state.can_receive(node(2), wx_proto::CAPABILITIES_CHANGED_SINCE));
+    }
+
+    #[test]
+    fn a_peer_that_has_not_introduced_itself_is_sent_nothing_new() {
+        // A peer known only from discovery has promised nothing about what it can
+        // decode, so the answer has to be no rather than an assumption.
+        let now = Instant::now();
+        let (state, _, _) = state_with_peer(1, 2, now);
+        assert!(!state.can_receive(node(2), wx_proto::CAPABILITIES_CHANGED_SINCE));
     }
 
     #[test]
@@ -882,7 +951,7 @@ mod tests {
         // point of admitting it is to show the user a PIN prompt.
         let now = Instant::now();
         let mut state = AgentState::new(node(1), "me".into(), now);
-        state.on_session(info(2, vec![]), false, now);
+        state.on_session(info(2, vec![]), wx_proto::PROTOCOL_VERSION, false, now);
         assert_eq!(state.peer(&node(2)).unwrap().status, ConnStatus::Pairing);
         assert!(!state.is_reachable(node(2)));
     }
@@ -958,7 +1027,7 @@ mod tests {
         // announcement would drop the cursor mid-gesture.
         let now = Instant::now();
         let (mut state, _, _) = state_with_peer(1, 2, now);
-        state.on_session(info(2, vec![]), true, now);
+        state.on_session(info(2, vec![]), wx_proto::PROTOCOL_VERSION, true, now);
         state.observe_lost(node(2));
         assert_eq!(state.peer(&node(2)).unwrap().status, ConnStatus::Connected);
     }

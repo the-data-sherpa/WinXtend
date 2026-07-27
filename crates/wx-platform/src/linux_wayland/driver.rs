@@ -206,6 +206,8 @@ async fn run(
         devices = ?live.granted,
         "the desktop portal granted a RemoteDesktop session"
     );
+    // The whole set, not a subset of it: a grant missing either device type never
+    // reaches here, because `accept_granted` refuses it.
     shared.activate(SESSION_CAPABILITIES);
 
     let reason = pump(live.connection, live.events, &live.session, stop).await;
@@ -331,12 +333,22 @@ async fn negotiate(
         restoring = restore_token.is_some(),
         "starting the portal session; a consent dialog appears unless a restore token covers it"
     );
+    // `TokenSent::No` from here on: only `SelectDevices` carried the token, so an
+    // argument the portal will not take on a later call is an argument of ours.
+    // Reading one as a rejected token would delete a good one and cost the user a
+    // consent dialog on the next launch.
     let started = proxy
         .start(session, None, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, sent))?
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?
         .response()
-        .map_err(|e| Failure::from_ashpd(e, sent))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?;
+
+    // Checked before the token is persisted: a token is the portal's promise to
+    // grant the same thing again without asking, and persisting one for a grant
+    // this session is about to refuse would make every later launch restore the
+    // same half grant silently, with no dialog left to fix it at.
+    accept_granted(started.devices())?;
 
     // Persisted before anything else can fail: a token thrown away because the libei
     // connection did not come up would cost the user another dialog for a problem
@@ -356,19 +368,11 @@ async fn negotiate(
     }
 
     let granted = started.devices();
-    if granted.is_empty() {
-        return Err(Failure::refused(
-            "the desktop portal granted no input devices",
-        ));
-    }
-    if !granted.contains(DeviceType::Keyboard) || !granted.contains(DeviceType::Pointer) {
-        tracing::warn!(devices = ?granted, "the portal granted only some of the devices asked for");
-    }
 
     let fd = proxy
         .connect_to_eis(session, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, sent))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?;
 
     let context = ei::Context::new(UnixStream::from(fd))
         .map_err(|e| Failure::broken(format!("opening the libei transport: {e}")))?;
@@ -383,6 +387,38 @@ async fn negotiate(
         connection,
         events,
     })
+}
+
+/// Refuse a grant that is missing either device type.
+///
+/// [`wx_proto::Capabilities`] has no per-device granularity: the session either
+/// advertises `CAPTURE_INPUT | INJECT_INPUT` or it advertises nothing. So a grant
+/// covering only the pointer has no honest way to be published — claiming keyboard
+/// capability the session cannot deliver would have peers route keystrokes here
+/// that silently go nowhere, against the rule this backend is built on that it
+/// advertises nothing it cannot do.
+///
+/// Reported as a refusal rather than a fault because that is what it is: the portal
+/// answered the request, and what came back is less than was asked for. The message
+/// names the missing device so a user who mis-clicked the dialog can see which box
+/// to tick next time.
+fn accept_granted(granted: BitFlags<DeviceType>) -> Result<(), Failure> {
+    let missing: Vec<&str> = [
+        (DeviceType::Keyboard, "keyboard"),
+        (DeviceType::Pointer, "pointer"),
+    ]
+    .into_iter()
+    .filter(|(device, _)| !granted.contains(*device))
+    .map(|(_, name)| name)
+    .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Failure::refused(format!(
+        "the desktop portal withheld {} access; this machine needs keyboard and pointer together, so the session was given back",
+        missing.join(" and ")
+    )))
 }
 
 /// What [`negotiate`] produces: everything a [`Live`] needs except the session.
@@ -406,14 +442,21 @@ async fn pump(
     session: &Session<RemoteDesktop>,
     mut stop: oneshot::Receiver<()>,
 ) -> Ended {
-    let closed = match session.receive_closed().await {
-        Ok(stream) => Some(stream),
-        Err(e) => {
-            // Losing this only costs the D-Bus half of revocation detection; the ei
-            // stream still notices. Not worth refusing a working session over.
-            tracing::warn!(error = %e, "cannot watch the portal session for revocation over D-Bus");
-            None
-        }
+    // Subscribing is a D-Bus round trip, and shutdown has to be able to interrupt it
+    // like everything else in here: `Driver::drop` joins this thread on the promise
+    // that no path is bounded only by however long the bus takes to answer.
+    let closed = tokio::select! {
+        biased;
+        _ = &mut stop => return Ended::Stopped,
+        subscribed = session.receive_closed() => match subscribed {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                // Losing this only costs the D-Bus half of revocation detection; the
+                // ei stream still notices. Not worth refusing a working session over.
+                tracing::warn!(error = %e, "cannot watch the portal session for revocation over D-Bus");
+                None
+            }
+        },
     };
     let mut closed = std::pin::pin!(OptionStream(closed));
 
@@ -908,6 +951,53 @@ mod tests {
         session.activate(SESSION_CAPABILITIES);
         assert_eq!(session.state(), SessionState::Denied);
         assert!(live.get().is_empty());
+    }
+
+    #[test]
+    fn a_grant_covering_both_devices_is_accepted() {
+        assert!(accept_granted(wanted_devices()).is_ok());
+    }
+
+    #[test]
+    fn a_half_grant_is_refused_rather_than_advertised_as_both() {
+        // `Capabilities` cannot say "pointer but not keyboard", so a session that
+        // published anything here would be claiming a capability it cannot honour
+        // and peers would send keystrokes into a void. Refusing says so instead.
+        let failure = accept_granted(DeviceType::Pointer.into()).unwrap_err();
+        assert!(matches!(failure.kind, FailureKind::Denied));
+        assert!(
+            failure.detail.contains("withheld keyboard"),
+            "the message must name what was withheld: {}",
+            failure.detail
+        );
+        assert!(!failure.detail.contains("withheld pointer"));
+
+        let (session, live) = session();
+        session.starting();
+        failure.report(&session);
+
+        assert_eq!(session.state(), SessionState::Denied);
+        assert!(
+            live.get().is_empty(),
+            "a half grant must advertise neither capability"
+        );
+        assert!(matches!(
+            session.error(),
+            Some(PlatformError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn a_half_grant_does_not_leave_a_token_that_would_restore_it_silently() {
+        // The self-heal for the other direction: a token for a grant that is refused
+        // would restore the same half grant on every later launch with no dialog, so
+        // the session would be wedged with nothing the user could act on.
+        let no_keyboard = accept_granted(DeviceType::Pointer.into()).unwrap_err();
+        assert!(no_keyboard.discards_token);
+
+        let none_at_all = accept_granted(BitFlags::empty()).unwrap_err();
+        assert!(none_at_all.discards_token);
+        assert!(none_at_all.detail.contains("withheld keyboard and pointer"));
     }
 
     #[test]

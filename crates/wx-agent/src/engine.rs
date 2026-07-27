@@ -52,7 +52,7 @@ use wx_platform::{CapturedEvent, PlatformBackend};
 use wx_proto::{
     Capabilities, ControlMsg, GlobalMonitorId, InputEvent, InputFrame, KeyAction, KeyPayload,
     Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos, PointerEvent, RejectReason, Reliability,
-    SequenceGate,
+    SequenceGate, CAPABILITIES_CHANGED_SINCE,
 };
 
 use crate::config::{Config, HotkeyAction};
@@ -1221,7 +1221,8 @@ impl Engine {
         let trusted = established.peer_was_paired;
         let info = established.peer.clone();
         let name = info.name.clone();
-        self.state.on_session(info.clone(), trusted, now);
+        self.state
+            .on_session(info.clone(), established.peer_protocol, trusted, now);
         {
             let trust = self.trust.lock().expect("trust store lock");
             let config = self.config.clone();
@@ -1912,7 +1913,7 @@ impl Engine {
     /// Polled rather than pushed: the backend that loses a permission is on its own
     /// thread with no route into this loop, and a tick is soon enough for a change
     /// the user just made by hand.
-    fn sync_capabilities(&mut self) {
+    async fn sync_capabilities(&mut self) {
         let now = capabilities_for(&self.platform, self.state.local_monitors());
         let before = {
             let mut info = self.local_info.lock().expect("local info lock");
@@ -1931,7 +1932,13 @@ impl Engine {
             now = now.0,
             "local capabilities changed; re-advertising"
         );
-        self.broadcast_control(ControlMsg::CapabilitiesChanged { capabilities: now });
+        // Only to peers new enough to decode it. A peer left out keeps the answer
+        // this node gave at its handshake, which is the same thing that happens on
+        // every build that predates this message.
+        self.broadcast_control_since(
+            CAPABILITIES_CHANGED_SINCE,
+            ControlMsg::CapabilitiesChanged { capabilities: now },
+        );
 
         if gained.contains(Capabilities::CAPTURE_INPUT) {
             // The permission this machine needs to capture may arrive long after
@@ -1944,6 +1951,14 @@ impl Engine {
         }
 
         if lost.contains(Capabilities::CAPTURE_INPUT) {
+            // Before anything else: if the cursor is out on a peer, this machine
+            // has just lost the only way to steer it back, and whatever it was
+            // holding down there would stay down forever. Same rescue as the
+            // reclaim hotkey, which is also the path that tells the peer to let go.
+            let local = self.local;
+            let actions = reclaim_cursor(&mut self.router, local, |n| n == local);
+            self.execute(actions, Origin::Remote).await;
+
             // Stopped, not restarted. The usual reason to lose this is a user who
             // refused, and a daemon that answered by asking again would put the
             // consent dialog back on their screen forever.
@@ -1999,7 +2014,7 @@ impl Engine {
             }
         }
 
-        self.sync_capabilities();
+        self.sync_capabilities().await;
 
         // Round-trip times, for the UI and for diagnosing a slow link.
         let rtts: Vec<(NodeId, Duration)> = self
@@ -2583,6 +2598,25 @@ impl Engine {
             .keys()
             .copied()
             .filter(|n| self.state.is_reachable(*n))
+            .collect();
+        for node in peers {
+            self.send_to(node, Outbound::Control(msg.clone()));
+        }
+    }
+
+    /// Broadcast a message that older peers cannot decode.
+    ///
+    /// Skipping a peer costs it one piece of news. Sending it anyway costs it the
+    /// session: a variant its build does not have is a decode error, and a control
+    /// stream that fails to decode is torn down by construction. So every message
+    /// introduced after protocol version 1 goes out through here, keyed to the
+    /// version it was introduced in.
+    fn broadcast_control_since(&mut self, version: u16, msg: ControlMsg) {
+        let peers: Vec<NodeId> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|n| self.state.can_receive(*n, version))
             .collect();
         for node in peers {
             self.send_to(node, Outbound::Control(msg.clone()));

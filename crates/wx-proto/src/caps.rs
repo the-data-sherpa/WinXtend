@@ -10,13 +10,21 @@ use serde::{Deserialize, Serialize};
 
 /// Wire format version.
 ///
-/// Bumped only for changes that older peers cannot parse. Additive changes —
-/// appending an enum variant or a capability bit — do not require a bump,
-/// because peers ignore capabilities they do not recognise and never send
-/// variants the other side did not advertise support for.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Bumped for any change an older peer cannot decode. Appending an enum variant
+/// or a capability bit is safe to *receive* — unknown capability bits survive a
+/// round trip and no old build sends a variant it does not have — but it is not
+/// safe to *send*: a variant a peer's build has never heard of is a decode error
+/// on a stream where a decode error is terminal. So a new variant means a bump,
+/// and the sender gates on the version the peer advertised at its handshake.
+///
+/// * 2 — [`crate::ControlMsg::CapabilitiesChanged`], for Wayland nodes whose
+///   input permission comes and goes while the process runs.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Oldest version this build can still talk to.
+///
+/// Left at 1 by the version-2 bump: a version-1 peer speaks a strict subset of
+/// this wire format, so it is only the newer messages it must never be sent.
 pub const MIN_COMPATIBLE_VERSION: u16 = 1;
 
 // A build whose floor is above its own version could not talk to anything, itself
