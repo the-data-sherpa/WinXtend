@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml/badge.svg)](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml)
 
-**Share one keyboard and mouse across every machine on your desk.** Move the cursor
-off the edge of one screen and it appears on the next machine — Windows, macOS, or
-Linux — with the clipboard following it and no KVM switch in sight.
+**Share one keyboard and mouse across every machine on your desk.** The idea: move
+the cursor off the edge of one screen and it appears on the next machine, no KVM
+switch in sight. The complete backend today is Windows, with Linux/Wayland the
+alpha target.
 
 A spiritual successor to Synergy, Barrier, and [hydra](https://github.com/PacAnimal/hydra),
 written in Rust, with a QUIC transport, zero-configuration discovery, and a visual
@@ -12,20 +13,38 @@ layout editor.
 
 ---
 
-> ### Project status: pre-alpha
+> ### Project status: pre-alpha, and the alpha target is Linux/Wayland
 >
-> Read this before cloning. The engine is real and heavily tested — **614 unit and
-> integration tests, `cargo clippy` clean** — but:
+> Read this before cloning. The engine is real and heavily tested — several hundred
+> unit and integration tests, `cargo clippy` clean; run `cargo test --workspace` for
+> the current figure — but the platform story needs stating plainly, because the
+> complete backend and the targeted one are not the same backend:
 >
-> - **Only the Windows backend is implemented.** macOS, X11, Wayland, and evdev
->   compile and are documented down to the exact syscall sequences, but they are
->   skeletons that advertise no capabilities. On those platforms the agent starts
->   and does nothing.
+> - **Windows is the only complete backend, and it is out of alpha scope.**
+>   Capture, injection, displays, and the clipboard platform layer all work there.
+>   Clipboard *sync*, though, does not work end to end on Windows any more than
+>   anywhere else, because the agent does not act on clipboard messages yet — they
+>   fall into the catch-all arm in `crates/wx-agent/src/engine.rs` that logs
+>   "ignoring a message this build does not handle". It is kept, tested, and
+>   accurately described below — but it is not what the alpha is aimed at.
+> - **Linux/Wayland is the alpha target, and it is being built now.** Display
+>   enumeration works: a `wl_output`/`xdg_output` client enumerates monitors, and
+>   `capabilities()` advertises `HAS_DISPLAYS` only when enumeration actually found
+>   one. Capture, injection, clipboard, and input suppression do not — the portal
+>   and `libei` work is unlanded, so the backend advertises none of them and refuses
+>   what it cannot do, on purpose
+>   (`crates/wx-platform/src/linux_wayland/mod.rs::the_backend_advertises_nothing_it_cannot_do`
+>   and `::suppression_is_refused_rather_than_silently_ignored`). macOS, X11, and
+>   evdev are further back than Wayland now is: compiling skeletons, documented down
+>   to the exact syscall sequences and implemented no further. On those platforms
+>   the agent starts and does nothing.
 > - **It has never moved a cursor between two physical machines.** Every test runs
 >   in a single process. The QUIC handshake and session tests are real, but they
 >   are loopback.
-> - **Screen streaming has no real codec yet** — lossless passthrough only, which
->   is LAN-only in practice.
+> - **Screen streaming is not connected.** `wx-video` compiles and its tests
+>   pass, but nothing depends on it and the agent hardcodes a refusal in the
+>   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
+>   `crates/wx-agent/src/engine.rs`. It is parked for alpha.
 >
 > The protocol, layout engine, routing, transport, and pairing are the parts worth
 > looking at today. Treat the rest as a well-marked construction site.
@@ -47,10 +66,9 @@ an operating system, or rescue a machine whose kernel has hung. Those need captu
 hardware physically attached to the target, and no amount of software substitutes
 for it.
 
-The one place WinXtend reaches past a classic software KVM is **optional screen
-streaming**: a machine with no monitor attached can send its screen to the UI, so a
-headless mini-PC is usable rather than merely reachable. It still needs the agent
-running, so it is not a bare-metal rescue tool.
+So what WinXtend does today is input sharing between machines that each have their
+own display. It does not send you a picture of any of them. See
+the [roadmap](#roadmap) for where screen streaming stands.
 
 ## Why another one of these
 
@@ -117,21 +135,27 @@ flowchart TD
     end
     subgraph B["Machine B"]
         BN[wx-net<br/>QUIC session] --> BI[wx-platform<br/>inject]
-        BV[wx-video<br/>capture + encode] --> BN
+        BV["wx-video<br/>capture + encode<br/>(parked: not wired in)"] -.-> BN
     end
     AN -->|"datagrams: pointer motion<br/>streams: keys, clipboard, control"| BN
     AN -.->|local IPC| UI[Tauri UI<br/>discovery, layout editor, status]
 ```
 
-| Crate | Role | Tests |
-|---|---|---|
-| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. | 67 |
-| `wx-core` | Engine: global layout, edge crossing, virtual cursor, input routing. Pure logic. | 86 |
-| `wx-platform` | Platform abstraction: capture, injection, displays, clipboard. | 160 |
-| `wx-net` | QUIC transport, ed25519 identity, PIN pairing, mDNS discovery. | 102 |
-| `wx-video` | Optional screen capture, encode, and frame pacing. | 61 |
-| `wx-agent` | The headless daemon that wires it together, plus its IPC surface. | 139 |
-| `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. | — |
+| Crate | Role |
+|---|---|
+| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. |
+| `wx-core` | Engine: global layout, edge crossing, virtual cursor, input routing. Pure logic. |
+| `wx-platform` | Platform abstraction: capture, injection, displays, clipboard. |
+| `wx-net` | QUIC transport, ed25519 identity, PIN pairing, mDNS discovery. |
+| `wx-video` | Optional screen capture, encode, and frame pacing. **Parked: nothing depends on it.** |
+| `wx-agent` | The headless daemon that wires it together, plus its IPC surface. |
+| `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. |
+
+No test counts are quoted here, per crate or in total, because none of them hold
+across platforms: `wx-platform`'s Windows backend and its Wayland client are gated
+to different operating systems, so neither Windows nor Linux is "the" figure.
+`cargo test --workspace` is the authority — see
+[Testing](#why-the-test-count-differs-by-platform).
 
 `wx-proto` and `wx-core` deliberately contain no I/O and no platform calls, which
 is why the interesting behaviour — edge crossings, split edges, stuck-modifier
@@ -140,9 +164,14 @@ second machine.
 
 ## Current status
 
+**The alpha targets Linux/Wayland.** That is the mostly-⚠️ column below, not the ✅
+one. Windows is the only backend that is finished, and it is reported accurately
+here because it is real — but it is out of alpha scope, so read the Wayland column
+for what the next release is about.
+
 | | Windows | macOS | Linux/X11 | Linux/Wayland | Linux headless |
 |---|---|---|---|---|---|
-| Display enumeration | ✅ | ⚠️ | ⚠️ | ⚠️ | n/a |
+| Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Input injection | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ⚠️ | n/a |
@@ -162,9 +191,9 @@ second machine.
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
 | File transfer | ❌ not implemented, and no longer advertised |
-| Screen streaming | ⚠️ passthrough only, no real codec |
+| Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ❌ the reason to pick this over Synergy, still to do |
+| Wayland | ⚠️ display enumeration landed; capture, injection, and clipboard are the alpha, and the standing gap in every tool in this space |
 
 ## Building
 
@@ -173,12 +202,51 @@ Requires **Rust 1.79+** and, for the UI, **Node 20+**.
 ```bash
 git clone git@github.com:the-data-sherpa/WinXtend.git
 cd WinXtend
-cargo test --workspace     # 614 tests
+cargo test --workspace     # the total differs by platform — see Testing
 cargo build --release      # produces target/release/wx-agent
 ```
 
-On Windows you also need the MSVC toolchain (Visual Studio Build Tools with the
-C++ workload) and the WebView2 runtime, which ships with Windows 11.
+### Ubuntu / Debian prerequisites
+
+The engine compiles bundled C through two build scripts — `zstd-sys`, because
+`zstd` is a default feature of `wx-video`, and `ring` — so a C compiler is its
+only system prerequisite:
+
+```bash
+sudo apt install -y build-essential
+```
+
+It needs neither `pkg-config` nor `libssl-dev`, both of which the package list
+in issue #2 named in error. No engine build script probes `pkg-config`:
+`zstd-sys` builds the bundled C with `cc`, and probes only under its own
+`pkg-config` feature or `ZSTD_SYS_USE_PKG_CONFIG`, neither of which is set
+here; `wayland-sys` is built with none of its `client`/`cursor`/`egl`/`server`
+features, so its build script emits nothing — `wayland-client` uses the
+pure-Rust backend. Nothing in the tree links OpenSSL either: neither
+`Cargo.lock` nor `ui/src-tauri/Cargo.lock` contains `openssl-sys` or
+`native-tls`, and `wx-net` pins `quinn` with `default-features = false` and
+`rustls-ring`, a pure-Rust TLS stack.
+
+The Tauri UI additionally needs the WebKitGTK and tray stack:
+
+```bash
+sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+                    libayatana-appindicator3-dev libxdo-dev
+```
+
+The authority for that list is the "Install Tauri system dependencies" step in
+`.github/workflows/ci.yml`, which installs those five packages and nothing else.
+The engine job in the same workflow installs no packages at all, because GitHub's
+runners ship a C toolchain preinstalled.
+
+Verified on Ubuntu 26.04. `libwebkit2gtk-4.1-dev` is the Tauri 2 dependency. These
+are the current Debian/Ubuntu package names; on an older release, check them against
+that release's own package index.
+
+### Windows prerequisites
+
+The MSVC toolchain (Visual Studio Build Tools with the C++ workload) and the
+WebView2 runtime, which ships with Windows 11.
 
 The UI is a separate Cargo workspace so it does not pull Tauri into the engine
 build:
@@ -267,17 +335,70 @@ adversarial cases: hostile values off the wire, NaN, zero-size rectangles, integ
 overflow at coordinate extremes, datagram reordering, and frame boundaries split at
 every possible byte offset.
 
+### Why the test count differs by platform
+
+`cargo test --workspace` legitimately reports a different total on Linux, Windows,
+and macOS. That is expected, not a broken checkout. No figure is quoted anywhere in
+this README on purpose: run the command, which is the only authority on what the
+current number is.
+
+Two mechanisms cause it, and they are not the same. A test that is `#[cfg]`-gated to
+a platform is not compiled elsewhere at all, so it cannot be counted; a test that is
+compiled everywhere but `#[cfg_attr(..., ignore)]`d off its platform is counted
+ignored rather than passed. Gates like these are where the difference comes from —
+examples, not an exhaustive list:
+
+- `crates/wx-platform/src/windows/` sits behind `#[cfg(target_os = "windows")]` and
+  is the largest block of tests in the crate. None of it exists in a Linux or macOS
+  build, which is why Windows reports the highest total of the three.
+- `crates/wx-platform/src/linux_wayland/mod.rs` declares its `outputs` module — the
+  `wl_output`/`xdg_output` client — under `#[cfg(target_os = "linux")]`, so that
+  module's tests exist only on Linux and are absent from a Windows or macOS build.
+  The gates run in both directions, not only Windows-ward, which is why Linux and
+  macOS do not report the same total as each other either.
+- `crates/wx-agent/src/autostart.rs` uses both mechanisms. Several of its tests are
+  `#[cfg(windows)]` outright, so off Windows they are not compiled and cannot be
+  counted; `registering_is_idempotent_and_removable` is instead
+  `#[cfg_attr(not(windows), ignore)]`, so it compiles everywhere but only runs where
+  there is an autostart mechanism to exercise, and anywhere but Windows it is
+  counted ignored rather than passed.
+
+`crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
+too, but it moves no passing total: its cases are additionally `#[ignore]`d because
+they need an interactive desktop, so they are skipped on Windows itself and
+absent on Linux and macOS alike. Everything else — `wx-proto`, `wx-core`,
+`wx-net`, and the rest of `wx-video` — runs the same tests on all three.
+
+The totals will never converge, because each platform's tests are gated to that
+platform; as the Wayland backend grows, the Linux total rises with it.
+
 ## Roadmap
 
-Roughly in order of value:
+The alpha is Linux/Wayland. Roughly in order of value:
 
-1. **Validate between two physical Windows machines.** Nothing here is trustworthy
-   until a cursor actually crosses a real network.
-2. **Wire clipboard sync into the agent.** The platform side already works.
-3. **macOS backend**, then **Wayland** — Wayland being the standing gap in every
-   tool in this space, and the strongest reason to prefer this one.
-4. A real video codec behind the existing `Encoder` seam.
-5. A relay for machines on different networks or across a VPN.
+1. **The Wayland backend.** Capture, injection, and clipboard against the portal
+   and `wlr`/`libei` interfaces; display enumeration already works. This is the
+   alpha, it is the standing gap in every tool in this space, and it is the
+   strongest reason to prefer this one.
+2. **Validate between two physical Linux machines** over a real network. Nothing
+   here is trustworthy until a cursor actually crosses one; every test today runs
+   in a single process.
+3. **Wire clipboard sync into the agent.** The platform side already works.
+4. **Packaging for Linux** — a distributable agent, a systemd user unit, and a
+   first-run path that does not require `cargo`.
+5. **The macOS backend.**
+6. **Screen streaming, once there is a backend to stream from.** This is the one
+   place WinXtend would reach past a classic software KVM: a machine with no
+   monitor attached sending its screen to the UI, so a headless mini-PC is usable
+   rather than merely reachable. It is **not connected today** — `wx-video` exists
+   and passes its tests, but nothing depends on it and `wx-agent` answers video
+   requests with a refusal, in the
+   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
+   `crates/wx-agent/src/engine.rs`. Connecting it
+   also means a real codec behind the existing `Encoder` seam; the current
+   lossless passthrough is LAN-only. Even finished, it needs the agent running, so
+   it would never be a bare-metal rescue tool.
+7. A relay for machines on different networks or across a VPN.
 
 ## Prior art
 

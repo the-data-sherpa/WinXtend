@@ -26,22 +26,14 @@ Related: clippy's `-D warnings` fires per-target because those `cfg` blocks diff
 lint can be clean on Linux and fail on Windows or macOS (or the reverse — see `f41c426`).
 Fix the lint on the platform that reports it rather than dropping the flag.
 
-## A Linux test count below the README's is expected
+## A test total that differs by platform is expected
 
-The README quotes a Windows-run total, so `cargo test --workspace` on Linux
-legitimately reports fewer. Three things account for the gap:
-
-- a large block of `wx-platform` tests is gated `#[cfg(target_os = "windows")]`
-  and does not run on Linux;
-- a smaller number of tests in `wx-platform`'s Wayland backend are gated
-  `cfg(target_os = "linux")` and do not run on Windows;
-- one test, in `crates/wx-agent/src/autostart.rs`, is
-  `#[cfg_attr(not(windows), ignore)]`, so anywhere but Windows it is counted as
-  ignored rather than passed.
-
-A Linux total below a Windows-run total is therefore expected, and is not evidence
-that a quoted number is stale or wrong. `cargo test --workspace` is the only
-authority on what the current figure is — don't copy one back into this file.
+`cargo test --workspace` legitimately reports a different total on Linux, Windows and
+macOS; that is the `cfg` gating above, not a broken checkout. The README's
+[Why the test count differs by platform](README.md#why-the-test-count-differs-by-platform)
+owns the explanation of which gates cause it. The rule that matters here: the command
+is the only authority on the current figure, so no count is quoted in this file or in
+the README — don't reintroduce one.
 
 ## Testing Linux/Wayland backends without a second machine
 
