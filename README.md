@@ -331,12 +331,15 @@ every possible byte offset.
 ### Why the test count differs by platform
 
 `cargo test --workspace` legitimately reports a different total on Linux, Windows,
-and macOS. That is expected, not a broken checkout — a Rust test that is
-`#[cfg]`-gated to a platform is not compiled at all elsewhere, so it cannot be
-counted. No figure is quoted anywhere in this README on purpose: run the command,
-which is the only authority on what the current number is.
+and macOS. That is expected, not a broken checkout. No figure is quoted anywhere in
+this README on purpose: run the command, which is the only authority on what the
+current number is.
 
-Three gates account for the difference:
+Two mechanisms cause it, and they are not the same. A test that is `#[cfg]`-gated to
+a platform is not compiled elsewhere at all, so it cannot be counted; a test that is
+compiled everywhere but `#[cfg_attr(..., ignore)]`d off its platform is counted
+ignored rather than passed. Gates like these are where the difference comes from —
+examples, not an exhaustive list:
 
 - `crates/wx-platform/src/windows/` sits behind `#[cfg(target_os = "windows")]` and
   is the largest block of tests in the crate. None of it exists in a Linux or macOS
@@ -346,10 +349,12 @@ Three gates account for the difference:
   Linux and are absent from a Windows or macOS build. The gates run in both
   directions, not only Windows-ward, which is why Linux and macOS do not report the
   same total as each other either.
-- `registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`
-  is `#[cfg_attr(not(windows), ignore)]`. It compiles everywhere but only runs where
-  there is an autostart mechanism to exercise, so anywhere but Windows it is counted
-  ignored rather than passed.
+- `crates/wx-agent/src/autostart.rs` uses both mechanisms. Several of its tests are
+  `#[cfg(windows)]` outright, so off Windows they are not compiled and cannot be
+  counted; `registering_is_idempotent_and_removable` is instead
+  `#[cfg_attr(not(windows), ignore)]`, so it compiles everywhere but only runs where
+  there is an autostart mechanism to exercise, and anywhere but Windows it is
+  counted ignored rather than passed.
 
 `crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
 too, but it moves no passing total: its cases are additionally `#[ignore]`d because
