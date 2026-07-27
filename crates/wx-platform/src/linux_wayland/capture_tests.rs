@@ -759,6 +759,48 @@ fn no_raw_keycode_escapes_upward_for_a_key_the_layout_maps() {
             }
         }
     }
+
+    // A modifier the layout put somewhere unusual is the case this rule was
+    // written for and the one it kept missing: keycode 86 resolves to
+    // `ISO_Level3_Shift`, which is no character, so it fell straight through to
+    // the raw-keycode escape meant for content keys.
+    let lv3 = Harness::with_layout(LV3_ELSEWHERE);
+    lv3.activate();
+    for event in lv3.tap(86) {
+        if let CapturedEvent::Key(k) = event {
+            assert!(
+                !matches!(k.payload, KeyPayload::RawKeyCode(_)),
+                "the level-3 shift escaped as a raw code"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_level_three_shift_crosses_as_a_modifier_rather_than_a_position() {
+    // The peer needs to know AltGr is down, not which key this keyboard keeps it
+    // under: pressing position 86 on the receiver types whatever sits there, which
+    // on an ordinary layout is `<`. `AltRight` is the honest target — the text has
+    // already been resolved on this side, so no receiver needs a level-3 shift to
+    // produce a character, and `wx_core`'s router pairs that key with `ALT|ALT_GR`
+    // so releasing it clears both bits exactly once.
+    let h = Harness::with_layout(LV3_ELSEWHERE);
+    h.activate();
+    let payloads: Vec<KeyPayload> = h
+        .tap(86)
+        .into_iter()
+        .filter_map(|e| match e {
+            CapturedEvent::Key(k) => Some(k.payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![
+            KeyPayload::Special(SpecialKey::AltRight),
+            KeyPayload::Special(SpecialKey::AltRight),
+        ]
+    );
 }
 
 #[test]

@@ -291,6 +291,46 @@ pub fn special_from_evdev(code: u32) -> Option<SpecialKey> {
     })
 }
 
+/// The semantic key a *modifier* keysym stands for.
+///
+/// A layout is free to put a modifier on any keycode it likes — `lv3:lsgt_switch`
+/// puts `ISO_Level3_Shift` on the key beside left Shift, `ctrl:nocaps` puts Control
+/// where Caps Lock is — and [`special_from_evdev`] only knows the usual positions.
+/// Without this the key falls through to the layout, resolves to a keysym no
+/// character can be made of, and leaves this backend as a raw keycode: the peer
+/// then presses whatever *its* keyboard has at that position, which types a stray
+/// character rather than modifying anything. [`crate`] states the rule this keeps:
+/// a backend that hands raw keycodes upwards has moved the problem to the wrong
+/// side of the wire.
+///
+/// The mapping is by intent rather than by name. `ISO_Level3_Shift` and
+/// `Mode_switch` both become [`SpecialKey::AltRight`], which is where every
+/// receiver's AltGr is, and which `wx_core`'s router already pairs with
+/// `ALT | ALT_GR` so releasing it clears both. That loses nothing: the sender has
+/// already resolved its text through its own layout, so a receiver never needs a
+/// level-3 shift to *produce* a character — only to know the modifier is down.
+///
+/// The locks are deliberately absent. Caps Lock and Num Lock are toggles this
+/// backend tracks from the evdev code, and a payload without the matching state
+/// change would put the two sides out of step about which level is live.
+pub fn special_from_keysym(keysym: u32) -> Option<SpecialKey> {
+    Some(match keysym {
+        XK_ISO_LEVEL3_SHIFT => SpecialKey::AltRight,
+        0xff7e => SpecialKey::AltRight, // Mode_switch, the older spelling of AltGr
+        0xffe1 => SpecialKey::ShiftLeft,
+        0xffe2 => SpecialKey::ShiftRight,
+        0xffe3 => SpecialKey::CtrlLeft,
+        0xffe4 => SpecialKey::CtrlRight,
+        // Meta is where X11 put the Alt keys on PC hardware, and keymaps still
+        // write it there.
+        0xffe7 | 0xffe9 => SpecialKey::AltLeft,
+        0xffe8 | 0xffea => SpecialKey::AltRight,
+        0xffeb => SpecialKey::SuperLeft,
+        0xffec => SpecialKey::SuperRight,
+        _ => return None,
+    })
+}
+
 /// `BTN_LEFT`. The mouse button block starts here.
 const BTN_LEFT: u32 = 0x110;
 /// `BTN_SIDE` and `BTN_EXTRA`: what a mouse's thumb buttons report, and what
@@ -421,6 +461,27 @@ mod tests {
         // text would make the alphabetic test below fire on Enter.
         assert_eq!(char_for_keysym(0xff0d), None);
         assert_eq!(char_for_keysym(0xfe03), None);
+    }
+
+    #[test]
+    fn a_modifier_keysym_resolves_to_the_modifier_and_not_to_a_position() {
+        // The keysym block a layout uses when it moves a modifier off its usual
+        // key. Left unmapped, each of these leaves capture as a raw keycode and has
+        // the peer press whatever its own keyboard has at that position.
+        assert_eq!(
+            special_from_keysym(XK_ISO_LEVEL3_SHIFT),
+            Some(SpecialKey::AltRight)
+        );
+        assert_eq!(special_from_keysym(0xff7e), Some(SpecialKey::AltRight));
+        assert_eq!(special_from_keysym(0xffe1), Some(SpecialKey::ShiftLeft));
+        assert_eq!(special_from_keysym(0xffe4), Some(SpecialKey::CtrlRight));
+        assert_eq!(special_from_keysym(0xffe9), Some(SpecialKey::AltLeft));
+        assert_eq!(special_from_keysym(0xffeb), Some(SpecialKey::SuperLeft));
+
+        // Characters and the locks are not this function's business: the first are
+        // text, and the second are toggles tracked from the evdev code.
+        assert_eq!(special_from_keysym(keysym_for_char('a')), None);
+        assert_eq!(special_from_keysym(0xffe5), None);
     }
 
     #[test]

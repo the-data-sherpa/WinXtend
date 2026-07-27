@@ -81,8 +81,8 @@ use crate::traits::{CaptureSink, CapturedEvent};
 
 use super::keymap::{Keymap, LevelMods};
 use super::keys::{
-    button_from_evdev, char_for_keysym, dead_accent, special_from_evdev, KEY_LEFTALT, KEY_LEFTCTRL,
-    KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT,
+    button_from_evdev, char_for_keysym, dead_accent, special_from_evdev, special_from_keysym,
+    KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT,
 };
 use super::BACKEND;
 
@@ -921,6 +921,13 @@ impl Keyboard {
         };
         match self.keymap.keysym(keycode, level, self.caps) {
             Some(keysym) => {
+                // A modifier the layout put somewhere unusual is still a modifier,
+                // and the raw-keycode escape below is for content keys: sending
+                // this position to a peer would press whatever its own keyboard has
+                // there.
+                if let Some(key) = special_from_keysym(keysym) {
+                    return RawKey::special(keycode, key, action, modifiers);
+                }
                 if let Some(accent) = dead_accent(keysym) {
                     return RawKey::dead(keycode, accent, action, modifiers);
                 }
