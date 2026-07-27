@@ -919,7 +919,8 @@ impl Keyboard {
             Some(SpecialKey::NumLock) if pressed => self.num = !self.num,
             _ if is_level_modifier(keycode)
                 || is_chord_modifier(keycode)
-                || self.keymap.is_level3(keycode) =>
+                || self.keymap.is_level3(keycode)
+                || special.is_some_and(SpecialKey::is_modifier) =>
             {
                 self.hold(keycode, pressed);
             }
@@ -938,7 +939,7 @@ impl Keyboard {
         }
 
         let level = LevelMods {
-            shift: self.holding(KEY_LEFTSHIFT) || self.holding(SHIFT_RIGHT),
+            shift: self.holding_shift(),
             level3: self.holding_level3(),
         };
         match self.keymap.keysym(keycode, level, self.caps) {
@@ -1007,26 +1008,54 @@ impl Keyboard {
         self.held.iter().any(|k| self.keymap.is_level3(*k))
     }
 
+    /// Whether a key acting as a shift is down.
+    ///
+    /// The same question as [`Keyboard::holding_level3`] and answered the same way:
+    /// what the key *is* on this layout, not where it sits.
+    fn holding_shift(&self) -> bool {
+        self.held.iter().any(|k| {
+            matches!(
+                self.held_modifier(*k),
+                Some(SpecialKey::ShiftLeft | SpecialKey::ShiftRight)
+            )
+        })
+    }
+
+    /// What a held key is, asked of the layout first and the evdev table second.
+    ///
+    /// The precedence [`Keyboard::raw`] already applies to the payload, applied to
+    /// the bookkeeping as well — they have to agree. `altwin:swap_alt_win` puts
+    /// `Super_L` on the left Alt keycode: reading the position would tell a peer
+    /// that Alt is down while sending it a Super key, which strands the ALT bit and
+    /// has the router release an Alt nobody pressed.
+    fn held_modifier(&self, keycode: u32) -> Option<SpecialKey> {
+        self.layout_modifier(keycode)
+            .or_else(|| special_from_evdev(keycode))
+            .filter(|key| key.is_modifier())
+    }
+
+    /// The bit one held key contributes.
+    fn bit_for(&self, keycode: u32) -> Modifiers {
+        if self.keymap.is_level3(keycode) {
+            // Right Alt is both, on a layout that makes it AltGr. The router relies
+            // on that pairing: releasing the key clears both bits, so neither is
+            // released a second time.
+            return if keycode == KEY_RIGHTALT {
+                Modifiers::ALT.union(Modifiers::ALT_GR)
+            } else {
+                Modifiers::ALT_GR
+            };
+        }
+        self.held_modifier(keycode)
+            .and_then(SpecialKey::modifier_bit)
+            .unwrap_or(Modifiers::NONE)
+    }
+
     /// The modifier snapshot every captured key event carries.
     fn modifiers(&self) -> Modifiers {
         let mut mods = Modifiers::NONE;
         for keycode in &self.held {
-            let bit = match *keycode {
-                KEY_LEFTSHIFT | SHIFT_RIGHT => Modifiers::SHIFT,
-                KEY_LEFTCTRL | CTRL_RIGHT => Modifiers::CTRL,
-                KEY_LEFTALT => Modifiers::ALT,
-                // Right Alt is both, on a layout that makes it AltGr. The router
-                // relies on that pairing: releasing the key clears both bits, so
-                // neither is released a second time.
-                KEY_RIGHTALT if self.keymap.is_level3(KEY_RIGHTALT) => {
-                    Modifiers::ALT.union(Modifiers::ALT_GR)
-                }
-                KEY_RIGHTALT => Modifiers::ALT,
-                KEY_LEFTMETA | SUPER_RIGHT => Modifiers::SUPER,
-                other if self.keymap.is_level3(other) => Modifiers::ALT_GR,
-                _ => Modifiers::NONE,
-            };
-            mods = mods.union(bit);
+            mods = mods.union(self.bit_for(*keycode));
         }
         if self.caps {
             mods = mods.union(Modifiers::CAPS_LOCK);

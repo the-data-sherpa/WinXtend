@@ -124,6 +124,30 @@ xkb_symbols "pc" {
 };
 "#;
 
+/// `altwin:swap_alt_win`: Super where left Alt sits, evdev 56.
+const SUPER_ON_ALT: &str = r#"
+xkb_keymap {
+xkb_keycodes "evdev" {
+	<LALT> = 64;
+	<AD01> = 24;
+};
+xkb_types "complete" {
+	type "ALPHABETIC" {
+		modifiers= Shift+Lock;
+		map[Shift]= 2;
+		map[Lock]= 2;
+	};
+};
+xkb_symbols "pc" {
+	key <AD01> {
+		type= "ALPHABETIC",
+		symbols[1]= [ q, Q ]
+	};
+	key <LALT> { [ Super_L ] };
+};
+};
+"#;
+
 /// The screen the harness pretends to be on: one 1920x1080 zone at the origin.
 const SCREEN: Zone = Zone {
     x: 0,
@@ -949,7 +973,42 @@ fn a_caps_lock_the_layout_made_into_a_control_toggles_no_lock() {
         panic!("{pressed:?}");
     };
     assert_eq!(k.payload, KeyPayload::Special(SpecialKey::CtrlLeft));
+    assert!(k.modifiers.contains(Modifiers::CTRL));
+    assert!(!k.modifiers.contains(Modifiers::CAPS_LOCK));
+
+    // And the chord typed while it is held carries the bit, or `Ctrl+C` crosses as
+    // a bare `c` and does nothing at all on the peer.
+    h.state.key(16, true);
+    let chord = h.drain();
+    let CapturedEvent::Key(k) = &chord[0] else {
+        panic!("{chord:?}");
+    };
+    assert_eq!(k.payload, KeyPayload::Text("q".into()));
+    assert!(k.modifiers.contains(Modifiers::CTRL));
+    h.state.key(16, false);
+    h.drain();
+
+    h.state.key(58, false);
+    h.drain();
     assert_eq!(h.texts(16), vec!["q".to_string()]);
+}
+
+#[test]
+fn a_super_the_layout_put_on_the_alt_key_reports_super_rather_than_alt() {
+    // `altwin:swap_alt_win`. Reading the position rather than the layout tells the
+    // peer Alt is down while sending it a Super key: the router covers SUPER from
+    // the payload, leaving ALT stranded and releasing an Alt nobody pressed, and an
+    // agent hotkey on Super never matches.
+    let h = Harness::with_layout(SUPER_ON_ALT);
+    h.activate();
+    h.state.key(56, true);
+    let pressed = h.drain();
+    let CapturedEvent::Key(k) = &pressed[0] else {
+        panic!("{pressed:?}");
+    };
+    assert_eq!(k.payload, KeyPayload::Special(SpecialKey::SuperLeft));
+    assert!(k.modifiers.contains(Modifiers::SUPER));
+    assert!(!k.modifiers.contains(Modifiers::ALT));
 }
 
 #[test]
