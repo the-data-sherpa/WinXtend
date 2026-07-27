@@ -391,9 +391,10 @@ struct ModifierStep {
     release: bool,
     /// Whether the key itself has to move, or only the bookkeeping.
     ///
-    /// False when another record is already holding the same physical key down:
-    /// the record that stops wanting it forgets it, but must not pull it out
-    /// from under the others.
+    /// False on a press whose key is already down for someone else's reason, and
+    /// on a release of a key this injector never pressed or that another record
+    /// still wants: a record that stops wanting a key forgets it, but must not
+    /// pull it out from under the others.
     physical: bool,
 }
 
@@ -413,6 +414,14 @@ pub struct Injector {
     /// the sender — but they drive the same two physical keys, so neither set
     /// moves one without asking the other (see [`Injector::chord_plan`]).
     level: LevelMods,
+    /// Modifier keycodes this injector actually pressed and has not let go of.
+    ///
+    /// `chord` and `level` record what each keystroke *wants*, which is not the
+    /// same thing: a modifier the sender is already holding is wanted by both and
+    /// pressed by neither. Only this list says who will release the key, and only
+    /// this list notices when a bit that was borrowed rather than pressed goes up
+    /// underneath its record.
+    pressed: Vec<u32>,
 }
 
 impl Injector {
@@ -422,6 +431,7 @@ impl Injector {
             held: Vec::new(),
             chord: Modifiers::NONE,
             level: LevelMods::default(),
+            pressed: Vec::new(),
         }
     }
 
@@ -440,7 +450,11 @@ impl Injector {
     }
 
     pub fn release_all(&mut self) -> Result<()> {
-        if self.held.is_empty() && self.chord.is_empty() && self.level == LevelMods::default() {
+        if self.held.is_empty()
+            && self.pressed.is_empty()
+            && self.chord.is_empty()
+            && self.level == LevelMods::default()
+        {
             return Ok(());
         }
         // A session that has already gone away has taken its virtual devices with
@@ -498,24 +512,30 @@ impl Injector {
         Ok(())
     }
 
-    /// Every modifier keycode currently believed held, in release order.
+    /// Every modifier keycode this injector pressed, in release order.
+    ///
+    /// Read off `pressed` rather than off the two records, which name the same
+    /// key more than once and name keys the sender pressed itself. Those are
+    /// already up: the held list was unwound first, and there is only ever one
+    /// key down to let go of.
     fn modifier_keycodes(&self, level3: u32) -> Vec<u32> {
         let mut codes = Vec::new();
-        for (held, code) in [
-            (self.level.level3, level3),
-            (self.level.shift, KEY_LEFTSHIFT),
-            (self.chord.contains(Modifiers::SHIFT), KEY_LEFTSHIFT),
-            (self.chord.contains(Modifiers::ALT_GR), level3),
-            (self.chord.contains(Modifiers::SUPER), KEY_LEFTMETA),
-            (self.chord.contains(Modifiers::ALT), KEY_LEFTALT),
-            (self.chord.contains(Modifiers::CTRL), KEY_LEFTCTRL),
+        // Ctrl last: letting it go first would turn the remaining releases into
+        // bare keys mid-chord.
+        for code in [
+            level3,
+            KEY_LEFTSHIFT,
+            KEY_LEFTMETA,
+            KEY_LEFTALT,
+            KEY_LEFTCTRL,
         ] {
-            // Once each, and not at all for a key the loop above has already
-            // released: the records share their keycodes with each other and with
-            // a modifier the sender forwarded, but there is only ever one key
-            // down to let go of.
-            if held && !codes.contains(&code) && !self.sender_holds(code) {
+            if self.pressed.contains(&code) && !codes.contains(&code) {
                 codes.push(code);
+            }
+        }
+        for code in &self.pressed {
+            if !codes.contains(code) {
+                codes.push(*code);
             }
         }
         codes
@@ -523,6 +543,7 @@ impl Injector {
 
     fn forget(&mut self) {
         self.held.clear();
+        self.pressed.clear();
         self.chord = Modifiers::NONE;
         self.level = LevelMods::default();
     }
@@ -667,13 +688,14 @@ impl Injector {
                 // legitimately observe "Ctrl went down" with no other key
                 // involved, and re-deriving it from the modifier bits would lose
                 // the left/right distinction the sender took care to keep.
-                if !key.is_modifier() {
-                    self.sync_chord(event.injection_modifiers())?;
-                    // A Shift or AltGr still held to reach some earlier
-                    // character's level is not part of this key, and leaving it
-                    // down turns Enter into AltGr+Enter.
-                    self.sync_level(LevelMods::default())?;
+                if key.is_modifier() {
+                    return self.forward_modifier(code, release);
                 }
+                self.sync_chord(event.injection_modifiers())?;
+                // A Shift or AltGr still held to reach some earlier character's
+                // level is not part of this key, and leaving it down turns Enter
+                // into AltGr+Enter.
+                self.sync_level(LevelMods::default())?;
                 self.send_key(code, release)
             }
             KeyPayload::Text(text) => self.inject_text(text, event, release),
@@ -823,15 +845,17 @@ impl Injector {
             .without(Modifiers::CAPS_LOCK)
             .without(Modifiers::NUM_LOCK);
         // Answered without touching the transport, so a keystroke that needs no
-        // modifier does not depend on a level-3 keycode being resolvable.
-        if wanted == self.chord {
+        // modifier does not depend on a level-3 keycode being resolvable. It is
+        // deliberately not "the record already says what this event wants": a bit
+        // the record borrowed rather than pressed goes stale the moment the
+        // sender lets the key go, and skipping on the record alone would inject
+        // the next Ctrl+C as a bare `c`.
+        if wanted.is_empty() && self.chord.is_empty() {
             return Ok(());
         }
         let level3 = self.level3_keycode()?;
         for (bit, step) in self.chord_plan(wanted, level3) {
-            if step.physical {
-                self.send_modifier(step.keycode, step.release)?;
-            }
+            self.apply(step)?;
             self.chord = if step.release {
                 self.chord.without(bit)
             } else {
@@ -843,22 +867,36 @@ impl Injector {
 
     /// Hold exactly the Shift and AltGr a keymap level needs.
     fn sync_level(&mut self, required: LevelMods) -> Result<()> {
-        if required == self.level {
+        if required == LevelMods::default() && self.level == LevelMods::default() {
             return Ok(());
         }
         let level3 = self.level3_keycode()?;
         let [shift, third] = self.level_plan(required, level3);
         if let Some(step) = shift {
-            if step.physical {
-                self.send_modifier(step.keycode, step.release)?;
-            }
+            self.apply(step)?;
             self.level.shift = required.shift;
         }
         if let Some(step) = third {
-            if step.physical {
-                self.send_modifier(step.keycode, step.release)?;
-            }
+            self.apply(step)?;
             self.level.level3 = required.level3;
+        }
+        Ok(())
+    }
+
+    /// Send one step, if it is one the key has to feel, and remember the result.
+    ///
+    /// `pressed` is updated only after the flush that carried the request, for
+    /// the same reason the held list is: a release the compositor never received
+    /// leaves this injector still responsible for the key.
+    fn apply(&mut self, step: ModifierStep) -> Result<()> {
+        if !step.physical {
+            return Ok(());
+        }
+        self.send_modifier(step.keycode, step.release)?;
+        if step.release {
+            self.pressed.retain(|c| *c != step.keycode);
+        } else if !self.pressed.contains(&step.keycode) {
+            self.pressed.push(step.keycode);
         }
         Ok(())
     }
@@ -871,6 +909,10 @@ impl Injector {
     /// the sender forwarded, which is injected as an ordinary key and lands on
     /// the held list; this chord set; and the keymap level — and each has to
     /// leave the key alone while another still wants it down.
+    ///
+    /// Wanting a bit the record already claims is therefore not always a no-op.
+    /// The claim may have been borrowed from a key the sender has since released,
+    /// in which case the chord is re-asserted rather than assumed.
     fn chord_plan(&self, required: Modifiers, level3: u32) -> Vec<(Modifiers, ModifierStep)> {
         let mut steps = Vec::new();
         for (bit, code) in [
@@ -882,21 +924,18 @@ impl Injector {
             // for the same reason the level path resolves it.
             (Modifiers::ALT_GR, level3),
         ] {
-            let want = required.contains(bit);
-            if want == self.chord.contains(bit) {
-                continue;
-            }
-            let pinned = self.sender_holds(code)
+            let wanted_elsewhere = self.sender_holds(code)
                 || (bit == Modifiers::SHIFT && self.level.shift)
                 || (bit == Modifiers::ALT_GR && self.level.level3);
-            steps.push((
-                bit,
-                ModifierStep {
-                    keycode: code,
-                    release: !want,
-                    physical: !pinned,
-                },
-            ));
+            let step = self.step(
+                code,
+                required.contains(bit),
+                self.chord.contains(bit),
+                wanted_elsewhere,
+            );
+            if let Some(step) = step {
+                steps.push((bit, step));
+            }
         }
         steps
     }
@@ -908,17 +947,55 @@ impl Injector {
     /// this injector is holding for a chord, and it must not press a second time
     /// a key either of them already has down.
     fn level_plan(&self, required: LevelMods, level3: u32) -> [Option<ModifierStep>; 2] {
-        let shift = (required.shift != self.level.shift).then(|| ModifierStep {
-            keycode: KEY_LEFTSHIFT,
-            release: !required.shift,
-            physical: !(self.sender_holds(KEY_LEFTSHIFT) || self.chord.contains(Modifiers::SHIFT)),
-        });
-        let third = (required.level3 != self.level.level3).then(|| ModifierStep {
-            keycode: level3,
-            release: !required.level3,
-            physical: !(self.sender_holds(level3) || self.chord.contains(Modifiers::ALT_GR)),
-        });
+        let shift = self.step(
+            KEY_LEFTSHIFT,
+            required.shift,
+            self.level.shift,
+            self.sender_holds(KEY_LEFTSHIFT) || self.chord.contains(Modifiers::SHIFT),
+        );
+        let third = self.step(
+            level3,
+            required.level3,
+            self.level.level3,
+            self.sender_holds(level3) || self.chord.contains(Modifiers::ALT_GR),
+        );
         [shift, third]
+    }
+
+    /// What one record's change means for one modifier key.
+    ///
+    /// `have` is what the record claims, `wanted_elsewhere` what the other
+    /// records claim, and `pressed` who actually has the key down — three
+    /// separate facts, and every wrong answer here is a silent one: press a key
+    /// that is already down and the compositor sees a repeat, release one this
+    /// injector never pressed and the user's own modifier goes up under them,
+    /// trust a stale claim and the chord loses its modifier without a word.
+    fn step(
+        &self,
+        code: u32,
+        want: bool,
+        have: bool,
+        wanted_elsewhere: bool,
+    ) -> Option<ModifierStep> {
+        let down = self.key_down(code);
+        if want {
+            (!have || !down).then_some(ModifierStep {
+                keycode: code,
+                release: false,
+                physical: !down,
+            })
+        } else {
+            have.then_some(ModifierStep {
+                keycode: code,
+                release: true,
+                physical: self.pressed.contains(&code) && !wanted_elsewhere,
+            })
+        }
+    }
+
+    /// Whether this modifier key is believed to be down at all.
+    fn key_down(&self, code: u32) -> bool {
+        self.pressed.contains(&code) || self.sender_holds(code)
     }
 
     /// Whether the sender is holding this key itself.
@@ -928,6 +1005,24 @@ impl Injector {
     /// neither of them may release.
     fn sender_holds(&self, code: u32) -> bool {
         self.held.contains(&Held::Key(code))
+    }
+
+    /// A bare modifier key the sender forwarded, which is theirs from here on.
+    ///
+    /// The sender's own key is the authority on it: their key-up takes it up
+    /// whoever pressed it, and their key-down needs nothing sent if this injector
+    /// is already holding it for a chord. Either way this injector stops being
+    /// the one responsible for releasing it, so what the two records still claim
+    /// about that key becomes a borrowed claim like any other.
+    fn forward_modifier(&mut self, code: u32, release: bool) -> Result<()> {
+        if !release && self.key_down(code) {
+            self.pressed.retain(|c| *c != code);
+            self.track(Held::Key(code), false);
+            return Ok(());
+        }
+        self.send_key(code, release)?;
+        self.pressed.retain(|c| *c != code);
+        Ok(())
     }
 
     fn level3_keycode(&self) -> Result<u32> {
@@ -1267,6 +1362,7 @@ mod tests {
         // event — the stuck-Shift defect that turned a following Home into
         // Shift+Home.
         inj.level.shift = true;
+        inj.pressed.push(KEY_LEFTSHIFT);
         let [shift, _] = inj.level_plan(LevelMods::default(), KEY_RIGHTALT);
         assert_eq!(
             shift,
@@ -1312,6 +1408,7 @@ mod tests {
         let mut inj = injector();
         inj.chord = Modifiers::SHIFT;
         inj.level.shift = true;
+        inj.pressed.push(KEY_LEFTSHIFT);
 
         let [shift, _] = inj.level_plan(LevelMods::default(), KEY_RIGHTALT);
         assert!(!shift.unwrap().physical);
@@ -1338,13 +1435,109 @@ mod tests {
         inj.held.push(Held::Key(KEY_LEFTSHIFT));
         inj.chord = Modifiers::SHIFT | Modifiers::CTRL;
         inj.level.shift = true;
+        inj.pressed.push(KEY_LEFTCTRL);
 
         assert_eq!(inj.modifier_keycodes(KEY_RIGHTALT), vec![KEY_LEFTCTRL]);
 
         inj.held.clear();
+        inj.pressed.push(KEY_LEFTSHIFT);
         assert_eq!(
             inj.modifier_keycodes(KEY_RIGHTALT),
             vec![KEY_LEFTSHIFT, KEY_LEFTCTRL]
+        );
+    }
+
+    #[test]
+    fn a_press_that_was_elided_is_not_released_afterwards() {
+        // The sender was already holding Ctrl, so `Text("c", CTRL)` records the
+        // chord without pressing anything. When the sender lets Ctrl go, the key
+        // is up — and a key-up for a key that is already up is a report the
+        // receiving desktop has no way to make sense of.
+        let mut inj = injector();
+        inj.held.push(Held::Key(KEY_LEFTCTRL));
+        assert_eq!(
+            inj.chord_plan(Modifiers::CTRL, KEY_RIGHTALT),
+            vec![(
+                Modifiers::CTRL,
+                ModifierStep {
+                    keycode: KEY_LEFTCTRL,
+                    release: false,
+                    physical: false,
+                }
+            )],
+            "the sender's Ctrl is already down; pressing it again is a repeat"
+        );
+        inj.chord = Modifiers::CTRL;
+
+        inj.held.clear();
+        assert_eq!(
+            inj.chord_plan(Modifiers::NONE, KEY_RIGHTALT),
+            vec![(
+                Modifiers::CTRL,
+                ModifierStep {
+                    keycode: KEY_LEFTCTRL,
+                    release: true,
+                    physical: false,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_chord_whose_modifier_has_gone_up_underneath_it_is_re_asserted() {
+        // The other half, and the one that matters: the record still says CTRL
+        // because it borrowed the sender's own key, but that key is up. A
+        // `Text("c", CTRL)` arriving now — capture that started mid-chord, so no
+        // bare Ctrl press preceded it — must inject Ctrl+c, not a bare `c`.
+        let mut inj = injector();
+        inj.chord = Modifiers::CTRL;
+
+        let event = KeyEvent::text("c", KeyAction::Press, Modifiers::CTRL);
+        assert_eq!(
+            inj.chord_plan(event.injection_modifiers(), KEY_RIGHTALT),
+            vec![(
+                Modifiers::CTRL,
+                ModifierStep {
+                    keycode: KEY_LEFTCTRL,
+                    release: false,
+                    physical: true,
+                }
+            )]
+        );
+
+        // And a chord this injector really is holding is left alone.
+        inj.pressed.push(KEY_LEFTCTRL);
+        assert!(inj
+            .chord_plan(event.injection_modifiers(), KEY_RIGHTALT)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_modifier_the_sender_forwards_is_not_pressed_twice() {
+        // This injector pressed Shift for a Shift+Tab chord; the sender then
+        // forwards its own ShiftLeft. The key is already down, and from here the
+        // sender's key-up is what will take it up.
+        let mut inj = injector();
+        inj.chord = Modifiers::SHIFT;
+        inj.pressed.push(KEY_LEFTSHIFT);
+
+        assert!(inj.forward_modifier(KEY_LEFTSHIFT, false).is_ok());
+        assert!(inj.pressed.is_empty(), "the sender owns the key now");
+        assert!(inj.sender_holds(KEY_LEFTSHIFT));
+
+        // The chord's claim is now a borrowed one, so it is re-asserted rather
+        // than trusted once that key goes up.
+        inj.held.clear();
+        assert_eq!(
+            inj.chord_plan(Modifiers::SHIFT, KEY_RIGHTALT),
+            vec![(
+                Modifiers::SHIFT,
+                ModifierStep {
+                    keycode: KEY_LEFTSHIFT,
+                    release: false,
+                    physical: true,
+                }
+            )]
         );
     }
 
