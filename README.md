@@ -14,10 +14,10 @@ layout editor.
 
 > ### Project status: pre-alpha, and the alpha target is Linux/Wayland
 >
-> Read this before cloning. The engine is real and heavily tested — **614 unit and
-> integration tests on Windows, 523 on Linux, `cargo clippy` clean** — but the
-> platform story needs stating plainly, because the complete backend and the
-> targeted one are not the same backend:
+> Read this before cloning. The engine is real and heavily tested — several hundred
+> unit and integration tests, `cargo clippy` clean; run `cargo test --workspace` for
+> the current figure — but the platform story needs stating plainly, because the
+> complete backend and the targeted one are not the same backend:
 >
 > - **Windows is the only complete backend, and it is out of alpha scope.**
 >   Capture, injection, displays, and the clipboard platform layer all work there.
@@ -26,18 +26,21 @@ layout editor.
 >   fall into the catch-all arm in `crates/wx-agent/src/engine.rs` that logs
 >   "ignoring a message this build does not handle". It is kept, tested, and
 >   accurately described below — but it is not what the alpha is aimed at.
-> - **Linux/Wayland is the alpha target, and it is being built now.** Today it is a
->   compiling skeleton that advertises no capabilities and refuses what it cannot
->   do, on purpose
->   (`crates/wx-platform/src/linux_wayland/mod.rs::the_skeleton_advertises_nothing_it_cannot_do`
->   and `::suppression_is_refused_rather_than_silently_ignored`). macOS, X11,
->   and evdev are in the same state: documented down to the exact syscall
->   sequences, implemented no further. On those platforms the agent starts and
->   does nothing.
+> - **Linux/Wayland is the alpha target, and it is being built now.** Display
+>   enumeration works: a `wl_output`/`xdg_output` client enumerates monitors, and
+>   `capabilities()` advertises `HAS_DISPLAYS` only when enumeration actually found
+>   one. Capture, injection, clipboard, and input suppression do not — the portal
+>   and `libei` work is unlanded, so the backend advertises none of them and refuses
+>   what it cannot do, on purpose
+>   (`crates/wx-platform/src/linux_wayland/mod.rs::the_backend_advertises_nothing_it_cannot_do`
+>   and `::suppression_is_refused_rather_than_silently_ignored`). macOS, X11, and
+>   evdev are further back than Wayland now is: compiling skeletons, documented down
+>   to the exact syscall sequences and implemented no further. On those platforms
+>   the agent starts and does nothing.
 > - **It has never moved a cursor between two physical machines.** Every test runs
 >   in a single process. The QUIC handshake and session tests are real, but they
 >   are loopback.
-> - **Screen streaming is not connected.** `wx-video` compiles and its 61 tests
+> - **Screen streaming is not connected.** `wx-video` compiles and its tests
 >   pass, but nothing depends on it and the agent hardcodes a refusal in the
 >   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
 >   `crates/wx-agent/src/engine.rs`. It is parked for alpha.
@@ -137,19 +140,21 @@ flowchart TD
     AN -.->|local IPC| UI[Tauri UI<br/>discovery, layout editor, status]
 ```
 
-| Crate | Role | Tests |
-|---|---|---|
-| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. | 66 |
-| `wx-core` | Engine: global layout, edge crossing, virtual cursor, input routing. Pure logic. | 86 |
-| `wx-platform` | Platform abstraction: capture, injection, displays, clipboard. | 160 |
-| `wx-net` | QUIC transport, ed25519 identity, PIN pairing, mDNS discovery. | 102 |
-| `wx-video` | Optional screen capture, encode, and frame pacing. **Parked: nothing depends on it.** | 61 |
-| `wx-agent` | The headless daemon that wires it together, plus its IPC surface. | 139 |
-| `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. | — |
+| Crate | Role |
+|---|---|
+| `wx-proto` | Wire protocol: messages, framing, capability negotiation. No I/O, no platform code. |
+| `wx-core` | Engine: global layout, edge crossing, virtual cursor, input routing. Pure logic. |
+| `wx-platform` | Platform abstraction: capture, injection, displays, clipboard. |
+| `wx-net` | QUIC transport, ed25519 identity, PIN pairing, mDNS discovery. |
+| `wx-video` | Optional screen capture, encode, and frame pacing. **Parked: nothing depends on it.** |
+| `wx-agent` | The headless daemon that wires it together, plus its IPC surface. |
+| `ui/` | Tauri 2 desktop app: device discovery, layout editor, status. |
 
-Test counts are the Windows figures, where every backend compiles and every test
-that can run does; they sum to the 614 above. On Linux `wx-platform` reports 70 and `wx-agent`
-138 — see [Testing](#why-the-test-count-differs-by-platform).
+No test counts are quoted here, per crate or in total, because none of them hold
+across platforms: `wx-platform`'s Windows backend and its Wayland client are gated
+to different operating systems, so neither Windows nor Linux is "the" figure.
+`cargo test --workspace` is the authority — see
+[Testing](#why-the-test-count-differs-by-platform).
 
 `wx-proto` and `wx-core` deliberately contain no I/O and no platform calls, which
 is why the interesting behaviour — edge crossings, split edges, stuck-modifier
@@ -158,14 +163,14 @@ second machine.
 
 ## Current status
 
-**The alpha targets Linux/Wayland.** That is the ⚠️ column below, not the ✅ one.
-Windows is the only backend that is finished, and it is reported accurately here
-because it is real — but it is out of alpha scope, so read the Wayland column for
-what the next release is about.
+**The alpha targets Linux/Wayland.** That is the mostly-⚠️ column below, not the ✅
+one. Windows is the only backend that is finished, and it is reported accurately
+here because it is real — but it is out of alpha scope, so read the Wayland column
+for what the next release is about.
 
 | | Windows | macOS | Linux/X11 | Linux/Wayland | Linux headless |
 |---|---|---|---|---|---|
-| Display enumeration | ✅ | ⚠️ | ⚠️ | ⚠️ | n/a |
+| Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Input injection | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ⚠️ | n/a |
@@ -187,7 +192,7 @@ what the next release is about.
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ❌ the alpha target, and the standing gap in every tool in this space |
+| Wayland | ⚠️ display enumeration landed; capture, injection, and clipboard are the alpha, and the standing gap in every tool in this space |
 
 ## Building
 
@@ -196,7 +201,7 @@ Requires **Rust 1.79+** and, for the UI, **Node 20+**.
 ```bash
 git clone git@github.com:the-data-sherpa/WinXtend.git
 cd WinXtend
-cargo test --workspace     # 523 tests on Linux, 614 on Windows — see Testing
+cargo test --workspace     # the total differs by platform — see Testing
 cargo build --release      # produces target/release/wx-agent
 ```
 
@@ -325,40 +330,44 @@ every possible byte offset.
 
 ### Why the test count differs by platform
 
-`cargo test --workspace` reports **523 passing on Linux and 614 on Windows**.
-macOS reports 523 as well, for the same reason Linux does: both gates below are
-keyed on Windows, not on Linux. That is expected, not a broken checkout — a Rust
-test that is `#[cfg]`-gated to a platform is not compiled at all elsewhere, so it
-cannot be counted.
+`cargo test --workspace` legitimately reports a different total on Linux, Windows,
+and macOS. That is expected, not a broken checkout — a Rust test that is
+`#[cfg]`-gated to a platform is not compiled at all elsewhere, so it cannot be
+counted. No figure is quoted anywhere in this README on purpose: run the command,
+which is the only authority on what the current number is.
 
-Nearly the whole 91-test gap is the Windows backend: `crates/wx-platform/src/windows/`
-sits behind `#[cfg(target_os = "windows")]` and carries **90 tests** that do not
-exist in a Linux or macOS build, which is exactly why `wx-platform` reports 70
-tests on those against 160 on Windows. The one remaining test is
-`registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`,
-which is `#[cfg_attr(not(windows), ignore)]`: it compiles everywhere but only runs
-where there is an autostart mechanism to exercise, so `wx-agent` reports 139
-passing on Windows and 138 passing plus one skipped on Linux and macOS alike.
-90 + 1 is the whole difference.
+Three gates account for the difference:
+
+- `crates/wx-platform/src/windows/` sits behind `#[cfg(target_os = "windows")]` and
+  is the largest block of tests in the crate. None of it exists in a Linux or macOS
+  build, which is why Windows reports the highest total of the three.
+- `crates/wx-platform/src/linux_wayland/mod.rs` declares its `wl_output` protocol
+  module under `#[cfg(target_os = "linux")]`, so that module's tests exist only on
+  Linux and are absent from a Windows or macOS build. The gates run in both
+  directions, not only Windows-ward, which is why Linux and macOS do not report the
+  same total as each other either.
+- `registering_is_idempotent_and_removable` in `crates/wx-agent/src/autostart.rs`
+  is `#[cfg_attr(not(windows), ignore)]`. It compiles everywhere but only runs where
+  there is an autostart mechanism to exercise, so anywhere but Windows it is counted
+  ignored rather than passed.
 
 `crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
-too, but it moves no total: its cases are additionally `#[ignore]`d because
+too, but it moves no passing total: its cases are additionally `#[ignore]`d because
 they need an interactive desktop, so they are skipped on Windows itself and
 absent on Linux and macOS alike. Everything else — `wx-proto`, `wx-core`,
 `wx-net`, and the rest of `wx-video` — runs the same tests on all three.
 
-Once the Wayland backend has an implementation, the Linux number rises by its own
-tests; it will never converge with the Windows number, because each platform's
-tests are gated to that platform.
+The totals will never converge, because each platform's tests are gated to that
+platform; as the Wayland backend grows, the Linux total rises with it.
 
 ## Roadmap
 
 The alpha is Linux/Wayland. Roughly in order of value:
 
-1. **The Wayland backend.** Capture, injection, displays, and clipboard against
-   the portal and `wlr`/`libei` interfaces. This is the alpha, it is the standing
-   gap in every tool in this space, and it is the strongest reason to prefer this
-   one.
+1. **The Wayland backend.** Capture, injection, and clipboard against the portal
+   and `wlr`/`libei` interfaces; display enumeration already works. This is the
+   alpha, it is the standing gap in every tool in this space, and it is the
+   strongest reason to prefer this one.
 2. **Validate between two physical Linux machines** over a real network. Nothing
    here is trustworthy until a cursor actually crosses one; every test today runs
    in a single process.
