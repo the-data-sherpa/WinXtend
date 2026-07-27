@@ -114,11 +114,12 @@ fn unsupported() -> AutostartError {
 mod windows_impl {
     use super::{AutostartError, ENTRY_NAME};
     use std::path::PathBuf;
-    use windows::core::HSTRING;
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
     };
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -133,7 +134,7 @@ mod windows_impl {
     }
 
     /// A registry key handle that closes itself.
-    struct Key(HKEY);
+    pub(super) struct Key(HKEY);
 
     impl Drop for Key {
         fn drop(&mut self) {
@@ -143,43 +144,178 @@ mod windows_impl {
         }
     }
 
-    fn open(
-        access: windows::Win32::System::Registry::REG_SAM_FLAGS,
-    ) -> Result<Key, AutostartError> {
+    /// Opens the Run key, or `Ok(None)` when the key itself does not exist.
+    ///
+    /// Windows creates `…\CurrentVersion\Run` lazily, so a user profile on which
+    /// nothing has ever registered a startup entry simply has no such key, and
+    /// `RegOpenKeyExW` answers `ERROR_FILE_NOT_FOUND`. For a reader that is not a
+    /// failure but an answer: a key that does not exist holds no entry, so the
+    /// honest result is "not registered" rather than an error. Reporting it as an
+    /// error made [`is_registered`] fail on exactly the clean profiles it is most
+    /// often asked about — including GitHub's Windows runners, whose freshly
+    /// provisioned profiles are how this was found.
+    fn open_existing(access: REG_SAM_FLAGS) -> Result<Option<Key>, AutostartError> {
+        open_existing_at(RUN_KEY, access)
+    }
+
+    /// [`open_existing`] against an arbitrary `HKCU` subkey.
+    ///
+    /// Split out purely so a test can name a subkey that certainly does not
+    /// exist and reach the absent-key branch deterministically, without the
+    /// alternative — deleting the real Run key — which would wipe every other
+    /// application's startup entries on a developer's machine.
+    pub(super) fn open_existing_at(
+        subkey: &str,
+        access: REG_SAM_FLAGS,
+    ) -> Result<Option<Key>, AutostartError> {
         let mut key = HKEY::default();
-        let path = HSTRING::from(RUN_KEY);
+        let path = HSTRING::from(subkey);
         let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, access, &mut key) };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
         if status != ERROR_SUCCESS {
             return Err(AutostartError::Os {
                 operation: "opening HKCU Run",
                 code: status.0,
             });
         }
+        Ok(Some(Key(key)))
+    }
+
+    /// Opens the Run key for writing, creating it when it is absent.
+    ///
+    /// A writer cannot treat the missing key as an answer the way a reader can:
+    /// registering has to work on a profile that has never registered anything.
+    /// `RegCreateKeyExW` opens the key when it exists and creates it when it does
+    /// not, which is why installing uses it rather than [`open_existing`].
+    fn open_or_create(access: REG_SAM_FLAGS) -> Result<Key, AutostartError> {
+        let mut key = HKEY::default();
+        let path = HSTRING::from(RUN_KEY);
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &path,
+                None,
+                PCWSTR::null(),
+                // Non-volatile: an autostart entry that vanished at reboot would
+                // be worse than none, because it would appear to work until then.
+                REG_OPTION_NON_VOLATILE,
+                access,
+                None,
+                &mut key,
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(AutostartError::Os {
+                operation: "creating HKCU Run",
+                code: status.0,
+            });
+        }
         Ok(Key(key))
     }
 
-    pub fn install() -> Result<PathBuf, AutostartError> {
-        let (exe, command) = command_line()?;
-        let key = open(KEY_SET_VALUE)?;
+    /// A registry value exactly as it is stored: its type as well as its bytes.
+    ///
+    /// The type travels with the bytes because it is not this code's to choose
+    /// when putting a value back. An entry written as `REG_EXPAND_SZ` by whatever
+    /// installer created it must come back as `REG_EXPAND_SZ`, or the `%VAR%` in
+    /// it stops expanding and the command line silently stops resolving.
+    #[cfg(test)]
+    pub(super) struct RawEntry {
+        pub(super) kind: REG_VALUE_TYPE,
+        pub(super) bytes: Vec<u8>,
+    }
+
+    /// Reads the autostart value verbatim, or `Ok(None)` when there is nothing
+    /// there to read — absent key and absent value both mean the same thing.
+    ///
+    /// This exists so a test can put back exactly what it found. Reconstructing
+    /// the value by calling [`install`] cannot do that: `install` writes *this*
+    /// executable's path, which under `cargo test` is the hashed test binary.
+    #[cfg(test)]
+    pub(super) fn read_raw_entry() -> Result<Option<RawEntry>, AutostartError> {
+        let Some(key) = open_existing(KEY_QUERY_VALUE)? else {
+            return Ok(None);
+        };
         let name = HSTRING::from(ENTRY_NAME);
-        // REG_SZ is a NUL-terminated wide string, and the terminator is part of
-        // the value: without it Windows reads whatever follows in the buffer.
-        let mut wide: Vec<u16> = command.encode_utf16().collect();
-        wide.push(0);
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
-        let status = unsafe { RegSetValueExW(key.0, &name, None, REG_SZ, Some(bytes)) };
+        let mut kind = REG_VALUE_TYPE::default();
+        let mut len: u32 = 0;
+        // Sizing call first: only the value itself knows how long it is.
+        let status =
+            unsafe { RegQueryValueExW(key.0, &name, None, Some(&mut kind), None, Some(&mut len)) };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(AutostartError::Os {
+                operation: "reading the autostart entry",
+                code: status.0,
+            });
+        }
+        let mut bytes = vec![0u8; len as usize];
+        let mut got = len;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                &name,
+                None,
+                Some(&mut kind),
+                Some(bytes.as_mut_ptr()),
+                Some(&mut got),
+            )
+        };
+        // The value can be deleted between the two calls, which is the same
+        // answer as never having been there.
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(AutostartError::Os {
+                operation: "reading the autostart entry",
+                code: status.0,
+            });
+        }
+        bytes.truncate(got as usize);
+        Ok(Some(RawEntry { kind, bytes }))
+    }
+
+    /// Writes the autostart value verbatim, creating the Run key when absent.
+    pub(super) fn write_raw_entry(
+        kind: REG_VALUE_TYPE,
+        bytes: &[u8],
+    ) -> Result<(), AutostartError> {
+        let key = open_or_create(KEY_SET_VALUE)?;
+        let name = HSTRING::from(ENTRY_NAME);
+        let status = unsafe { RegSetValueExW(key.0, &name, None, kind, Some(bytes)) };
         if status != ERROR_SUCCESS {
             return Err(AutostartError::Os {
                 operation: "writing the autostart entry",
                 code: status.0,
             });
         }
+        Ok(())
+    }
+
+    pub fn install() -> Result<PathBuf, AutostartError> {
+        let (exe, command) = command_line()?;
+        // REG_SZ is a NUL-terminated wide string, and the terminator is part of
+        // the value: without it Windows reads whatever follows in the buffer.
+        let mut wide: Vec<u16> = command.encode_utf16().collect();
+        wide.push(0);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+        write_raw_entry(REG_SZ, bytes)?;
         Ok(exe)
     }
 
     pub fn uninstall() -> Result<(), AutostartError> {
-        let key = open(KEY_SET_VALUE)?;
+        // No key at all means no entry, which is the end state being asked for —
+        // the same reasoning as the ERROR_FILE_NOT_FOUND arm below.
+        let Some(key) = open_existing(KEY_SET_VALUE)? else {
+            return Ok(());
+        };
         let name = HSTRING::from(ENTRY_NAME);
         let status = unsafe { RegDeleteValueW(key.0, &name) };
         // Not installed is the desired end state, so it is success.
@@ -193,7 +329,9 @@ mod windows_impl {
     }
 
     pub fn is_registered() -> Result<bool, AutostartError> {
-        let key = open(KEY_QUERY_VALUE)?;
+        let Some(key) = open_existing(KEY_QUERY_VALUE)? else {
+            return Ok(false);
+        };
         let name = HSTRING::from(ENTRY_NAME);
         let mut len: u32 = 0;
         let status = unsafe { RegQueryValueExW(key.0, &name, None, None, None, Some(&mut len)) };
@@ -214,6 +352,103 @@ mod windows_impl {
 mod tests {
     use super::*;
 
+    /// What the autostart value was before a test touched it, and how to put it
+    /// back.
+    ///
+    /// A boolean is not enough. Restoring a "there was one" by calling
+    /// [`install`] writes *this* executable's path, and under `cargo test` that
+    /// is `target\debug\deps\wx_agent-<hash>.exe` — so a developer who really had
+    /// WinXtend registered would end a test run with their Run entry pointing at
+    /// a hashed test binary that the next `cargo clean` deletes. That is exactly
+    /// the silent-at-every-login failure [`install`]'s own doc comment calls
+    /// worse than no entry, caused by the test suite. So the bytes and the value
+    /// type are captured and written back verbatim instead.
+    ///
+    /// `Absent` restores to absent by *deleting*, never by writing an empty
+    /// value: an empty `Run` entry is not the same state as no entry.
+    ///
+    /// `Unknown` is the one case that cannot be restored faithfully, and it is
+    /// named rather than rounded up: when the capturing read itself fails there
+    /// is nothing trustworthy to put back, so the guard leaves the registry
+    /// alone rather than guessing a state the developer never had.
+    #[cfg(windows)]
+    enum Restore {
+        Value(windows_impl::RawEntry),
+        Absent,
+        Unknown,
+    }
+
+    #[cfg(windows)]
+    impl Restore {
+        fn capture() -> Self {
+            // Matching on the error rather than `.unwrap()`: whether querying can
+            // fail is the very thing one of these tests asserts, and the guard
+            // must not be the thing that panics on it.
+            match windows_impl::read_raw_entry() {
+                Ok(Some(entry)) => Self::Value(entry),
+                Ok(None) => Self::Absent,
+                Err(_) => Self::Unknown,
+            }
+        }
+
+        fn apply(&self) {
+            // Errors are deliberately swallowed: a restore that fails must not
+            // replace the test's own failure with a less informative one.
+            let _ = match self {
+                Self::Value(entry) => windows_impl::write_raw_entry(entry.kind, &entry.bytes),
+                Self::Absent => uninstall(),
+                Self::Unknown => Ok(()),
+            };
+        }
+    }
+
+    /// Serialises every test that touches the one real `HKCU` autostart value,
+    /// and puts back the exact value the developer had when the test ends.
+    ///
+    /// All three properties matter, and none is a comment:
+    ///
+    /// * These tests share a single registry value. Cargo runs them on parallel
+    ///   threads by default, so without the lock one test's `uninstall` lands
+    ///   between another's `install` and its assertion. Holding the guard is the
+    ///   only supported way to reach the real registry from a test — a future
+    ///   test that mutates without it is the accident this exists to prevent.
+    ///   `a_platform_with_no_mechanism_says_what_to_do_instead` takes the guard
+    ///   even though it only reads, both so it cannot observe another test
+    ///   mid-write and so it is not the exception that teaches the next test to
+    ///   skip the guard.
+    /// * The restore is byte-faithful rather than a re-`install`; see
+    ///   [`Restore`] for why the difference is the developer's autostart still
+    ///   working tomorrow.
+    /// * Restoring happens in `Drop`, so it survives a panic. The earlier version
+    ///   restored on the success path only, which meant a failing assertion left
+    ///   the developer's own autostart setting changed by a test run.
+    #[cfg(windows)]
+    struct RealRegistry {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        was: Restore,
+    }
+
+    #[cfg(windows)]
+    impl RealRegistry {
+        fn acquire() -> Self {
+            static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Poison only means some other test panicked while holding this; the
+            // registry is not left inconsistent by that, so carry on.
+            let _guard = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let was = Restore::capture();
+            Self { _guard, was }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for RealRegistry {
+        fn drop(&mut self) {
+            // Still inside the lock: the restore is as much a mutation of the
+            // shared value as the test body was.
+            self.was.apply();
+        }
+    }
+
     #[test]
     fn a_platform_with_no_mechanism_says_what_to_do_instead() {
         // The point of the error text: an unsupported platform must tell the user
@@ -230,19 +465,24 @@ mod tests {
         #[cfg(windows)]
         {
             // Windows has a real implementation; querying it must not error even
-            // when nothing is registered.
-            assert!(is_registered().is_ok());
+            // when nothing is registered — including on a profile so clean that
+            // the Run key itself has never been created. `expect` rather than
+            // `assert!(….is_ok())` so the failure names the OS error: the bare
+            // assertion cost several CI runs to diagnose once.
+            let _real = RealRegistry::acquire();
+            is_registered().expect("querying autostart must not error when nothing is registered");
         }
     }
 
     #[test]
     #[cfg_attr(not(windows), ignore = "no autostart mechanism on this platform")]
     fn registering_is_idempotent_and_removable() {
-        // Touches the real registry, but only HKCU and only this one value, and it
-        // restores whatever it found.
+        // Touches the real registry, but only HKCU and only this one value.
+        // `RealRegistry` serialises it against the other tests and restores
+        // whatever it found, even if an assertion below panics.
         #[cfg(windows)]
         {
-            let was = is_registered().unwrap();
+            let _real = RealRegistry::acquire();
             install().unwrap();
             assert!(is_registered().unwrap());
             install().unwrap();
@@ -251,9 +491,129 @@ mod tests {
             assert!(!is_registered().unwrap());
             // Removing twice is not an error: the desired end state is reached.
             uninstall().unwrap();
-            if was {
-                install().unwrap();
-            }
         }
+    }
+
+    /// With no autostart *value* registered, the answer is a plain no — and
+    /// installing works from there.
+    ///
+    /// This covers the absent-value state, not the absent-*key* state that broke
+    /// CI: `uninstall` deletes the value and leaves the Run key standing, and
+    /// whether the key exists at all is decided by the profile the suite happens
+    /// to run on. [`an_absent_run_key_reads_as_absent_rather_than_erroring`] is
+    /// the one that reproduces the key condition deterministically.
+    ///
+    /// On a platform with no mechanism at all the same question earns a refusal
+    /// that still says what to write by hand. Neither may be an unexplained
+    /// error.
+    #[test]
+    fn asking_about_a_profile_that_has_never_registered_anything_is_answerable() {
+        #[cfg(windows)]
+        {
+            let _real = RealRegistry::acquire();
+            // Remove the value, so the query below runs against a profile with
+            // nothing registered — the state a fresh install is asked about.
+            uninstall().unwrap();
+            assert!(
+                !is_registered().unwrap(),
+                "with nothing registered the answer is a plain no"
+            );
+            // And installing must work from that state rather than failing for
+            // want of a key: `RegCreateKeyExW` creates it when it is missing.
+            install().unwrap();
+            assert!(is_registered().unwrap());
+        }
+        #[cfg(not(windows))]
+        {
+            let err = is_registered().unwrap_err();
+            assert!(matches!(err, AutostartError::Unsupported { .. }), "{err}");
+        }
+    }
+
+    /// Guards the property that actually broke CI.
+    ///
+    /// `Os { operation: "opening HKCU Run", code: 2 }` — `ERROR_FILE_NOT_FOUND`
+    /// on the *key*, not the value — is what failed on the Windows runners,
+    /// because Windows creates `…\CurrentVersion\Run` lazily and a profile that
+    /// has never registered a startup entry has no such key. A key that is not
+    /// there holds no entry, so the reader's honest answer is `Ok(None)`.
+    ///
+    /// It is asked of a subkey that does not exist rather than of the real Run
+    /// key, because reproducing the condition on the real one would mean
+    /// deleting every other application's startup entries. That makes it
+    /// deterministic and independent of thread ordering and of whatever the
+    /// runner's profile happens to contain.
+    ///
+    /// It reads a key that is absent, so it creates nothing and deletes nothing
+    /// and needs no `RealRegistry` guard — deliberately, not by omission.
+    #[cfg(windows)]
+    #[test]
+    fn an_absent_run_key_reads_as_absent_rather_than_erroring() {
+        use windows::Win32::System::Registry::KEY_QUERY_VALUE;
+
+        // `expect` rather than a bare assertion so a regression names the OS
+        // error, which is what took three CI runs to read the first time.
+        let opened = windows_impl::open_existing_at(
+            r"Software\WinXtend\absent-key-regression-guard",
+            KEY_QUERY_VALUE,
+        )
+        .expect("a Run key that does not exist is an answer, not an error");
+        assert!(opened.is_none(), "there is no key there to hand back");
+    }
+
+    /// A developer's own autostart entry must survive a test run unchanged.
+    ///
+    /// The guard is exercised through [`Restore`] rather than by nesting a second
+    /// `RealRegistry`, which would deadlock on the very mutex that makes these
+    /// tests safe. The outer guard still holds the lock and still puts the real
+    /// machine back the way it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_captured_entry_is_restored_byte_for_byte() {
+        use windows::Win32::System::Registry::REG_SZ;
+
+        let _real = RealRegistry::acquire();
+        // A value `install()` could never produce: it names a path that is not
+        // this test binary, so a restore that goes through `install()` instead of
+        // the captured bytes fails here rather than on a developer's machine.
+        let planted: Vec<u8> = r#""C:\Program Files\WinXtend\wx-agent.exe" --from-a-real-install"#
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        windows_impl::write_raw_entry(REG_SZ, &planted).unwrap();
+
+        let restore = Restore::capture();
+        // Whatever a test body does to the value, up to and including the
+        // rewrite that made restoring by `install()` wrong.
+        install().unwrap();
+        restore.apply();
+
+        let after = windows_impl::read_raw_entry()
+            .unwrap()
+            .expect("a value that was there before the test must be there after it");
+        assert_eq!(after.bytes, planted, "the restored value must be verbatim");
+        assert_eq!(after.kind, REG_SZ, "the value type is restored too");
+    }
+
+    /// The other direction, which a boolean got right only by accident: a
+    /// profile with nothing registered must still have nothing registered, and
+    /// specifically must not gain an empty entry.
+    #[cfg(windows)]
+    #[test]
+    fn nothing_to_restore_leaves_nothing_behind() {
+        let _real = RealRegistry::acquire();
+        uninstall().unwrap();
+
+        let restore = Restore::capture();
+        assert!(matches!(restore, Restore::Absent), "nothing was registered");
+        install().unwrap();
+        restore.apply();
+
+        assert!(
+            windows_impl::read_raw_entry().unwrap().is_none(),
+            "an absent entry must come back absent, not as an empty value"
+        );
+        assert!(!is_registered().unwrap());
     }
 }
