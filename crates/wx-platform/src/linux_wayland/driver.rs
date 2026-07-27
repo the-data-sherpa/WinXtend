@@ -258,8 +258,9 @@ impl Aborted {
     fn before_session(e: ashpd::Error) -> Self {
         Self {
             // Nothing before `SelectDevices` carries the restore token, so whatever
-            // went wrong here cannot be the token's fault.
-            failure: Failure::from_ashpd(e, TokenSent::No),
+            // went wrong here cannot be the token's fault, and no dialog has been
+            // shown yet so nobody has refused anything.
+            failure: Failure::from_ashpd(e, TokenSent::No, UserAsked::No),
             session: None,
         }
     }
@@ -325,9 +326,9 @@ async fn negotiate(
                 .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await
-        .map_err(|e| Failure::from_ashpd(e, sent))?
+        .map_err(|e| Failure::from_ashpd(e, sent, UserAsked::No))?
         .response()
-        .map_err(|e| Failure::from_ashpd(e, sent))?;
+        .map_err(|e| Failure::from_ashpd(e, sent, UserAsked::No))?;
 
     tracing::info!(
         restoring = restore_token.is_some(),
@@ -340,9 +341,9 @@ async fn negotiate(
     let started = proxy
         .start(session, None, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::Yes))?
         .response()
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::Yes))?;
 
     // Checked before the token is persisted: a token is the portal's promise to
     // grant the same thing again without asking, and persisting one for a grant
@@ -372,7 +373,7 @@ async fn negotiate(
     let fd = proxy
         .connect_to_eis(session, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::No))?;
 
     let context = ei::Context::new(UnixStream::from(fd))
         .map_err(|e| Failure::broken(format!("opening the libei transport: {e}")))?;
@@ -612,6 +613,24 @@ enum TokenSent {
     No,
 }
 
+/// Whether the portal call that failed is the one the user answers.
+///
+/// Only `Start` puts a dialog on screen, so only `Start` can fail because somebody
+/// said no. `CreateSession` and `SelectDevices` complete before any consent UI
+/// exists at all, and a refusal from either is the desktop declining to set the
+/// session up — a locked or not-yet-ready session is the usual reason, and both
+/// pass on their own.
+///
+/// Kept structural rather than matched on the portal's message text, and it is what
+/// stops a screen that happened to be locked at startup from being recorded as a
+/// refusal — terminal, never retried, and reported to the user as a permission they
+/// have to go and grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserAsked {
+    Yes,
+    No,
+}
+
 impl Failure {
     fn denied(detail: impl Into<String>) -> Self {
         Self {
@@ -670,18 +689,31 @@ impl Failure {
     /// The distinction that matters is "the user can fix this" versus "there is no
     /// portal here". Reporting a headless machine as a permission problem sends the
     /// user hunting for a dialog that was never shown; reporting a refusal as
-    /// unsupported hides the one thing they could act on.
-    fn from_ashpd(e: ashpd::Error, sent: TokenSent) -> Self {
+    /// unsupported hides the one thing they could act on. Which of the two a refused
+    /// request is depends on whether anybody had been asked yet — see [`UserAsked`].
+    fn from_ashpd(e: ashpd::Error, sent: TokenSent, asked: UserAsked) -> Self {
         use ashpd::desktop::ResponseError;
         use ashpd::PortalError;
 
         match e {
+            // A request turned down before the dialog existed. Nobody refused this:
+            // the desktop would not set the session up at all, which is what a
+            // compositor answers with when the session is locked or not yet ready —
+            // both of which pass without anyone doing anything. Calling it a
+            // permission problem would leave a daemon that started at a lock screen
+            // input-dead for its whole run, with a message sending the user to a
+            // settings panel where there is nothing to fix.
+            ashpd::Error::Response(_) if asked == UserAsked::No => Self::broken(
+                "the desktop refused to create a remote desktop session; the session is \
+                 most likely locked or not ready yet",
+            ),
             ashpd::Error::Response(ResponseError::Cancelled) => {
                 Self::refused("the desktop portal consent dialog was dismissed")
             }
-            // The portal's catch-all. It covers a compositor that failed as well as
-            // one that refused, so the token stays: throwing away a good token over a
-            // transient failure would cost the user a dialog they need not have seen.
+            // The portal's catch-all, from the call the user was answering. It covers
+            // a compositor that failed as well as one that refused, so the token
+            // stays: throwing away a good token over a transient failure would cost
+            // the user a dialog they need not have seen.
             ashpd::Error::Response(ResponseError::Other) => {
                 Self::denied("the desktop portal refused the remote desktop session")
             }
@@ -860,6 +892,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "Restore token is not a valid UUID string"),
             TokenSent::Yes,
+            UserAsked::No,
         );
         assert!(matches!(failure.kind, FailureKind::Broken));
         assert!(
@@ -891,6 +924,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "Restore token is not a valid UUID string"),
             TokenSent::Yes,
+            UserAsked::No,
         );
         forget_rejected_token(&store, had_token, &failure);
 
@@ -909,6 +943,7 @@ mod tests {
         let no_token = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "some other argument"),
             TokenSent::No,
+            UserAsked::No,
         );
         assert!(matches!(no_token.kind, FailureKind::Broken));
         assert!(!no_token.discards_token);
@@ -916,6 +951,7 @@ mod tests {
         let other_error = Failure::from_ashpd(
             method_error("org.freedesktop.DBus.Error.NoReply", "timed out"),
             TokenSent::Yes,
+            UserAsked::No,
         );
         assert!(matches!(other_error.kind, FailureKind::Broken));
         assert!(!other_error.discards_token);
@@ -926,6 +962,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             ashpd::Error::Response(ResponseError::Cancelled),
             TokenSent::Yes,
+            UserAsked::Yes,
         );
         assert!(matches!(failure.kind, FailureKind::Denied));
         assert!(
@@ -951,6 +988,46 @@ mod tests {
         session.activate(SESSION_CAPABILITIES);
         assert_eq!(session.state(), SessionState::Denied);
         assert!(live.get().is_empty());
+    }
+
+    #[test]
+    fn a_desktop_that_will_not_create_the_session_is_not_a_user_saying_no() {
+        // Measured on GNOME 50: with the screen locked, mutter answers
+        // `CreateSession` with a refusal — "Session creation inhibited" — long before
+        // any dialog exists. Recording that as a refusal made the agent permanently
+        // input-dead for a lock the user walked away from, and told them to go and
+        // grant a permission that was never in question.
+        for (label, error) in [
+            ("other", ashpd::Error::Response(ResponseError::Other)),
+            (
+                "cancelled",
+                ashpd::Error::Response(ResponseError::Cancelled),
+            ),
+        ] {
+            let failure = Failure::from_ashpd(error, TokenSent::Yes, UserAsked::No);
+            assert!(matches!(failure.kind, FailureKind::Broken), "{label}");
+            assert!(
+                !failure.discards_token,
+                "a lock screen is not the token's fault: {label}"
+            );
+            assert!(
+                failure.detail.contains("locked")
+                    && failure.detail.contains("create a remote desktop session"),
+                "the message must name what the desktop did and the likely reason: {}",
+                failure.detail
+            );
+
+            let (session, live) = session();
+            session.starting();
+            failure.report(&session);
+
+            assert_eq!(session.state(), SessionState::Failed, "{label}");
+            assert!(live.get().is_empty(), "{label}");
+            assert!(
+                !matches!(session.error(), Some(PlatformError::PermissionDenied(_))),
+                "nobody refused anything here: {label}"
+            );
+        }
     }
 
     #[test]
@@ -1012,6 +1089,7 @@ mod tests {
                 "no such service",
             ),
             TokenSent::Yes,
+            UserAsked::No,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
         assert!(!failure.discards_token);
@@ -1021,6 +1099,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             ashpd::Error::Zbus(ashpd::zbus::Error::Address("no bus here".to_string())),
             TokenSent::Yes,
+            UserAsked::No,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
         assert!(!failure.discards_token);

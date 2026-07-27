@@ -2168,6 +2168,10 @@ impl Engine {
                     &self.config,
                     &self.router.layout().to_layout(),
                     &self.platform.info,
+                    // The live advertisement, not `info.capabilities`: on Wayland
+                    // the portal grants input permission long after the backend was
+                    // built, and the UI reads this field to decide what this machine
+                    // can do.
                     self.advertised_by(self.local),
                     AGENT_VERSION,
                     self.state.uptime(Instant::now()),
