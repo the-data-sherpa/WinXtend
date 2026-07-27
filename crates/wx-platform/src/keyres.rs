@@ -9,10 +9,12 @@
 //!
 //! # What the backends must supply
 //!
-//! Each OS backend does the syscall part — `ToUnicodeEx` on Windows,
-//! `UCKeyTranslate` on macOS, `xkb_state_key_get_utf8` on X11/Wayland — and hands
-//! the result over as a [`RawKey`]. Everything after that is platform-independent
-//! and lives here, so the composition rules cannot drift between backends.
+//! Each OS backend does the layout part — `ToUnicodeEx` on Windows,
+//! `UCKeyTranslate` on macOS, and on Wayland the compositor's own xkb keymap,
+//! read in pure Rust by [`crate::linux_wayland::keymap`], which the X11 backend is
+//! to reuse rather than link `libxkbcommon` — and hands the result over as a
+//! [`RawKey`]. Everything after that is platform-independent and lives here, so
+//! the composition rules cannot drift between backends.
 //!
 //! The one thing here that runs on the *receiving* side is [`decompose`], the
 //! inverse of [`compose`]: an injector whose layout has no single key for `é` types

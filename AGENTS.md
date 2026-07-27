@@ -120,10 +120,11 @@ GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untruste
 callers, so visual confirmation of the UI needs a human or a portal prompt.
 
 The backend is split to keep that reachable from CI: the parts needing no desktop —
-restore-token persistence in `token.rs`, the session state machine in `session.rs` —
-are deliberately separated from everything touching D-Bus or libei (`driver.rs`, behind
-`cfg(target_os = "linux")` with a stub alongside), so this crate compiles and tests on
-all three platforms with no session. Keep that division.
+restore-token persistence in `token.rs`, the session state machine in `session.rs`, the
+event translation in `capture.rs` — are deliberately separated from everything touching
+D-Bus or libei (`driver.rs` and `capture_driver.rs`, behind `cfg(target_os = "linux")`
+with a stub alongside each), so this crate compiles and tests on all three platforms
+with no session. Keep that division.
 
 ## Wayland input needs two portals, and they are not interchangeable
 
