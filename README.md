@@ -208,18 +208,24 @@ cargo build --release      # produces target/release/wx-agent
 
 ### Ubuntu / Debian prerequisites
 
-The engine compiles C through two build scripts — `zstd-sys`, because `zstd` is a
-default feature of `wx-video`, and `ring` — so it needs a C toolchain:
+The engine compiles bundled C through two build scripts — `zstd-sys`, because
+`zstd` is a default feature of `wx-video`, and `ring` — so a C compiler is its
+only system prerequisite:
 
 ```bash
-sudo apt install -y build-essential pkg-config
+sudo apt install -y build-essential
 ```
 
-It does **not** need `libssl-dev`. Nothing in the tree links OpenSSL: neither
+It needs neither `pkg-config` nor `libssl-dev`, both of which the package list
+in issue #2 named in error. No engine build script probes `pkg-config`:
+`zstd-sys` builds the bundled C with `cc`, and probes only under its own
+`pkg-config` feature or `ZSTD_SYS_USE_PKG_CONFIG`, neither of which is set
+here; `wayland-sys` is built with none of its `client`/`cursor`/`egl`/`server`
+features, so its build script emits nothing — `wayland-client` uses the
+pure-Rust backend. Nothing in the tree links OpenSSL either: neither
 `Cargo.lock` nor `ui/src-tauri/Cargo.lock` contains `openssl-sys` or
 `native-tls`, and `wx-net` pins `quinn` with `default-features = false` and
-`rustls-ring`, a pure-Rust TLS stack. This departs deliberately from the package
-list in issue #2, which named `libssl-dev` in error.
+`rustls-ring`, a pure-Rust TLS stack.
 
 The Tauri UI additionally needs the WebKitGTK and tray stack:
 
