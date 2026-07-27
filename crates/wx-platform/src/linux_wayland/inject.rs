@@ -80,6 +80,15 @@ struct Wired {
     pointer: Option<Device>,
     /// Absolute motion, and the device buttons and scrolling are sent on.
     absolute: Option<Device>,
+    /// Devices the compositor has paused.
+    ///
+    /// A pause is temporary and routine — mutter pauses the devices around
+    /// session suspension — so a paused device keeps its slot and only loses the
+    /// right to be sent on, which is what the accessors below enforce. Dropping
+    /// it instead would be unrecoverable: the keymap arrives exactly once, on a
+    /// file descriptor, and the layout group and locked modifiers reported since
+    /// are state no later event repeats.
+    paused: Vec<Device>,
     /// Incremented for each `start_emulating`, as the protocol asks.
     sequence: u32,
 }
@@ -139,6 +148,7 @@ impl Transport {
             keyboard: None,
             pointer: None,
             absolute: None,
+            paused: Vec::new(),
             sequence: 0,
         });
     }
@@ -147,47 +157,21 @@ impl Transport {
     pub fn device_added(&self, device: &Device) {
         let mut guard = self.lock();
         let Some(wired) = guard.as_mut() else { return };
-
-        if device.has_capability(DeviceCapability::Keyboard) {
-            if let Some(keyboard) = device.interface::<ei::Keyboard>() {
-                let source = read_keymap(device);
-                let keymap = Keymap::parse(&source, 0);
-                if keymap.is_empty() {
-                    // Not fatal — special keys and chords use fixed evdev codes and
-                    // work regardless — but every text payload will be refused, so
-                    // it needs to be attributable.
-                    tracing::warn!(
-                        device = ?device.name(),
-                        "the libei keyboard offered no keymap this backend could read; text injection will be unavailable"
-                    );
-                }
-                wired.keyboard = Some(VirtualKeyboard {
-                    device: device.clone(),
-                    keyboard,
-                    source,
-                    keymap,
-                    group: 0,
-                    locked: 0,
-                });
-            }
-        }
-        // Two independent questions, not two branches of one. On the alpha target
-        // the capabilities land on separate devices, but a compositor is free to
-        // offer one device that does both — and an `else if` there would leave
-        // relative motion with nowhere to go while an absolute pointer sat right
-        // in front of it.
-        if device.has_capability(DeviceCapability::PointerAbsolute) {
-            wired.absolute = Some(device.clone());
-        }
-        if device.has_capability(DeviceCapability::Pointer) {
-            wired.pointer = Some(device.clone());
-        }
+        wired.register(device);
     }
 
     /// The device is ready to emulate. Nothing may be sent before this.
+    ///
+    /// Not only at the start of a session: the compositor pauses and resumes
+    /// devices over the life of one, so a resume has to put the device back in
+    /// service as well as start it emulating. Leaving that to `DeviceAdded`
+    /// alone would mean one routine suspend killed injection for the rest of the
+    /// process while the session still advertised it to peers.
     pub fn device_resumed(&self, device: &Device) {
         let mut guard = self.lock();
         let Some(wired) = guard.as_mut() else { return };
+        wired.paused.retain(|d| d != device);
+        wired.register(device);
         wired.sequence = wired.sequence.wrapping_add(1);
         let serial = wired.connection.serial();
         device.device().start_emulating(serial, wired.sequence);
@@ -196,7 +180,19 @@ impl Transport {
         }
     }
 
-    /// The device is gone, or suspended. Either way nothing may be sent on it.
+    /// The device is suspended. Nothing may be sent on it until it resumes.
+    ///
+    /// It keeps its slot, because the compositor may hand it straight back; see
+    /// [`Wired::paused`].
+    pub fn device_paused(&self, device: &Device) {
+        let mut guard = self.lock();
+        let Some(wired) = guard.as_mut() else { return };
+        if !wired.is_paused(device) {
+            wired.paused.push(device.clone());
+        }
+    }
+
+    /// The device is gone for good and nothing may be sent on it again.
     pub fn device_lost(&self, device: &Device) {
         let mut guard = self.lock();
         let Some(wired) = guard.as_mut() else { return };
@@ -209,6 +205,7 @@ impl Transport {
         if wired.absolute.as_ref() == Some(device) {
             wired.absolute = None;
         }
+        wired.paused.retain(|d| d != device);
     }
 
     /// The compositor's view of the keyboard's modifier state.
@@ -267,13 +264,90 @@ impl Transport {
 }
 
 impl Wired {
-    fn devices(&self) -> impl Iterator<Item = &Device> {
+    /// Put a device into whichever slots its capabilities claim.
+    ///
+    /// Runs again on every resume, so it has to be idempotent in the one way that
+    /// matters: a keyboard that is already registered keeps the instance it has
+    /// rather than being rebuilt, or the layout group and locked modifiers
+    /// reported since it arrived would silently reset to zero — and the keymap
+    /// would be re-read from a file descriptor that has already been consumed.
+    fn register(&mut self, device: &Device) {
+        let known = self.keyboard.as_ref().is_some_and(|k| &k.device == device);
+        if device.has_capability(DeviceCapability::Keyboard) && !known {
+            if let Some(keyboard) = device.interface::<ei::Keyboard>() {
+                let source = read_keymap(device);
+                let keymap = Keymap::parse(&source, 0);
+                if keymap.is_empty() {
+                    // Not fatal — special keys and chords use fixed evdev codes and
+                    // work regardless — but every text payload will be refused, so
+                    // it needs to be attributable.
+                    tracing::warn!(
+                        device = ?device.name(),
+                        "the libei keyboard offered no keymap this backend could read; text injection will be unavailable"
+                    );
+                }
+                self.keyboard = Some(VirtualKeyboard {
+                    device: device.clone(),
+                    keyboard,
+                    source,
+                    keymap,
+                    group: 0,
+                    locked: 0,
+                });
+            }
+        }
+        // Two independent questions, not two branches of one. On the alpha target
+        // the capabilities land on separate devices, but a compositor is free to
+        // offer one device that does both — and an `else if` there would leave
+        // relative motion with nowhere to go while an absolute pointer sat right
+        // in front of it.
+        if device.has_capability(DeviceCapability::PointerAbsolute) {
+            self.absolute = Some(device.clone());
+        }
+        if device.has_capability(DeviceCapability::Pointer) {
+            self.pointer = Some(device.clone());
+        }
+    }
+
+    fn is_paused(&self, device: &Device) -> bool {
+        self.paused.iter().any(|d| d == device)
+    }
+
+    /// The keyboard, if there is one and it may be sent on.
+    fn keyboard(&self) -> Option<&VirtualKeyboard> {
         self.keyboard
             .as_ref()
+            .filter(|k| !self.is_paused(&k.device))
+    }
+
+    fn pointer(&self) -> Option<&Device> {
+        self.pointer.as_ref().filter(|d| !self.is_paused(d))
+    }
+
+    fn absolute(&self) -> Option<&Device> {
+        self.absolute.as_ref().filter(|d| !self.is_paused(d))
+    }
+
+    /// Every device that is currently emulating, each one once.
+    ///
+    /// Deduplicated by identity because one device can fill two slots: a
+    /// compositor is free to offer a single pointer carrying both `Pointer` and
+    /// `PointerAbsolute`, and `stop_emulating` twice on it is a request the peer
+    /// has every reason to read as a client bug.
+    fn devices(&self) -> Vec<&Device> {
+        let mut out: Vec<&Device> = Vec::new();
+        for device in self
+            .keyboard()
             .map(|k| &k.device)
             .into_iter()
-            .chain(self.pointer.as_ref())
-            .chain(self.absolute.as_ref())
+            .chain(self.pointer())
+            .chain(self.absolute())
+        {
+            if !out.contains(&device) {
+                out.push(device);
+            }
+        }
+        out
     }
 
     /// Frame the events just queued on `device` and put them on the wire.
@@ -291,17 +365,15 @@ impl Wired {
     /// The device buttons and scrolling go on: the one this backend positions
     /// with, so a click is unambiguous about where it landed.
     fn buttons(&self) -> Option<&Device> {
-        self.absolute
-            .as_ref()
+        self.absolute()
             .filter(|d| d.has_capability(DeviceCapability::Button))
-            .or(self.pointer.as_ref())
+            .or(self.pointer())
     }
 
     fn scrolling(&self) -> Option<&Device> {
-        self.absolute
-            .as_ref()
+        self.absolute()
             .filter(|d| d.has_capability(DeviceCapability::Scroll))
-            .or(self.pointer.as_ref())
+            .or(self.pointer())
     }
 }
 
@@ -312,12 +384,25 @@ enum Held {
     Button(u32),
 }
 
+/// One modifier key a keystroke asks to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModifierStep {
+    keycode: u32,
+    release: bool,
+    /// Whether the key itself has to move, or only the bookkeeping.
+    ///
+    /// False when another record is already holding the same physical key down:
+    /// the record that stops wanting it forgets it, but must not pull it out
+    /// from under the others.
+    physical: bool,
+}
+
 /// The receiving half of the input path on Wayland.
 pub struct Injector {
     transport: Arc<Transport>,
     /// Press-ordered, so `release_all` unwinds newest first.
     held: Vec<Held>,
-    /// Chord modifiers (Ctrl, Alt, Super) this injector is physically holding.
+    /// Modifiers this injector is holding because the sender asked for them.
     ///
     /// Tracked rather than queried, because the user may be holding the same
     /// modifier on the local keyboard and releasing theirs would be a visible
@@ -325,7 +410,8 @@ pub struct Injector {
     chord: Modifiers,
     /// Shift and AltGr held to reach a keymap level. Kept apart from `chord`
     /// because they are consumed by layout resolution rather than requested by
-    /// the sender.
+    /// the sender — but they drive the same two physical keys, so neither set
+    /// moves one without asking the other (see [`Injector::chord_plan`]).
     level: LevelMods,
 }
 
@@ -372,7 +458,7 @@ impl Injector {
         for held in self.held.iter().rev() {
             match held {
                 Held::Key(code) => {
-                    let Some(keyboard) = wired.keyboard.as_ref() else {
+                    let Some(keyboard) = wired.keyboard() else {
                         continue;
                     };
                     keyboard
@@ -394,8 +480,9 @@ impl Injector {
         }
         // Modifiers last: letting Ctrl go first would turn the remaining releases
         // into bare keys mid-chord, which some applications act on.
-        if let Some(keyboard) = wired.keyboard.as_ref() {
-            for code in self.modifier_keycodes(wired) {
+        if let Some(keyboard) = wired.keyboard() {
+            let level3 = keyboard.keymap.level3_keycode().unwrap_or(KEY_RIGHTALT);
+            for code in self.modifier_keycodes(level3) {
                 keyboard
                     .keyboard
                     .key(code, ei::keyboard::KeyState::Released);
@@ -412,27 +499,22 @@ impl Injector {
     }
 
     /// Every modifier keycode currently believed held, in release order.
-    fn modifier_keycodes(&self, wired: &Wired) -> Vec<u32> {
-        let level3 = wired
-            .keyboard
-            .as_ref()
-            .and_then(|k| k.keymap.level3_keycode())
-            .unwrap_or(KEY_RIGHTALT);
+    fn modifier_keycodes(&self, level3: u32) -> Vec<u32> {
         let mut codes = Vec::new();
-        if self.level.level3 {
-            codes.push(level3);
-        }
-        if self.level.shift {
-            codes.push(KEY_LEFTSHIFT);
-        }
-        for (bit, code) in [
-            (Modifiers::SHIFT, KEY_LEFTSHIFT),
-            (Modifiers::ALT_GR, level3),
-            (Modifiers::SUPER, KEY_LEFTMETA),
-            (Modifiers::ALT, KEY_LEFTALT),
-            (Modifiers::CTRL, KEY_LEFTCTRL),
+        for (held, code) in [
+            (self.level.level3, level3),
+            (self.level.shift, KEY_LEFTSHIFT),
+            (self.chord.contains(Modifiers::SHIFT), KEY_LEFTSHIFT),
+            (self.chord.contains(Modifiers::ALT_GR), level3),
+            (self.chord.contains(Modifiers::SUPER), KEY_LEFTMETA),
+            (self.chord.contains(Modifiers::ALT), KEY_LEFTALT),
+            (self.chord.contains(Modifiers::CTRL), KEY_LEFTCTRL),
         ] {
-            if self.chord.contains(bit) && !codes.contains(&code) {
+            // Once each, and not at all for a key the loop above has already
+            // released: the records share their keycodes with each other and with
+            // a modifier the sender forwarded, but there is only ever one key
+            // down to let go of.
+            if held && !codes.contains(&code) && !self.sender_holds(code) {
                 codes.push(code);
             }
         }
@@ -456,10 +538,7 @@ impl Injector {
                 }
                 let guard = self.transport.lock();
                 let wired = guard.as_ref().ok_or_else(transport_gone)?;
-                let device = wired
-                    .pointer
-                    .as_ref()
-                    .ok_or_else(|| no_device("a pointer"))?;
+                let device = wired.pointer().ok_or_else(|| no_device("a pointer"))?;
                 let pointer = device
                     .interface::<ei::Pointer>()
                     .ok_or_else(|| no_device("relative pointer motion"))?;
@@ -476,8 +555,7 @@ impl Injector {
         let guard = self.transport.lock();
         let wired = guard.as_ref().ok_or_else(transport_gone)?;
         let device = wired
-            .absolute
-            .as_ref()
+            .absolute()
             .ok_or_else(|| no_device("an absolute pointer"))?;
         let absolute = device
             .interface::<ei::PointerAbsolute>()
@@ -641,7 +719,9 @@ impl Injector {
                 // The level modifiers belong to this keystroke and nothing after
                 // it. Held past the key-up they reach the next event — the
                 // pointer click or the Enter that follows a level-3 character —
-                // and the peer sees a modifier it never sent.
+                // and the peer sees a modifier it never sent. A Shift the sender
+                // is holding itself is a different record and outlives this: the
+                // plan leaves that key alone.
                 if release {
                     self.sync_level(LevelMods::default())?;
                 }
@@ -690,10 +770,7 @@ impl Injector {
     fn resolve(&self, c: char) -> Result<Vec<ResolvedKey>> {
         let guard = self.transport.lock();
         let wired = guard.as_ref().ok_or_else(transport_gone)?;
-        let keyboard = wired
-            .keyboard
-            .as_ref()
-            .ok_or_else(|| no_device("a keyboard"))?;
+        let keyboard = wired.keyboard().ok_or_else(|| no_device("a keyboard"))?;
 
         if let Some(stroke) = keyboard.keymap.stroke_for_any(char_keysyms(c)) {
             return Ok(vec![keyboard.reachable(stroke)?]);
@@ -733,34 +810,32 @@ impl Injector {
     /// Lock keys are deliberately absent: Caps Lock and Num Lock are toggles, not
     /// held keys, and pressing them to "match" the sender would flip the
     /// receiver's state permanently.
+    ///
+    /// Shift and AltGr are here despite also being level modifiers, because
+    /// [`KeyEvent::injection_modifiers`] is what keeps them from being applied
+    /// twice: it strips both from a text payload — the sender already spent them
+    /// producing the character, and [`Injector::sync_level`] re-applies them
+    /// through the keymap — and preserves them on the payloads that have no text
+    /// form and genuinely need them, which is how Shift+Tab and Shift+Home reach
+    /// the receiver as chords at all.
     fn sync_chord(&mut self, required: Modifiers) -> Result<()> {
-        for (bit, code) in [
-            (Modifiers::CTRL, KEY_LEFTCTRL),
-            (Modifiers::ALT, KEY_LEFTALT),
-            (Modifiers::SUPER, KEY_LEFTMETA),
-        ] {
-            let want = required.contains(bit);
-            if want == self.chord.contains(bit) {
-                continue;
-            }
-            self.send_modifier(code, !want)?;
-            self.chord = if want {
-                self.chord.union(bit)
-            } else {
-                self.chord.without(bit)
-            };
+        let wanted = required
+            .without(Modifiers::CAPS_LOCK)
+            .without(Modifiers::NUM_LOCK);
+        // Answered without touching the transport, so a keystroke that needs no
+        // modifier does not depend on a level-3 keycode being resolvable.
+        if wanted == self.chord {
+            return Ok(());
         }
-        // AltGr is a chord modifier the sender can ask for as well as a level this
-        // backend reaches for itself, so it is resolved against the keymap like
-        // the level one rather than assumed to be right Alt.
-        let want = required.contains(Modifiers::ALT_GR);
-        if want != self.chord.contains(Modifiers::ALT_GR) {
-            let code = self.level3_keycode()?;
-            self.send_modifier(code, !want)?;
-            self.chord = if want {
-                self.chord.union(Modifiers::ALT_GR)
+        let level3 = self.level3_keycode()?;
+        for (bit, step) in self.chord_plan(wanted, level3) {
+            if step.physical {
+                self.send_modifier(step.keycode, step.release)?;
+            }
+            self.chord = if step.release {
+                self.chord.without(bit)
             } else {
-                self.chord.without(Modifiers::ALT_GR)
+                self.chord.union(bit)
             };
         }
         Ok(())
@@ -768,24 +843,98 @@ impl Injector {
 
     /// Hold exactly the Shift and AltGr a keymap level needs.
     fn sync_level(&mut self, required: LevelMods) -> Result<()> {
-        if required.shift != self.level.shift {
-            self.send_modifier(KEY_LEFTSHIFT, !required.shift)?;
+        if required == self.level {
+            return Ok(());
+        }
+        let level3 = self.level3_keycode()?;
+        let [shift, third] = self.level_plan(required, level3);
+        if let Some(step) = shift {
+            if step.physical {
+                self.send_modifier(step.keycode, step.release)?;
+            }
             self.level.shift = required.shift;
         }
-        if required.level3 != self.level.level3 {
-            let code = self.level3_keycode()?;
-            self.send_modifier(code, !required.level3)?;
+        if let Some(step) = third {
+            if step.physical {
+                self.send_modifier(step.keycode, step.release)?;
+            }
             self.level.level3 = required.level3;
         }
         Ok(())
+    }
+
+    /// The chord modifiers `required` changes, and whether each one's key has to
+    /// move.
+    ///
+    /// Pure, because the difficulty here is not the sending: three independent
+    /// records drive the same physical Shift key — a bare `SpecialKey::ShiftLeft`
+    /// the sender forwarded, which is injected as an ordinary key and lands on
+    /// the held list; this chord set; and the keymap level — and each has to
+    /// leave the key alone while another still wants it down.
+    fn chord_plan(&self, required: Modifiers, level3: u32) -> Vec<(Modifiers, ModifierStep)> {
+        let mut steps = Vec::new();
+        for (bit, code) in [
+            (Modifiers::CTRL, KEY_LEFTCTRL),
+            (Modifiers::ALT, KEY_LEFTALT),
+            (Modifiers::SUPER, KEY_LEFTMETA),
+            (Modifiers::SHIFT, KEY_LEFTSHIFT),
+            // Resolved against the keymap rather than assumed to be right Alt,
+            // for the same reason the level path resolves it.
+            (Modifiers::ALT_GR, level3),
+        ] {
+            let want = required.contains(bit);
+            if want == self.chord.contains(bit) {
+                continue;
+            }
+            let pinned = self.sender_holds(code)
+                || (bit == Modifiers::SHIFT && self.level.shift)
+                || (bit == Modifiers::ALT_GR && self.level.level3);
+            steps.push((
+                bit,
+                ModifierStep {
+                    keycode: code,
+                    release: !want,
+                    physical: !pinned,
+                },
+            ));
+        }
+        steps
+    }
+
+    /// The two level modifiers `required` changes, Shift first.
+    ///
+    /// Pure for the same reason [`Injector::chord_plan`] is, and the mirror of
+    /// it: the level path must not release a Shift the sender is holding or one
+    /// this injector is holding for a chord, and it must not press a second time
+    /// a key either of them already has down.
+    fn level_plan(&self, required: LevelMods, level3: u32) -> [Option<ModifierStep>; 2] {
+        let shift = (required.shift != self.level.shift).then(|| ModifierStep {
+            keycode: KEY_LEFTSHIFT,
+            release: !required.shift,
+            physical: !(self.sender_holds(KEY_LEFTSHIFT) || self.chord.contains(Modifiers::SHIFT)),
+        });
+        let third = (required.level3 != self.level.level3).then(|| ModifierStep {
+            keycode: level3,
+            release: !required.level3,
+            physical: !(self.sender_holds(level3) || self.chord.contains(Modifiers::ALT_GR)),
+        });
+        [shift, third]
+    }
+
+    /// Whether the sender is holding this key itself.
+    ///
+    /// A forwarded bare modifier press is injected as an ordinary key, so it is
+    /// invisible to `chord` and `level` — and it is the user's own Shift, which
+    /// neither of them may release.
+    fn sender_holds(&self, code: u32) -> bool {
+        self.held.contains(&Held::Key(code))
     }
 
     fn level3_keycode(&self) -> Result<u32> {
         let guard = self.transport.lock();
         let wired = guard.as_ref().ok_or_else(transport_gone)?;
         Ok(wired
-            .keyboard
-            .as_ref()
+            .keyboard()
             .and_then(|k| k.keymap.level3_keycode())
             .unwrap_or(KEY_RIGHTALT))
     }
@@ -798,10 +947,7 @@ impl Injector {
     fn send_modifier(&self, code: u32, release: bool) -> Result<()> {
         let guard = self.transport.lock();
         let wired = guard.as_ref().ok_or_else(transport_gone)?;
-        let keyboard = wired
-            .keyboard
-            .as_ref()
-            .ok_or_else(|| no_device("a keyboard"))?;
+        let keyboard = wired.keyboard().ok_or_else(|| no_device("a keyboard"))?;
         keyboard.keyboard.key(code, key_state(release));
         wired.commit(&keyboard.device)
     }
@@ -810,10 +956,7 @@ impl Injector {
         {
             let guard = self.transport.lock();
             let wired = guard.as_ref().ok_or_else(transport_gone)?;
-            let keyboard = wired
-                .keyboard
-                .as_ref()
-                .ok_or_else(|| no_device("a keyboard"))?;
+            let keyboard = wired.keyboard().ok_or_else(|| no_device("a keyboard"))?;
             keyboard.keyboard.key(code, key_state(release));
             wired.commit(&keyboard.device)?;
         }
@@ -1070,6 +1213,139 @@ mod tests {
         assert_eq!(inj.held.len(), 1);
         inj.track(Held::Key(30), true);
         assert!(inj.held.is_empty());
+    }
+
+    #[test]
+    fn a_special_key_that_needs_shift_actually_holds_it() {
+        // Shift+Tab has no text form, so `injection_modifiers` keeps the Shift and
+        // this backend has to press it. Ignoring the bit sends a bare Tab, and the
+        // reverse-tabbing the user asked for silently does not happen.
+        let inj = injector();
+        let event = KeyEvent::special(SpecialKey::Tab, KeyAction::Press, Modifiers::SHIFT);
+        assert_eq!(
+            inj.chord_plan(event.injection_modifiers(), KEY_RIGHTALT),
+            vec![(
+                Modifiers::SHIFT,
+                ModifierStep {
+                    keycode: KEY_LEFTSHIFT,
+                    release: false,
+                    physical: true,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_shifted_character_is_not_shifted_twice() {
+        // The other direction: the sender already spent Shift producing the `A`,
+        // so `injection_modifiers` strips it and the chord path must ask for
+        // nothing. The keymap level presses Shift once, on its own.
+        let mut inj = injector();
+        let event = KeyEvent::text("A", KeyAction::Press, Modifiers::SHIFT);
+        assert!(inj
+            .chord_plan(event.injection_modifiers(), KEY_RIGHTALT)
+            .is_empty());
+
+        let [shift, third] = inj.level_plan(
+            LevelMods {
+                shift: true,
+                level3: false,
+            },
+            KEY_RIGHTALT,
+        );
+        assert_eq!(
+            shift,
+            Some(ModifierStep {
+                keycode: KEY_LEFTSHIFT,
+                release: false,
+                physical: true,
+            })
+        );
+        assert_eq!(third, None);
+
+        // And it comes back up with the keystroke rather than reaching the next
+        // event — the stuck-Shift defect that turned a following Home into
+        // Shift+Home.
+        inj.level.shift = true;
+        let [shift, _] = inj.level_plan(LevelMods::default(), KEY_RIGHTALT);
+        assert_eq!(
+            shift,
+            Some(ModifierStep {
+                keycode: KEY_LEFTSHIFT,
+                release: true,
+                physical: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_shift_the_sender_is_holding_is_never_released_by_a_keystroke() {
+        // A forwarded `SpecialKey::ShiftLeft` is injected as an ordinary key, so
+        // it is on the held list and invisible to both modifier sets. Letting the
+        // level path release it after a `!` loses the Shift from the Shift+Home
+        // that follows.
+        let mut inj = injector();
+        inj.held.push(Held::Key(KEY_LEFTSHIFT));
+        inj.level.shift = true;
+
+        let [shift, _] = inj.level_plan(LevelMods::default(), KEY_RIGHTALT);
+        let step = shift.expect("the level record still has to let go of its Shift");
+        assert!(step.release);
+        assert!(!step.physical, "the sender's own Shift key must stay down");
+
+        // And the level path must not press a key that is already down either.
+        inj.level.shift = false;
+        let [shift, _] = inj.level_plan(
+            LevelMods {
+                shift: true,
+                level3: false,
+            },
+            KEY_RIGHTALT,
+        );
+        assert!(!shift.unwrap().physical);
+    }
+
+    #[test]
+    fn the_chord_and_the_level_do_not_fight_over_the_same_key() {
+        // Both drive KEY_LEFTSHIFT. Whichever stops wanting it while the other
+        // still does must forget it without touching the key.
+        let mut inj = injector();
+        inj.chord = Modifiers::SHIFT;
+        inj.level.shift = true;
+
+        let [shift, _] = inj.level_plan(LevelMods::default(), KEY_RIGHTALT);
+        assert!(!shift.unwrap().physical);
+
+        assert_eq!(
+            inj.chord_plan(Modifiers::NONE, KEY_RIGHTALT),
+            vec![(
+                Modifiers::SHIFT,
+                ModifierStep {
+                    keycode: KEY_LEFTSHIFT,
+                    release: true,
+                    physical: false,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn release_all_lets_a_shared_modifier_key_go_exactly_once() {
+        // Three records can name KEY_LEFTSHIFT at the same time, and the held list
+        // is unwound first. A second key-up for a key that is already up is a
+        // report the receiving desktop has no way to make sense of.
+        let mut inj = injector();
+        inj.held.push(Held::Key(KEY_LEFTSHIFT));
+        inj.chord = Modifiers::SHIFT | Modifiers::CTRL;
+        inj.level.shift = true;
+
+        assert_eq!(inj.modifier_keycodes(KEY_RIGHTALT), vec![KEY_LEFTCTRL]);
+
+        inj.held.clear();
+        assert_eq!(
+            inj.modifier_keycodes(KEY_RIGHTALT),
+            vec![KEY_LEFTSHIFT, KEY_LEFTCTRL]
+        );
     }
 
     #[test]

@@ -339,9 +339,16 @@ fn parse_keycodes(body: &str) -> HashMap<String, u32> {
 /// `type "FOUR_LEVEL" { map[Shift+LevelThree]= 4; ... }`, flattened to
 /// name → level index → modifiers.
 ///
-/// A `map` naming any modifier outside Shift, `LevelThree` and Lock records the
-/// level as unreachable rather than approximating it: that is how a `CTRL+ALT`
-/// key's second level stops being mistaken for a shifted character.
+/// A `map` naming any modifier outside Shift and `LevelThree` leaves the level
+/// unreachable rather than approximating it: that is how a `CTRL+ALT` key's
+/// second level stops being mistaken for a shifted character.
+///
+/// A level is routinely mapped more than once, and the entries do not agree. The
+/// standard `ALPHABETIC` type is `map[Shift]= 2` followed by `map[Lock]= 2`, and
+/// `KEYPAD` pairs Shift with NumLock the same way; whichever of those this
+/// backend cannot press must never displace the one it can, in either order, or
+/// the level records as reachable with nothing held and every capital types
+/// lowercase.
 fn parse_types(body: &str) -> HashMap<String, Vec<Option<LevelMods>>> {
     let mut types: HashMap<String, Vec<Option<LevelMods>>> = HashMap::new();
     let mut current: Option<String> = None;
@@ -379,16 +386,17 @@ fn parse_types(body: &str) -> HashMap<String, Vec<Option<LevelMods>>> {
         };
 
         let mut wanted = LevelMods::NONE;
-        let mut reachable = true;
+        // Whether this backend can hold everything the entry names. Caps Lock is
+        // the desktop's own state rather than a key to press — it is handled by
+        // inverting the shift on an alphabetic key — so a level reached only
+        // through it is not a level this backend can reach at all.
+        let mut pressable = true;
         for token in mods.split('+') {
             match token.trim() {
                 "Shift" => wanted.shift = true,
                 "LevelThree" => wanted.level3 = true,
-                // Caps Lock is the desktop's state, not something to press; a
-                // level reached with it is reached without it too once the
-                // alphabetic inversion has been applied.
-                "Lock" | "" => {}
-                _ => reachable = false,
+                "" => {}
+                _ => pressable = false,
             }
         }
 
@@ -396,7 +404,14 @@ fn parse_types(body: &str) -> HashMap<String, Vec<Option<LevelMods>>> {
         if levels.len() < level {
             levels.resize(level, None);
         }
-        levels[level - 1] = reachable.then_some(wanted);
+        let slot = &mut levels[level - 1];
+        let better = match *slot {
+            Some(existing) => wanted.cost() < existing.cost(),
+            None => true,
+        };
+        if pressable && better {
+            *slot = Some(wanted);
+        }
     }
     types
 }
@@ -994,6 +1009,85 @@ xkb_symbols "s" {
 };
 "#;
         assert_eq!(Keymap::parse(both, 0).level3_keycode(), Some(KEY_RIGHTALT));
+    }
+
+    #[test]
+    fn a_lock_mapping_does_not_steal_the_level_from_shift() {
+        // `ALPHABETIC` maps level 2 twice — `map[Shift]= 2` and `map[Lock]= 2` —
+        // and `<AD01>` declares that type. Letting the Lock entry win records the
+        // level as reachable with nothing held, so `Q` presses the `q` key bare
+        // and types a lowercase letter with Caps Lock off *and* on.
+        let upper = us().stroke(keysym_for_char('Q')).unwrap();
+        assert_eq!(upper.keycode, 16, "AD01 is evdev 16, the `q` key");
+        assert_eq!(upper.mods, LevelMods::SHIFT);
+        assert!(upper.alphabetic);
+        assert_eq!(
+            us().stroke(keysym_for_char('q')).unwrap().mods,
+            LevelMods::NONE
+        );
+    }
+
+    #[test]
+    fn an_unpressable_mapping_never_displaces_a_pressable_one() {
+        // Order must not decide it: the same collision arrives Lock-first on some
+        // keymaps, and `KEYPAD` spells it with NumLock, which is not a modifier
+        // this backend recognises at all.
+        let text = r#"
+xkb_keymap {
+xkb_keycodes "e" { <A> = 10; <B> = 11; };
+xkb_types "c" {
+	type "LOCK_FIRST" { modifiers= Shift+Lock; map[Lock]= 2; map[Shift]= 2; };
+	type "KEYPAD" { modifiers= Shift+NumLock; map[Shift]= 2; map[NumLock]= 2; };
+};
+xkb_symbols "s" {
+	key <A> { type= "LOCK_FIRST", symbols[1]= [ 0x61, 0x41 ] };
+	key <B> { type= "KEYPAD", symbols[1]= [ 0x62, 0x42 ] };
+};
+};
+"#;
+        let km = Keymap::parse(text, 0);
+        assert_eq!(
+            km.stroke(keysym_for_char('A')).unwrap().mods,
+            LevelMods::SHIFT
+        );
+        assert_eq!(
+            km.stroke(keysym_for_char('B')).unwrap().mods,
+            LevelMods::SHIFT
+        );
+    }
+
+    #[test]
+    fn the_fourth_level_of_an_alphabetic_type_still_wants_shift() {
+        // `FOUR_LEVEL_ALPHABETIC` maps level 4 as `Shift+LevelThree` and again as
+        // `Lock+LevelThree`. Taking the second reading holds AltGr alone and types
+        // the third level's character instead.
+        let text = r#"
+xkb_keymap {
+xkb_keycodes "e" { <A> = 10; };
+xkb_types "c" {
+	type "FOUR_LEVEL_ALPHABETIC" {
+		modifiers= Shift+Lock+LevelThree;
+		map[Shift]= 2;
+		map[Lock]= 2;
+		map[LevelThree]= 3;
+		map[Shift+LevelThree]= 4;
+		map[Lock+LevelThree]= 4;
+	};
+};
+xkb_symbols "s" {
+	key <A> { type= "FOUR_LEVEL_ALPHABETIC", symbols[1]= [ 0x61, 0x41, 0xe1, 0xc1 ] };
+};
+};
+"#;
+        let km = Keymap::parse(text, 0);
+        assert_eq!(
+            km.stroke(keysym_for_char('Á')).unwrap().mods,
+            LevelMods::SHIFT_LEVEL3
+        );
+        assert_eq!(
+            km.stroke(keysym_for_char('á')).unwrap().mods,
+            LevelMods::LEVEL3
+        );
     }
 
     #[test]

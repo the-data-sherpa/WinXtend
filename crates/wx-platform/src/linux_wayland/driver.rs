@@ -600,8 +600,10 @@ fn on_ei_event(
             transport.device_resumed(&resumed.device);
             None
         }
+        // A pause is reversible and routine, so the device keeps its slot and its
+        // keymap; only sending on it is forbidden until it resumes.
         EiEvent::DevicePaused(paused) => {
-            transport.device_lost(&paused.device);
+            transport.device_paused(&paused.device);
             None
         }
         EiEvent::DeviceRemoved(removed) => {
