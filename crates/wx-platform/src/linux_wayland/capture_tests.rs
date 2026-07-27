@@ -71,6 +71,59 @@ xkb_symbols "pc" {
 };
 "#;
 
+/// `lv3:menu_switch`: the level-3 shift on a key the evdev table already names.
+///
+/// Menu is evdev 127, which [`special_from_evdev`] answers `SpecialKey::Menu` for.
+/// The layout has the better answer and has to win, or every AltGr press opens a
+/// context menu on the peer.
+const LV3_ON_MENU: &str = r#"
+xkb_keymap {
+xkb_keycodes "evdev" {
+	<AE08> = 17;
+	<MENU> = 135;
+};
+xkb_types "complete" {
+	type "FOUR_LEVEL" {
+		modifiers= Shift+LevelThree;
+		map[Shift]= 2;
+		map[LevelThree]= 3;
+		map[Shift+LevelThree]= 4;
+	};
+};
+xkb_symbols "pc" {
+	key <AE08> {
+		type= "FOUR_LEVEL",
+		symbols[1]= [ 7, slash, braceleft, NoSymbol ]
+	};
+	key <MENU> { [ ISO_Level3_Shift ] };
+};
+};
+"#;
+
+/// `ctrl:nocaps`: Control where Caps Lock sits, evdev 58.
+const CTRL_ON_CAPS: &str = r#"
+xkb_keymap {
+xkb_keycodes "evdev" {
+	<CAPS> = 66;
+	<AD01> = 24;
+};
+xkb_types "complete" {
+	type "ALPHABETIC" {
+		modifiers= Shift+Lock;
+		map[Shift]= 2;
+		map[Lock]= 2;
+	};
+};
+xkb_symbols "pc" {
+	key <AD01> {
+		type= "ALPHABETIC",
+		symbols[1]= [ q, Q ]
+	};
+	key <CAPS> { [ Control_L ] };
+};
+};
+"#;
+
 /// The screen the harness pretends to be on: one 1920x1080 zone at the origin.
 const SCREEN: Zone = Zone {
     x: 0,
@@ -848,6 +901,74 @@ fn the_level_three_shift_is_followed_wherever_the_layout_puts_it() {
     assert_eq!(h.texts(9), vec!["{".to_string()]);
     h.state.key(86, false);
     assert_eq!(h.texts(9), vec!["7".to_string()]);
+}
+
+#[test]
+fn a_modifier_the_layout_moved_onto_a_named_key_is_still_that_modifier() {
+    // `lv3:menu_switch`. The evdev table says keycode 127 is Menu, and it is right
+    // about the hardware and wrong about this layout: sending `Menu` would open a
+    // context menu on the peer every time the user reached for AltGr.
+    let h = Harness::with_layout(LV3_ON_MENU);
+    h.activate();
+    let payloads: Vec<KeyPayload> = h
+        .tap(127)
+        .into_iter()
+        .filter_map(|e| match e {
+            CapturedEvent::Key(k) => Some(k.payload),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !payloads.contains(&KeyPayload::Special(SpecialKey::Menu)),
+        "{payloads:?}"
+    );
+    assert_eq!(
+        payloads,
+        vec![
+            KeyPayload::Special(SpecialKey::AltRight),
+            KeyPayload::Special(SpecialKey::AltRight),
+        ]
+    );
+
+    // And it still shifts the level it is the shift for.
+    h.state.key(127, true);
+    h.drain();
+    assert_eq!(h.texts(9), vec!["{".to_string()]);
+}
+
+#[test]
+fn a_caps_lock_the_layout_made_into_a_control_toggles_no_lock() {
+    // `ctrl:nocaps`. Flipping the lock on a key the layout says is Control would
+    // resolve every following letter through the swapped levels, so the user's
+    // text crosses the wire in capitals they never typed.
+    let h = Harness::with_layout(CTRL_ON_CAPS);
+    h.activate();
+    h.state.key(58, true);
+    let pressed = h.drain();
+    let CapturedEvent::Key(k) = &pressed[0] else {
+        panic!("{pressed:?}");
+    };
+    assert_eq!(k.payload, KeyPayload::Special(SpecialKey::CtrlLeft));
+    assert_eq!(h.texts(16), vec!["q".to_string()]);
+}
+
+#[test]
+fn a_key_the_layout_says_nothing_special_about_keeps_its_evdev_meaning() {
+    // The narrower rule must not cost the wider one: Tab and Enter still beat the
+    // control characters the layout would give them, because a receiver injecting
+    // `\t` as text does not move focus.
+    let h = Harness::us();
+    h.activate();
+    for (keycode, expected) in [(15, SpecialKey::Tab), (28, SpecialKey::Enter)] {
+        h.state.key(keycode, true);
+        let pressed = h.drain();
+        let CapturedEvent::Key(k) = &pressed[0] else {
+            panic!("{pressed:?}");
+        };
+        assert_eq!(k.payload, KeyPayload::Special(expected));
+        h.state.key(keycode, false);
+        h.drain();
+    }
 }
 
 #[test]

@@ -228,15 +228,28 @@ impl KeyResolver {
         // A pending accent that cannot compose with this key (a function key, an
         // arrow, an unmapped code) is flushed rather than discarded: the user
         // typed it and losing input silently is worse than an extra character.
-        if self.pending_dead.is_some() && !matches!(payload, KeyPayload::Text(_)) {
+        //
+        // A modifier press is not one of those keys. Nothing cancels or commits a
+        // composition because the user reached for Shift on the way to the letter
+        // that will compose with it — `^` then Shift then `E` is `Ê` on every
+        // desktop, not `^E`. It matters on any layout that reaches an accent
+        // through AltGr, which arrives here as a level-3 shift.
+        let composing = matches!(payload, KeyPayload::Text(_))
+            || matches!(payload, KeyPayload::Special(k) if k.is_modifier());
+        if self.pending_dead.is_some() && !composing {
             if let Some(previous) = self.pending_dead.take() {
                 out.extend(flush_accent(previous));
             }
         }
 
-        let payload = match (self.pending_dead.take(), payload) {
-            (Some(accent), KeyPayload::Text(text)) => KeyPayload::Text(compose(accent, &text)),
-            (_, payload) => payload,
+        let payload = match payload {
+            KeyPayload::Text(text) => match self.pending_dead.take() {
+                Some(accent) => KeyPayload::Text(compose(accent, &text)),
+                None => KeyPayload::Text(text),
+            },
+            // The accent stays pending across a modifier; every other payload has
+            // already flushed it above.
+            payload => payload,
         };
 
         self.record_down(raw, Some(payload.clone()));
@@ -786,14 +799,38 @@ mod tests {
 
     #[test]
     fn a_pending_accent_is_flushed_before_a_key_it_cannot_compose_with() {
-        let mut kb = FakeKeyboard::new();
-        kb.press_dead('~');
-        let out = kb.press_special(SpecialKey::Right, Modifiers::NONE);
-        assert_eq!(texts(&out), vec!["~"]);
-        assert_eq!(
-            out.last().unwrap().payload,
-            KeyPayload::Special(SpecialKey::Right)
-        );
+        // An arrow, a function key, Enter: none of them composes, and the accent
+        // the user typed is emitted rather than dropped, because losing input
+        // silently is worse than an extra character.
+        for key in [SpecialKey::Right, SpecialKey::F5, SpecialKey::Enter] {
+            let mut kb = FakeKeyboard::new();
+            kb.press_dead('~');
+            let out = kb.press_special(key, Modifiers::NONE);
+            assert_eq!(texts(&out), vec!["~"], "{key:?}");
+            assert_eq!(out.last().unwrap().payload, KeyPayload::Special(key));
+            assert!(!kb.resolver.has_pending_composition(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn reaching_for_a_modifier_does_not_break_a_composition_in_progress() {
+        // The AZERTY case: `^`, then Shift, then E is `Ê` on every desktop. Nothing
+        // cancels a composition because the user reached for the shift that types
+        // the letter it is going to compose with — and a level-3 shift arrives here
+        // as `AltRight`, so an accent reached with AltGr would flush itself.
+        for modifier in [SpecialKey::ShiftLeft, SpecialKey::AltRight] {
+            let mut kb = FakeKeyboard::new();
+            kb.press_dead('^');
+            let out = kb.press_special(modifier, Modifiers::NONE);
+            assert!(texts(&out).is_empty(), "{modifier:?} flushed the accent");
+            assert_eq!(out.last().unwrap().payload, KeyPayload::Special(modifier));
+            assert!(kb.resolver.has_pending_composition(), "{modifier:?}");
+            assert_eq!(
+                texts(&kb.press_text("E", Modifiers::SHIFT)),
+                vec!["Ê"],
+                "{modifier:?}"
+            );
+        }
     }
 
     #[test]

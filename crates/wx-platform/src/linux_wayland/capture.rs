@@ -887,13 +887,33 @@ impl Keyboard {
         self.held.clear();
     }
 
+    /// What the layout says this keycode is, where what it says is a modifier.
+    ///
+    /// The one place the layout outranks the evdev table. `lv3:menu_switch` puts
+    /// `ISO_Level3_Shift` on Menu and `ctrl:nocaps` puts `Control_L` on Caps Lock:
+    /// both keycodes are in [`special_from_evdev`], so without this a peer is sent
+    /// a context-menu key on every AltGr press, and a Caps Lock press that also
+    /// flips the level every following letter resolves through.
+    ///
+    /// Asked at the base level, because a modifier's own meaning does not depend on
+    /// which modifiers are already down — and because this is answered before the
+    /// held set is updated.
+    fn layout_modifier(&self, keycode: u32) -> Option<SpecialKey> {
+        self.keymap
+            .keysym(keycode, LevelMods::default(), false)
+            .and_then(special_from_keysym)
+    }
+
     fn raw(&mut self, keycode: u32, action: KeyAction) -> RawKey {
-        let special = special_from_evdev(keycode);
+        let special = self
+            .layout_modifier(keycode)
+            .or_else(|| special_from_evdev(keycode));
         let pressed = action != KeyAction::Release;
 
         // State first, so a modifier's own event carries its bit — which is what
         // the router's held-key bookkeeping expects, and what every other backend
-        // reports.
+        // reports. Read off the *resolved* key, so a Caps Lock the layout has made
+        // into a Control does not toggle a lock nobody pressed.
         match special {
             Some(SpecialKey::CapsLock) if pressed => self.caps = !self.caps,
             Some(SpecialKey::NumLock) if pressed => self.num = !self.num,
@@ -908,9 +928,11 @@ impl Keyboard {
 
         let modifiers = self.modifiers();
 
-        // A semantic key beats whatever the layout would call it: a receiver
+        // A semantic key beats whatever *text* the layout would call it: a receiver
         // injecting `\t` as a character does not move focus, and `\r` does not
-        // press a button. `RawKey` states the same precedence.
+        // press a button. `RawKey` states the same precedence. The narrower rule
+        // above is the exception, and only where the layout itself says the key is
+        // a modifier rather than something to type.
         if let Some(key) = special {
             return RawKey::special(keycode, key, action, modifiers);
         }

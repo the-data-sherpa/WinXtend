@@ -777,11 +777,9 @@ fn parse_keysym(token: &str) -> Option<u32> {
 /// Latin-2 and beyond are thousands of names for layouts the alpha target does not
 /// reach, and the compositor it does reach writes hex anyway.
 fn named_keysym(name: &str) -> Option<u32> {
-    // The one non-character name that matters here: without it, AltGr cannot be
-    // found in a keymap serialised with names, and every level-3 character
-    // becomes untypable.
-    if name == "ISO_Level3_Shift" {
-        return Some(XK_ISO_LEVEL3_SHIFT);
+    // The modifiers, which are not characters and must not be read as one.
+    if let Some(keysym) = modifier_named_keysym(name) {
+        return Some(keysym);
     }
     // A dead key is not a character and must not be read as one. Without these,
     // every accented character on a layout that composes them is unreachable in
@@ -820,6 +818,33 @@ fn dead_named_keysym(name: &str) -> Option<u32> {
         _ => return None,
     };
     super::keys::dead_keysym(combining)
+}
+
+/// The modifier keysyms, by the names a keymap serialised with names writes.
+///
+/// `ISO_Level3_Shift` is the one that has to be here for text to resolve at all:
+/// without it AltGr cannot be found and every level-3 character is untypable. The
+/// rest are here so a layout that *moves* a modifier — `ctrl:nocaps` puts
+/// `Control_L` where Caps Lock sits — is understood rather than leaving that key
+/// meaning nothing, which is how a modifier ends up crossing the wire as a raw
+/// position. The set matches [`super::keys::special_from_keysym`] exactly, and a
+/// test holds the two together.
+fn modifier_named_keysym(name: &str) -> Option<u32> {
+    Some(match name {
+        "ISO_Level3_Shift" => XK_ISO_LEVEL3_SHIFT,
+        "Mode_switch" => 0xff7e,
+        "Shift_L" => 0xffe1,
+        "Shift_R" => 0xffe2,
+        "Control_L" => 0xffe3,
+        "Control_R" => 0xffe4,
+        "Meta_L" => 0xffe7,
+        "Meta_R" => 0xffe8,
+        "Alt_L" => 0xffe9,
+        "Alt_R" => 0xffea,
+        "Super_L" => 0xffeb,
+        "Super_R" => 0xffec,
+        _ => return None,
+    })
 }
 
 /// X11 keysym names for printable Latin-1, in codepoint order.
@@ -1636,5 +1661,34 @@ xkb_symbols "s" {
         assert_eq!(parse_keysym("NoSymbol"), None);
         assert_eq!(parse_keysym(""), None);
         assert_eq!(parse_keysym("Hangul_Jeonja"), None);
+    }
+
+    #[test]
+    fn every_modifier_this_backend_names_is_also_one_it_can_report() {
+        // The two tables are halves of one answer: a name the parser understands
+        // but `keys` cannot turn into a modifier leaves that key meaning nothing,
+        // which is how a remapped Control crosses the wire as a raw position.
+        for name in [
+            "ISO_Level3_Shift",
+            "Mode_switch",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Meta_L",
+            "Meta_R",
+            "Alt_L",
+            "Alt_R",
+            "Super_L",
+            "Super_R",
+        ] {
+            let keysym = parse_keysym(name).unwrap_or_else(|| panic!("{name} is not parsed"));
+            assert!(
+                super::super::keys::special_from_keysym(keysym).is_some(),
+                "{name} parses to {keysym:#x}, which is no modifier"
+            );
+            // And it must not be mistaken for something to type.
+            assert_eq!(super::super::keys::char_for_keysym(keysym), None, "{name}");
+        }
     }
 }
