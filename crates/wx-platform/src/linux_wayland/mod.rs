@@ -57,6 +57,30 @@
 //! of them. Display enumeration needs no portal, so a refusal must not take this
 //! machine's screens out of the layout.
 //!
+//! # What a live session advertises today: nothing
+//!
+//! The portal grants keyboard and pointer access, but this backend still cannot use
+//! it: [`WaylandCapture::start`], [`WaylandInjector::inject`] and
+//! [`WaylandInjector::warp_cursor`] return [`PlatformError::Unsupported`] because the
+//! translation between [`InputEvent`] and `ei` events is a skeleton. So
+//! [`SESSION_CAPABILITIES`] — what a live session contributes to the advertised set —
+//! is empty, and `HAS_DISPLAYS` is the only thing this backend claims. Advertising
+//! injection here would invite peers to push the cursor onto a desktop where the
+//! keyboard goes dead, and would silence `Engine::on_peer_ready`'s warning, which
+//! fires precisely on a peer that has screens and does not advertise injection.
+//!
+//! That constant is the one switch: the injection (#6) and capture (#7) slices set it
+//! to [`SESSION_OWNED_CAPABILITIES`] and everything else here already works.
+//!
+//! The lifecycle it feeds is not theoretical. The full transition — `0` →
+//! `CAPTURE_INPUT | INJECT_INPUT` on the grant, back to `0` on revocation, with the
+//! new set re-advertised to peers each time — was verified by hand on real hardware
+//! earlier in this branch's history, against a revision whose session capabilities
+//! were still populated; see the log at the top of the private `driver` module. The
+//! shipped default no longer produces that transition, but the machinery that
+//! produced it is unchanged, and `HAS_DISPLAYS` exercises the same publish path on
+//! every display hotplug.
+//!
 //! One thing to check before building capture on top of this. Every device this
 //! session offers is an *emulation* device — on GNOME 50 the seat produces "WinXtend
 //! virtual pointer", "WinXtend virtual keyboard" and "WinXtend shared virtual absolute
@@ -102,7 +126,7 @@ mod driver_stub;
 use driver_stub as driver;
 
 pub use display::WaylandDisplays;
-pub use session::{SessionState, SESSION_CAPABILITIES};
+pub use session::{SessionState, SESSION_CAPABILITIES, SESSION_OWNED_CAPABILITIES};
 pub use token::RESTORE_TOKEN_FILE;
 
 use session::SharedSession;
@@ -292,10 +316,12 @@ impl ScreenSaverControl for WaylandSession {
 /// is no error to report when they do.
 ///
 /// Capture and injection are absent here because at startup nobody has consented to
-/// them; they appear in [`PlatformBackend::current_capabilities`] if and when the
-/// portal session goes live. Clipboard and screensaver sync stay unadvertised
-/// because they still return [`PlatformError::Unsupported`]. Claiming any of them
-/// would make a peer hand this node the cursor and then watch it disappear.
+/// them — and, until the event translation lands, they stay absent afterwards too:
+/// [`SESSION_CAPABILITIES`] is empty, so a granted portal session adds nothing to
+/// [`PlatformBackend::current_capabilities`] either. Clipboard and screensaver sync
+/// stay unadvertised because they still return [`PlatformError::Unsupported`].
+/// Claiming any of them would make a peer hand this node the cursor and then watch
+/// it disappear.
 fn capabilities(has_displays: bool) -> Capabilities {
     if has_displays {
         Capabilities::HAS_DISPLAYS
@@ -469,7 +495,7 @@ mod tests {
         };
 
         shared.starting();
-        shared.activate(SESSION_CAPABILITIES);
+        shared.activate(SESSION_OWNED_CAPABILITIES);
         assert_eq!(portal.state(), SessionState::Active);
 
         shared.denied("the user closed the sharing indicator");
@@ -489,10 +515,11 @@ mod tests {
     }
 
     #[test]
-    fn a_live_session_advertises_capture_and_injection() {
+    fn a_live_session_advertises_what_it_was_granted_and_only_that() {
         // The dynamic half of `PlatformInfo`: a Wayland node holds these only while
         // the portal session does, so peers get the real answer rather than the one
-        // that was true at startup.
+        // that was true at startup. Driven with an explicit grant rather than with
+        // the shipped `SESSION_CAPABILITIES`, which is empty today.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
         let shared = SharedSession::new(live.clone(), Capabilities::NONE);
         shared.starting();
@@ -500,10 +527,40 @@ mod tests {
             live.get().is_empty(),
             "nothing is advertised while the dialog is still up"
         );
-        shared.activate(SESSION_CAPABILITIES);
+        shared.activate(SESSION_OWNED_CAPABILITIES);
         assert!(live
             .get()
             .contains(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT));
+    }
+
+    #[test]
+    fn a_granted_session_still_advertises_no_input_until_it_can_perform_any() {
+        // The backend's own rule applied to the granted branch: capture and
+        // injection still return `Unsupported`, so consent alone must not make this
+        // node look drivable to peers. The one line that changes when #6 and #7 land.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = Arc::new(SharedSession::new(live.clone(), Capabilities::NONE));
+        let mut injector = WaylandInjector {
+            portal: Arc::new(PortalSession {
+                _driver: None,
+                shared: Arc::clone(&shared),
+            }),
+        };
+
+        shared.starting();
+        shared.activate(SESSION_CAPABILITIES);
+        assert_eq!(shared.state(), SessionState::Active);
+        assert!(
+            live.get().is_empty(),
+            "a granted session advertises nothing it cannot yet do"
+        );
+        assert!(
+            matches!(
+                injector.inject(&monitor(), &nudge()),
+                Err(PlatformError::Unsupported { .. })
+            ),
+            "the reason the bit is withheld: injection is still a skeleton"
+        );
     }
 
     #[test]
@@ -518,7 +575,7 @@ mod tests {
         let shared = SharedSession::new(live.clone(), base);
 
         shared.starting();
-        shared.activate(SESSION_CAPABILITIES);
+        shared.activate(SESSION_OWNED_CAPABILITIES);
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
 
         shared.denied("the desktop portal revoked the session");

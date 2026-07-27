@@ -54,8 +54,20 @@ impl RestoreTokenStore {
     /// or oversized file means exactly one thing to the caller — start the session
     /// without a token and let the user approve it once more — and making that an
     /// error would tempt a caller into treating a first run as a failure.
+    ///
+    /// The cap bounds the *read*, not just the result. Reading the whole file and
+    /// measuring it afterwards would pull a multi-gigabyte file into memory before
+    /// deciding to throw it away, which is the case [`MAX_TOKEN_LEN`] exists for.
+    /// One byte past the cap is enough to tell an acceptable token from an
+    /// oversized one.
     pub fn load(&self) -> Option<String> {
-        let raw = std::fs::read_to_string(&self.path).ok()?;
+        use std::io::Read;
+
+        let file = std::fs::File::open(&self.path).ok()?;
+        let mut raw = String::new();
+        file.take(MAX_TOKEN_LEN as u64 + 1)
+            .read_to_string(&mut raw)
+            .ok()?;
         // The portal's tokens are opaque, so the only cleanup that is safe is
         // trimming whitespace a text editor may have added.
         let token = raw.trim();
@@ -231,6 +243,20 @@ mod tests {
         assert_eq!(store.load(), None);
 
         std::fs::write(store.path(), "x".repeat(MAX_TOKEN_LEN + 1)).unwrap();
+        assert_eq!(store.load(), None);
+    }
+
+    #[test]
+    fn a_file_far_larger_than_the_cap_is_not_read_into_memory_to_reject_it() {
+        // The guard is on the read, not on the result: a corrupted or hostile file
+        // must not be pulled in whole before being thrown away. Only the outcome is
+        // observable from here, so the size is the part that matters — this passes
+        // either way, and exists so a change back to `read_to_string` is a decision
+        // somebody has to make against the doc on `MAX_TOKEN_LEN` rather than a
+        // silent regression.
+        let dir = TempDir::new("oversized");
+        let store = RestoreTokenStore::in_dir(&dir.0);
+        std::fs::write(store.path(), "x".repeat(MAX_TOKEN_LEN * 64)).unwrap();
         assert_eq!(store.load(), None);
     }
 

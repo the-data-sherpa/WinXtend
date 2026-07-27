@@ -82,12 +82,34 @@ struct Status {
     detail: String,
 }
 
-/// Capabilities a live portal session unlocks.
+/// The bits this session governs, and the only ones it may ever set or clear.
 ///
 /// Both, from one session: the portal's `SelectDevices` grants keyboard and pointer
-/// access that serves capture and injection alike.
-pub const SESSION_CAPABILITIES: Capabilities =
+/// access that serves capture and injection alike. Fixed for the life of the type —
+/// it is the mask [`SharedSession::publish`] applies, so it says what the session
+/// *owns*, not what it currently grants. Anything outside it belongs to somebody
+/// else and survives every transition untouched.
+pub const SESSION_OWNED_CAPABILITIES: Capabilities =
     Capabilities::CAPTURE_INPUT.union(Capabilities::INJECT_INPUT);
+
+/// What a live portal session contributes to the advertised set.
+///
+/// **Empty today, deliberately.** The portal session and its libei transport are
+/// real, but `WaylandCapture::start`, `WaylandInjector::inject` and
+/// `WaylandInjector::warp_cursor` still return `Unsupported`: translating
+/// `InputEvent`s to and from `ei` events is a skeleton. Advertising
+/// [`Capabilities::INJECT_INPUT`] here would tell every peer this machine can be
+/// driven, and the cursor would cross onto a desktop where the keyboard goes dead
+/// with nothing to say why — against the rule this backend is built on that it
+/// advertises nothing it cannot do. It would also silence the one warning built to
+/// surface exactly this state, `Engine::on_peer_ready`'s notice about a peer that
+/// has screens but does not advertise injection.
+///
+/// This is the single switch: when the injection (#6) and capture (#7) slices land
+/// their event translation, they set this to [`SESSION_OWNED_CAPABILITIES`] and the
+/// whole lifecycle above — activation, revocation, re-advertisement — publishes it
+/// with nothing else to change.
+pub const SESSION_CAPABILITIES: Capabilities = Capabilities::NONE;
 
 impl SharedSession {
     /// `base` is what the backend advertises without a session, which this type
@@ -178,17 +200,21 @@ impl SharedSession {
     /// touched.
     ///
     /// Written as a read-modify-write over the published set rather than as
-    /// `base | granted`, because this type owns [`SESSION_CAPABILITIES`] and
+    /// `base | granted`, because this type owns [`SESSION_OWNED_CAPABILITIES`] and
     /// nothing more. `base` is the floor it can never publish less than; a bit
     /// somebody else put on the live set — one that describes the build rather
     /// than the portal — is not this type's to clear, and replacing the whole set
     /// on every transition would silently drop it the moment the session came up
     /// or went away. Only the session's own bits are set here, and `granted` is
     /// masked so a caller cannot smuggle a foreign bit in through it either.
+    ///
+    /// Masked against what the session *owns* rather than against what it currently
+    /// grants, so that the clear on the way out stays real while
+    /// [`SESSION_CAPABILITIES`] is empty.
     fn publish(&self, granted: Capabilities) {
         let held = self.live.get().union(self.base);
         self.live.set(Capabilities(
-            (held.0 & !SESSION_CAPABILITIES.0) | (granted.0 & SESSION_CAPABILITIES.0),
+            (held.0 & !SESSION_OWNED_CAPABILITIES.0) | (granted.0 & SESSION_OWNED_CAPABILITIES.0),
         ));
     }
 
@@ -259,18 +285,42 @@ mod tests {
     }
 
     #[test]
-    fn a_live_session_advertises_capture_and_injection() {
+    fn a_live_session_publishes_exactly_what_it_was_granted() {
+        // Drives the mechanism with an explicit non-empty grant rather than with
+        // whatever `SESSION_CAPABILITIES` happens to be today, so the publish path
+        // stays proven while the shipped contribution is empty — and so the slices
+        // that repopulate it inherit a test that already covers them.
         let (s, live) = session();
         s.starting();
         assert!(
             live.get().is_empty(),
             "nothing is granted until Start returns"
         );
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
         assert_eq!(s.state(), SessionState::Active);
         assert!(live.get().contains(Capabilities::CAPTURE_INPUT));
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
         assert!(s.error().is_none());
+    }
+
+    #[test]
+    fn a_live_session_contributes_nothing_while_event_translation_is_a_skeleton() {
+        // Today's truth, and the reason it is true: capture and injection still
+        // return `Unsupported`, so a granted session must not tell peers this
+        // machine can be driven. The session is `Active` all the same — the portal
+        // really did grant it — which is what the lifecycle above is for.
+        assert!(SESSION_CAPABILITIES.is_empty());
+
+        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+        s.starting();
+        s.activate(SESSION_CAPABILITIES);
+        assert_eq!(s.state(), SessionState::Active);
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+        assert!(!live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(
+            live.get().contains(Capabilities::HAS_DISPLAYS),
+            "the screens are real whatever the portal answered"
+        );
     }
 
     #[test]
@@ -280,7 +330,7 @@ mod tests {
         // UI turns into an actionable prompt.
         let (s, live) = session();
         s.starting();
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
         s.denied("the desktop portal revoked the session");
 
         assert_eq!(s.state(), SessionState::Denied);
@@ -300,7 +350,7 @@ mod tests {
         s.denied("dialog dismissed");
 
         s.starting();
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
 
         assert_eq!(s.state(), SessionState::Denied);
         assert!(
@@ -315,7 +365,7 @@ mod tests {
         // a permission problem they need to act on.
         let (s, _) = session();
         s.starting();
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
         s.stopped();
         s.denied("revoked");
         assert_eq!(s.state(), SessionState::Stopped);
@@ -379,9 +429,9 @@ mod tests {
         s.starting();
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
 
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
-        assert!(live.get().contains(SESSION_CAPABILITIES));
+        assert!(live.get().contains(SESSION_OWNED_CAPABILITIES));
 
         s.denied("the desktop portal revoked the session");
         assert!(
@@ -403,9 +453,9 @@ mod tests {
         live.set(Capabilities::HAS_DISPLAYS.union(Capabilities::CAPABILITY_UPDATES));
 
         s.starting();
-        s.activate(SESSION_CAPABILITIES);
+        s.activate(SESSION_OWNED_CAPABILITIES);
         assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));
-        assert!(live.get().contains(SESSION_CAPABILITIES));
+        assert!(live.get().contains(SESSION_OWNED_CAPABILITIES));
 
         s.denied("the desktop portal revoked the session");
         assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));

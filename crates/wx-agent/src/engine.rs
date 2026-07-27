@@ -1413,6 +1413,7 @@ impl Engine {
                 // A peer whose portal session was revoked, most likely. Recording it
                 // keeps the peer's own account of what it can do current, which is
                 // what `publish_peer` below shows the user.
+                let before = self.state.peer_capabilities(node);
                 if let Some(info) = self.peer_info_mut(node) {
                     if info.capabilities == capabilities {
                         return;
@@ -1421,6 +1422,29 @@ impl Engine {
                     info.capabilities = capabilities;
                 }
                 self.publish_peer(node);
+
+                if strands_the_cursor(before, capabilities, self.router.owner() == node) {
+                    // The remote half of the rescue `sync_capabilities` performs for
+                    // this machine when it loses `CAPTURE_INPUT`. The cursor is on a
+                    // machine that has just said it can no longer inject, so every
+                    // pointer and key frame from here on lands nowhere, and anything
+                    // it is holding down would stay down. Bringing the cursor home is
+                    // the same action, and it is also what tells the peer to let go.
+                    let name = self.peer_label(node);
+                    tracing::warn!(
+                        peer = %node,
+                        machine = %name,
+                        capabilities = %capabilities.describe(),
+                        "the machine holding the cursor can no longer receive input; taking it back"
+                    );
+                    let local = self.local;
+                    let actions = reclaim_cursor(&mut self.router, local, |n| n == local);
+                    self.execute(actions, Origin::Remote).await;
+                    self.notice(
+                        ipc::NoticeLevel::Warning,
+                        format!("{name} can no longer receive input; control returned here"),
+                    );
+                }
             }
             ControlMsg::MonitorsChanged { monitors } => {
                 if let Some(info) = self.peer_info_mut(node) {
@@ -2740,6 +2764,33 @@ fn with_displays(base: Capabilities, has_displays: bool) -> Capabilities {
     }
 }
 
+/// Whether a peer's new capability set leaves the cursor somewhere it cannot be
+/// used.
+///
+/// The mirror of the losing edge in [`Engine::sync_capabilities`]: that one reclaims
+/// when *this* machine loses `CAPTURE_INPUT` and so can no longer steer the cursor
+/// home; this one reclaims when the machine *holding* the cursor announces it can no
+/// longer take input. Both leave the user with a cursor that answers to nothing, and
+/// on the remote side the only recovery without this is a hotkey they may not know
+/// exists.
+///
+/// Keyed on the losing edge rather than on the absence of the bit, so that a peer
+/// which never advertised injection — a headless forwarder, say — does not have the
+/// cursor snatched off it every time it re-advertises anything else.
+///
+/// Pure, and separate from the engine, so both answers can be tested: losing
+/// injection while holding the cursor has to reclaim, and any other change has to
+/// leave the cursor where it is.
+fn strands_the_cursor(
+    before: Capabilities,
+    now: Capabilities,
+    peer_holds_the_cursor: bool,
+) -> bool {
+    peer_holds_the_cursor
+        && before.contains(Capabilities::INJECT_INPUT)
+        && !now.contains(Capabilities::INJECT_INPUT)
+}
+
 /// Whether an optional feature may be attempted against a machine, refusing out
 /// loud when it may not.
 ///
@@ -3283,6 +3334,48 @@ mod tests {
         assert!(logs.contains("CLIPBOARD_TEXT"), "{logs}");
         // And says so: an empty set has to read as a claim, not as a missing field.
         assert!(logs.contains("nothing"), "{logs}");
+    }
+
+    #[test]
+    fn a_peer_that_loses_injection_while_holding_the_cursor_gives_it_back() {
+        // A Wayland peer whose portal session is revoked announces the loss over
+        // `CapabilitiesChanged` while the cursor is sitting on it. Every frame sent
+        // from here on would land on a machine that cannot inject it, and the user
+        // would be left with a cursor that answers to nothing.
+        let has_input = Capabilities::HAS_DISPLAYS | Capabilities::INJECT_INPUT;
+        let revoked = Capabilities::HAS_DISPLAYS;
+        assert!(strands_the_cursor(has_input, revoked, true));
+
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(2, 0));
+        let actions = reclaim_cursor(&mut router, node(1), |n| n == node(1));
+        assert!(router.owns_cursor());
+        assert!(!actions.is_empty(), "the cursor was left on the peer");
+    }
+
+    #[test]
+    fn an_unrelated_capability_change_leaves_the_cursor_where_it_is() {
+        // The guard on the rescue: it has to fire on the losing edge of injection and
+        // on nothing else, or the cursor would be yanked home whenever a peer plugged
+        // in a monitor or its clipboard support landed.
+        let base = Capabilities::HAS_DISPLAYS | Capabilities::INJECT_INPUT;
+        assert!(!strands_the_cursor(
+            base,
+            base | Capabilities::CLIPBOARD_TEXT,
+            true
+        ));
+        assert!(!strands_the_cursor(base, Capabilities::INJECT_INPUT, true));
+        // Losing it while the cursor is elsewhere is somebody else's problem.
+        assert!(!strands_the_cursor(base, Capabilities::HAS_DISPLAYS, false));
+        // And a peer that never advertised injection has nothing to lose, so a
+        // re-advertisement must not read as a revocation.
+        let never = Capabilities::HAS_DISPLAYS;
+        assert!(!strands_the_cursor(never, never, true));
+        assert!(!strands_the_cursor(
+            never,
+            never | Capabilities::CLIPBOARD_TEXT,
+            true
+        ));
     }
 
     #[test]

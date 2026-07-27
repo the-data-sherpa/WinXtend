@@ -98,7 +98,7 @@ impl Capabilities {
     ///
     /// Ordered by bit so that two machines' capability lists can be read side by
     /// side without re-sorting them in the reader's head.
-    const NAMED: [(Self, &'static str); 11] = [
+    const NAMED: [(Self, &'static str); 12] = [
         (Self::CAPTURE_INPUT, "CAPTURE_INPUT"),
         (Self::INJECT_INPUT, "INJECT_INPUT"),
         (Self::HAS_DISPLAYS, "HAS_DISPLAYS"),
@@ -110,6 +110,7 @@ impl Capabilities {
         (Self::SCREENSAVER_SYNC, "SCREENSAVER_SYNC"),
         (Self::PRIVILEGED_INJECT, "PRIVILEGED_INJECT"),
         (Self::RELAY, "RELAY"),
+        (Self::CAPABILITY_UPDATES, "CAPABILITY_UPDATES"),
     ];
 
     /// Names of the bits that are set.
@@ -211,22 +212,29 @@ pub fn check_version(peer_version: u16) -> VersionCheck {
 mod tests {
     use super::*;
 
+    /// Every bit this build defines, in one place.
+    ///
+    /// One list rather than one per test: the bug this guards against is a bit
+    /// added to the impl and forgotten somewhere else, and a second copy of the
+    /// list is just another place to forget it.
+    const ALL: [Capabilities; 12] = [
+        Capabilities::CAPTURE_INPUT,
+        Capabilities::INJECT_INPUT,
+        Capabilities::HAS_DISPLAYS,
+        Capabilities::CLIPBOARD_TEXT,
+        Capabilities::CLIPBOARD_IMAGE,
+        Capabilities::FILE_TRANSFER,
+        Capabilities::VIDEO_SOURCE,
+        Capabilities::VIDEO_SINK,
+        Capabilities::SCREENSAVER_SYNC,
+        Capabilities::PRIVILEGED_INJECT,
+        Capabilities::RELAY,
+        Capabilities::CAPABILITY_UPDATES,
+    ];
+
     #[test]
     fn capability_bits_are_distinct() {
-        let all = [
-            Capabilities::CAPTURE_INPUT,
-            Capabilities::INJECT_INPUT,
-            Capabilities::HAS_DISPLAYS,
-            Capabilities::CLIPBOARD_TEXT,
-            Capabilities::CLIPBOARD_IMAGE,
-            Capabilities::FILE_TRANSFER,
-            Capabilities::VIDEO_SOURCE,
-            Capabilities::VIDEO_SINK,
-            Capabilities::SCREENSAVER_SYNC,
-            Capabilities::PRIVILEGED_INJECT,
-            Capabilities::RELAY,
-            Capabilities::CAPABILITY_UPDATES,
-        ];
+        let all = ALL;
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
                 if i != j {
@@ -267,21 +275,10 @@ mod tests {
     #[test]
     fn every_known_bit_has_a_name() {
         // A bit added without a name would be reported as "bit N" in a refusal,
-        // which tells the user nothing about what their machine cannot do.
-        let all = [
-            Capabilities::CAPTURE_INPUT,
-            Capabilities::INJECT_INPUT,
-            Capabilities::HAS_DISPLAYS,
-            Capabilities::CLIPBOARD_TEXT,
-            Capabilities::CLIPBOARD_IMAGE,
-            Capabilities::FILE_TRANSFER,
-            Capabilities::VIDEO_SOURCE,
-            Capabilities::VIDEO_SINK,
-            Capabilities::SCREENSAVER_SYNC,
-            Capabilities::PRIVILEGED_INJECT,
-            Capabilities::RELAY,
-        ];
-        for cap in all {
+        // which tells the user nothing about what their machine cannot do. The
+        // fallback is there for a *peer* built against a newer protocol, so a bit
+        // this build advertises itself reaching it is always a mistake.
+        for cap in ALL {
             let names = cap.names();
             assert_eq!(names.len(), 1, "{cap:?} named {names:?}");
             assert!(!names[0].starts_with("bit "), "{cap:?} has no name");

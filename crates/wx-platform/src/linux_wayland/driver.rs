@@ -33,7 +33,7 @@
 //! that clicks its own consent dialog tests nothing. It is verified by hand instead.
 //!
 //! Verified by hand on Ubuntu 26.04 / GNOME Shell 50 / `xdg-desktop-portal` 1.21.1
-//! against this revision:
+//! against this branch:
 //!
 //! * the full `CreateSession` → `SelectDevices` (`KEYBOARD|POINTER`, `persist_mode=2`)
 //!   → `Start` → `ConnectToEIS` sequence;
@@ -42,10 +42,17 @@
 //! * the restore token persisted `0o600`, 36 bytes; a relaunch reporting
 //!   `restoring=true` and granted ~3.6 ms later with no dialog;
 //! * capabilities moving `0` → `3` and being re-advertised, with the gaining edge
-//!   starting capture;
+//!   starting capture, and back to `0` when the session ended;
 //! * a dismissed dialog reported as `PermissionDenied` with exactly one `Start`
 //!   attempt and no retry, leaving no token file behind;
 //! * clean teardown of a live session in ~260 ms.
+//!
+//! The capability transition in that list was observed against a revision whose
+//! [`super::session::SESSION_CAPABILITIES`] still held `CAPTURE_INPUT | INJECT_INPUT`.
+//! It is empty now — see the note there and in [`super`] for why — so the shipped
+//! build no longer produces the `0` → `3` → `0` movement. The publish path that
+//! produced it is unchanged and is the same one `HAS_DISPLAYS` goes through, and the
+//! evidence stands for the day #6 and #7 set the constant back.
 //!
 //! Not proven, deliberately: portal-*initiated* revocation through the shell's
 //! screen-sharing indicator. An external `Close` on the session object is refused with
@@ -208,6 +215,16 @@ async fn run(
     );
     // The whole set, not a subset of it: a grant missing either device type never
     // reaches here, because `accept_granted` refuses it.
+    //
+    // `SESSION_CAPABILITIES` is empty today, so this publishes nothing and the node
+    // goes on advertising only its displays. That is deliberate, not an oversight:
+    // the portal really did grant keyboard and pointer, but `WaylandCapture::start`
+    // and `WaylandInjector::inject` still return `Unsupported` because the
+    // translation between `InputEvent` and `ei` events is not written yet, and a node
+    // that claimed injection here would have peers push the cursor onto a desktop
+    // where nothing they type arrives. Repopulating the constant is the whole of what
+    // #6 and #7 have to change on this path — the state machine, the activation and
+    // revocation edges and the re-advertisement above them are already right.
     shared.activate(SESSION_CAPABILITIES);
 
     let reason = pump(live.connection, live.events, &live.session, stop).await;
@@ -260,7 +277,7 @@ impl Aborted {
             // Nothing before `SelectDevices` carries the restore token, so whatever
             // went wrong here cannot be the token's fault, and no dialog has been
             // shown yet so nobody has refused anything.
-            failure: Failure::from_ashpd(e, TokenSent::No, UserAsked::No),
+            failure: Failure::from_ashpd(e, TokenSent::No, Stage::BeforeConsent),
             session: None,
         }
     }
@@ -326,9 +343,9 @@ async fn negotiate(
                 .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await
-        .map_err(|e| Failure::from_ashpd(e, sent, UserAsked::No))?
+        .map_err(|e| Failure::from_ashpd(e, sent, Stage::BeforeConsent))?
         .response()
-        .map_err(|e| Failure::from_ashpd(e, sent, UserAsked::No))?;
+        .map_err(|e| Failure::from_ashpd(e, sent, Stage::BeforeConsent))?;
 
     tracing::info!(
         restoring = restore_token.is_some(),
@@ -341,9 +358,9 @@ async fn negotiate(
     let started = proxy
         .start(session, None, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::Yes))?
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::Consent))?
         .response()
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::Yes))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::Consent))?;
 
     // Checked before the token is persisted: a token is the portal's promise to
     // grant the same thing again without asking, and persisting one for a grant
@@ -373,7 +390,7 @@ async fn negotiate(
     let fd = proxy
         .connect_to_eis(session, Default::default())
         .await
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, UserAsked::No))?;
+        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::AfterGrant))?;
 
     let context = ei::Context::new(UnixStream::from(fd))
         .map_err(|e| Failure::broken(format!("opening the libei transport: {e}")))?;
@@ -392,12 +409,19 @@ async fn negotiate(
 
 /// Refuse a grant that is missing either device type.
 ///
-/// [`wx_proto::Capabilities`] has no per-device granularity: the session either
-/// advertises `CAPTURE_INPUT | INJECT_INPUT` or it advertises nothing. So a grant
-/// covering only the pointer has no honest way to be published — claiming keyboard
-/// capability the session cannot deliver would have peers route keystrokes here
-/// that silently go nowhere, against the rule this backend is built on that it
-/// advertises nothing it cannot do.
+/// [`wx_proto::Capabilities`] has no per-device granularity: the session owns
+/// `CAPTURE_INPUT | INJECT_INPUT` together or it owns neither. So a grant covering
+/// only the pointer has no honest way to be published — claiming keyboard capability
+/// the session cannot deliver would have peers route keystrokes here that silently
+/// go nowhere, against the rule this backend is built on that it advertises nothing
+/// it cannot do.
+///
+/// Checked even though [`super::session::SESSION_CAPABILITIES`] is empty and a half
+/// grant would therefore publish nothing either way. What is at stake is the restore
+/// token: this refusal runs before the token is persisted, and a token recorded for a
+/// half grant would restore that same half grant silently on every later launch, with
+/// no dialog left to correct it — including after #6 and #7 make the difference
+/// visible.
 ///
 /// Reported as a refusal rather than a fault because that is what it is: the portal
 /// answered the request, and what came back is less than was asked for. The message
@@ -613,22 +637,28 @@ enum TokenSent {
     No,
 }
 
-/// Whether the portal call that failed is the one the user answers.
+/// Where in the sequence the failing call sits, relative to the consent dialog.
 ///
-/// Only `Start` puts a dialog on screen, so only `Start` can fail because somebody
-/// said no. `CreateSession` and `SelectDevices` complete before any consent UI
-/// exists at all, and a refusal from either is the desktop declining to set the
-/// session up — a locked or not-yet-ready session is the usual reason, and both
-/// pass on their own.
+/// Three positions, not two, because "the user was not asked" is true on either side
+/// of the dialog and the two sides mean opposite things. Only `Start` puts a dialog on
+/// screen, so only `Start` can fail because somebody said no; `CreateSession` and
+/// `SelectDevices` run before any consent UI exists; and `ConnectToEIS` runs after a
+/// grant has already come back. Collapsing the last into the first is how a transport
+/// fault on a session the user had just approved came to be reported as a desktop that
+/// would not create the session at all.
 ///
 /// Kept structural rather than matched on the portal's message text, and it is what
 /// stops a screen that happened to be locked at startup from being recorded as a
 /// refusal — terminal, never retried, and reported to the user as a permission they
 /// have to go and grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UserAsked {
-    Yes,
-    No,
+enum Stage {
+    /// `CreateSession`, `SelectDevices`: no dialog exists yet.
+    BeforeConsent,
+    /// `Start`: the call the user answers.
+    Consent,
+    /// `ConnectToEIS` and after: the session is granted and the user has consented.
+    AfterGrant,
 }
 
 impl Failure {
@@ -690,8 +720,8 @@ impl Failure {
     /// portal here". Reporting a headless machine as a permission problem sends the
     /// user hunting for a dialog that was never shown; reporting a refusal as
     /// unsupported hides the one thing they could act on. Which of the two a refused
-    /// request is depends on whether anybody had been asked yet — see [`UserAsked`].
-    fn from_ashpd(e: ashpd::Error, sent: TokenSent, asked: UserAsked) -> Self {
+    /// request is depends on where in the sequence it failed — see [`Stage`].
+    fn from_ashpd(e: ashpd::Error, sent: TokenSent, stage: Stage) -> Self {
         use ashpd::desktop::ResponseError;
         use ashpd::PortalError;
 
@@ -703,9 +733,18 @@ impl Failure {
             // permission problem would leave a daemon that started at a lock screen
             // input-dead for its whole run, with a message sending the user to a
             // settings panel where there is nothing to fix.
-            ashpd::Error::Response(_) if asked == UserAsked::No => Self::broken(
+            ashpd::Error::Response(_) if stage == Stage::BeforeConsent => Self::broken(
                 "the desktop refused to create a remote desktop session; the session is \
                  most likely locked or not ready yet",
+            ),
+            // Also nobody's decision, but the opposite situation: the user consented,
+            // the portal granted, and the call that failed is the one that hands over
+            // the libei socket. The pre-consent wording above would be wrong in both
+            // of its clauses here and would send the user to check a lock screen for
+            // what is a transport fault on a session they had just approved.
+            ashpd::Error::Response(_) if stage == Stage::AfterGrant => Self::broken(
+                "the desktop portal granted the remote desktop session but would not \
+                 hand over the input transport",
             ),
             ashpd::Error::Response(ResponseError::Cancelled) => {
                 Self::refused("the desktop portal consent dialog was dismissed")
@@ -830,7 +869,7 @@ mod tests {
     use crate::error::PlatformError;
     use crate::LiveCapabilities;
 
-    use super::super::session::SessionState;
+    use super::super::session::{SessionState, SESSION_OWNED_CAPABILITIES};
 
     /// What the portal answers with when a request's arguments are not acceptable.
     const INVALID_ARGUMENT: &str = "org.freedesktop.portal.Error.InvalidArgument";
@@ -892,7 +931,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "Restore token is not a valid UUID string"),
             TokenSent::Yes,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         assert!(matches!(failure.kind, FailureKind::Broken));
         assert!(
@@ -924,7 +963,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "Restore token is not a valid UUID string"),
             TokenSent::Yes,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         forget_rejected_token(&store, had_token, &failure);
 
@@ -943,7 +982,7 @@ mod tests {
         let no_token = Failure::from_ashpd(
             method_error(INVALID_ARGUMENT, "some other argument"),
             TokenSent::No,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         assert!(matches!(no_token.kind, FailureKind::Broken));
         assert!(!no_token.discards_token);
@@ -951,7 +990,7 @@ mod tests {
         let other_error = Failure::from_ashpd(
             method_error("org.freedesktop.DBus.Error.NoReply", "timed out"),
             TokenSent::Yes,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         assert!(matches!(other_error.kind, FailureKind::Broken));
         assert!(!other_error.discards_token);
@@ -962,7 +1001,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             ashpd::Error::Response(ResponseError::Cancelled),
             TokenSent::Yes,
-            UserAsked::Yes,
+            Stage::Consent,
         );
         assert!(matches!(failure.kind, FailureKind::Denied));
         assert!(
@@ -985,7 +1024,7 @@ mod tests {
         // already said no, so a later attempt to start cannot take the refusal back.
         assert!(session.state().is_terminal());
         session.starting();
-        session.activate(SESSION_CAPABILITIES);
+        session.activate(SESSION_OWNED_CAPABILITIES);
         assert_eq!(session.state(), SessionState::Denied);
         assert!(live.get().is_empty());
     }
@@ -1004,7 +1043,7 @@ mod tests {
                 ashpd::Error::Response(ResponseError::Cancelled),
             ),
         ] {
-            let failure = Failure::from_ashpd(error, TokenSent::Yes, UserAsked::No);
+            let failure = Failure::from_ashpd(error, TokenSent::Yes, Stage::BeforeConsent);
             assert!(matches!(failure.kind, FailureKind::Broken), "{label}");
             assert!(
                 !failure.discards_token,
@@ -1028,6 +1067,40 @@ mod tests {
                 "nobody refused anything here: {label}"
             );
         }
+    }
+
+    #[test]
+    fn a_transport_failure_after_the_grant_does_not_read_as_a_locked_screen() {
+        // `ConnectToEIS` runs after `Start` came back granted, so neither clause of
+        // the pre-consent message is true here: the user consented and the session
+        // exists. Sharing that wording sent somebody looking at a lock screen for a
+        // fault in handing over the libei socket.
+        let failure = Failure::from_ashpd(
+            ashpd::Error::Response(ResponseError::Other),
+            TokenSent::No,
+            Stage::AfterGrant,
+        );
+        assert!(matches!(failure.kind, FailureKind::Broken));
+        assert!(!failure.discards_token, "the grant itself was fine");
+        assert!(
+            !failure.detail.contains("locked"),
+            "the session is not locked; it was granted: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("granted") && failure.detail.contains("transport"),
+            "the message must say the grant succeeded and the transport did not: {}",
+            failure.detail
+        );
+
+        let (session, _) = session();
+        session.starting();
+        failure.report(&session);
+        assert_eq!(session.state(), SessionState::Failed);
+        assert!(!matches!(
+            session.error(),
+            Some(PlatformError::PermissionDenied(_))
+        ));
     }
 
     #[test]
@@ -1089,7 +1162,7 @@ mod tests {
                 "no such service",
             ),
             TokenSent::Yes,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
         assert!(!failure.discards_token);
@@ -1099,7 +1172,7 @@ mod tests {
         let failure = Failure::from_ashpd(
             ashpd::Error::Zbus(ashpd::zbus::Error::Address("no bus here".to_string())),
             TokenSent::Yes,
-            UserAsked::No,
+            Stage::BeforeConsent,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
         assert!(!failure.discards_token);
