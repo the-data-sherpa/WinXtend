@@ -2070,6 +2070,7 @@ impl Engine {
                     &self.config,
                     &self.router.layout().to_layout(),
                     &self.platform.info,
+                    self.advertised_by(self.local),
                     AGENT_VERSION,
                     self.state.uptime(Instant::now()),
                 )),

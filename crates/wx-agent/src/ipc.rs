@@ -75,7 +75,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use wx_proto::{Layout, Monitor, MonitorId, NodeId, Rect};
+use wx_proto::{Capabilities, Layout, Monitor, MonitorId, NodeId, Rect};
 
 use crate::config::{Config, SavedLayout};
 use crate::state::{AgentState, ConnStatus, PeerState};
@@ -622,12 +622,20 @@ pub use crate::config::SavedPlacement as PlacementSpec;
 /// A free function taking the pieces rather than a method on the engine, so that
 /// the shape of the UI's view of the world is defined here next to the types it
 /// uses, and can be tested without an engine.
+///
+/// `advertised` is what this machine has actually told the mesh it can do, and has
+/// to be passed in rather than read from `platform`: `PlatformInfo::capabilities`
+/// is fixed when the backend is built, while the advertisement is recomputed on
+/// every display hotplug. The snapshot's `capabilities` is the row a user reads
+/// when a feature is not happening between two machines, so it has to be the set
+/// peers were given, not the one this process booted with.
 #[allow(clippy::too_many_arguments)]
 pub fn status_snapshot(
     state: &AgentState,
     config: &Config,
     layout: &Layout,
     platform: &wx_platform::PlatformInfo,
+    advertised: Capabilities,
     agent_version: &str,
     uptime: Duration,
 ) -> StatusSnapshot {
@@ -655,7 +663,7 @@ pub fn status_snapshot(
         uptime_secs: uptime.as_secs(),
         platform: platform_name(platform.platform).to_string(),
         display_server: display_server_name(platform.display_server).to_string(),
-        capabilities: platform.capabilities.0,
+        capabilities: advertised.0,
         discovery: config.network.discovery,
         autostart: config.node.autostart,
         monitors: state.local_monitors().iter().map(MonitorSpec::of).collect(),
@@ -1361,6 +1369,43 @@ mod tests {
             } => assert_eq!(*status, snapshot),
             other => panic!("wrong message back: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_status_snapshot_reports_what_the_mesh_was_told() {
+        // A laptop that boots with the lid shut advertises no displays and gains
+        // the bit when a monitor is plugged in. The platform's own info still says
+        // what it said at construction, so a snapshot built from that would show a
+        // set no peer was ever given — and the local row is the one a user reads
+        // first when a feature is not happening between two machines.
+        let at_boot = wx_platform::PlatformInfo {
+            platform: wx_proto::Platform::Linux,
+            display_server: wx_proto::DisplayServer::Wayland,
+            capabilities: Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT,
+        };
+        let advertised = at_boot.capabilities | Capabilities::HAS_DISPLAYS;
+        let state = AgentState::new(
+            NodeId([1u8; 32]),
+            "laptop".into(),
+            std::time::Instant::now(),
+        );
+        let snapshot = status_snapshot(
+            &state,
+            &Config::default(),
+            &Layout::default(),
+            &at_boot,
+            advertised,
+            "0.1.0",
+            Duration::from_secs(7),
+        );
+        assert_eq!(snapshot.capabilities, advertised.0);
+        assert_ne!(
+            snapshot.capabilities, at_boot.capabilities.0,
+            "the snapshot reported the construction-time set, not the advertised one"
+        );
+        // The rest of the platform row still comes from the platform.
+        assert_eq!(snapshot.platform, "linux");
+        assert_eq!(snapshot.display_server, "wayland");
     }
 
     #[test]
