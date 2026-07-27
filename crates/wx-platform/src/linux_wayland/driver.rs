@@ -48,10 +48,10 @@
 //! * clean teardown of a live session in ~260 ms.
 //!
 //! The capability transition in that list was observed against a revision whose
-//! [`super::session::SESSION_CAPABILITIES`] held `CAPTURE_INPUT | INJECT_INPUT`. It
-//! holds `INJECT_INPUT` alone today — injection is implemented and capture is not —
-//! so the shipped build moves `0` → `2` → `0` rather than `0` → `3` → `0`. The
-//! publish path is unchanged.
+//! session published `CAPTURE_INPUT | INJECT_INPUT` together. This session publishes
+//! [`super::session::REMOTE_DESKTOP_CAPABILITIES`] alone — capture comes from the
+//! `InputCapture` portal and has a session of its own — so this half moves
+//! `0` → `2` → `0`. The publish path is unchanged.
 //!
 //! Also verified by hand on the same desktop while #6 landed, through the real
 //! `WaylandInjector` rather than a scratch client — see the note at the top of
@@ -90,7 +90,7 @@ use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::oneshot;
 
 use super::inject::Transport;
-use super::session::{SharedSession, SESSION_CAPABILITIES};
+use super::session::{SharedSession, REMOTE_DESKTOP_CAPABILITIES};
 use super::token::RestoreTokenStore;
 
 /// Name this client reports to the compositor.
@@ -232,17 +232,16 @@ async fn run(
     // The whole set, not a subset of it: a grant missing either device type never
     // reaches here, because `accept_granted` refuses it.
     //
-    // `SESSION_CAPABILITIES` holds injection and not capture, because that is what
-    // this backend can do: a peer may drive this machine, and must not sit waiting
-    // for input from it. Repopulating the other half is the whole of what #7 has to
-    // change on this path — the state machine, the activation and revocation edges
-    // and the re-advertisement above them are already right.
+    // `REMOTE_DESKTOP_CAPABILITIES` holds injection and not capture: this portal's
+    // devices are emulation devices, so what this session buys is the ability to be
+    // driven. Capture is `org.freedesktop.portal.InputCapture` and has a session of
+    // its own; see the note at the top of `super::capture`.
     //
     // The transport is published *before* the capabilities, so no peer can be told
     // this machine accepts input during the window where the injector would still
     // find nothing to send on.
     transport.attach(live.connection.clone());
-    shared.activate(SESSION_CAPABILITIES);
+    shared.activate(REMOTE_DESKTOP_CAPABILITIES);
 
     let reason = pump(live.connection, live.events, &live.session, transport, stop).await;
     // Before the state change, so an injector that races teardown finds the
@@ -879,7 +878,7 @@ impl Failure {
 /// This is the headless and CI case, and it has to come out as
 /// [`crate::PlatformError::Unsupported`] with a clear message rather than as a
 /// permission problem nobody can fix.
-fn no_session_bus(e: &ashpd::zbus::Error) -> bool {
+pub(super) fn no_session_bus(e: &ashpd::zbus::Error) -> bool {
     match e {
         // No `DBUS_SESSION_BUS_ADDRESS`, or one pointing at a socket that is not
         // there: exactly what a CI container and a bare tty look like.
@@ -929,7 +928,7 @@ mod tests {
     use crate::error::PlatformError;
     use crate::LiveCapabilities;
 
-    use super::super::session::{SessionState, SESSION_OWNED_CAPABILITIES};
+    use super::super::session::{SessionState, PORTAL_REMOTE_DESKTOP, REMOTE_DESKTOP_CAPABILITIES};
 
     /// What the portal answers with when a request's arguments are not acceptable.
     const INVALID_ARGUMENT: &str = "org.freedesktop.portal.Error.InvalidArgument";
@@ -961,7 +960,15 @@ mod tests {
     /// these tests see the session's own contribution and nothing else.
     fn session() -> (SharedSession, LiveCapabilities) {
         let live = LiveCapabilities::fixed(Capabilities::NONE);
-        (SharedSession::new(live.clone(), Capabilities::NONE), live)
+        (
+            SharedSession::new(
+                live.clone(),
+                Capabilities::NONE,
+                REMOTE_DESKTOP_CAPABILITIES,
+                PORTAL_REMOTE_DESKTOP,
+            ),
+            live,
+        )
     }
 
     /// A scratch config directory, cleaned up on drop, so this needs no
@@ -1084,7 +1091,7 @@ mod tests {
         // already said no, so a later attempt to start cannot take the refusal back.
         assert!(session.state().is_terminal());
         session.starting();
-        session.activate(SESSION_OWNED_CAPABILITIES);
+        session.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert_eq!(session.state(), SessionState::Denied);
         assert!(live.get().is_empty());
     }

@@ -59,11 +59,15 @@ impl DisplayEnumerator for X11Displays {
 /// at once. A grab is exclusive, so it must be released the instant control comes
 /// back or the local desktop appears frozen.
 ///
-/// Key resolution: build an `xkb_state` from `xkb_x11_keymap_new_from_device`, feed
-/// it with `xkb_state_update_key`, and read text with `xkb_state_key_get_utf8`.
-/// That already applies the user's layout, which is the
-/// [`crate::keyres::RawKey::text`] contract; mask out Control before asking, the
-/// same as every other backend.
+/// Key resolution has already been solved, in pure Rust, by the Wayland slice: an
+/// X11 keycode is an evdev keycode plus eight, which is exactly what
+/// [`crate::linux_wayland::keymap::Keymap::keysym`] takes, and
+/// `xkb_x11_get_keymap_as_string` hands over the same text
+/// [`crate::linux_wayland::keymap::Keymap::parse`] reads. Reuse it rather than
+/// linking `libxkbcommon`: the reason not to is at the top of that module, and it
+/// applies here for the same reason — no CI runner should need a C toolchain to
+/// build this crate. Mask out Control before asking, the same as every other
+/// backend; that is the [`crate::keyres::RawKey::text`] contract.
 pub struct X11Capture;
 
 impl InputCapture for X11Capture {

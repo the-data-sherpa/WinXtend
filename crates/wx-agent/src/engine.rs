@@ -48,11 +48,11 @@ use wx_net::{
     Advertiser, Browser, DiscoveryEvent, Endpoint, Established, Events, Identity, PairingSession,
     Pin, Session, SessionEvent, SessionSetup, TrustStore,
 };
-use wx_platform::{CapturedEvent, PlatformBackend};
+use wx_platform::{CapturedEvent, PlatformBackend, PlatformError};
 use wx_proto::{
     Capabilities, ControlMsg, GlobalMonitorId, InputEvent, InputFrame, KeyAction, KeyPayload,
-    Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos, PointerEvent, RejectReason, Reliability,
-    SequenceGate,
+    Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos, Point, PointerEvent, RejectReason,
+    Reliability, SequenceGate,
 };
 
 use crate::config::{Config, HotkeyAction};
@@ -91,6 +91,90 @@ const CURSOR_PROBE: Duration = Duration::from_millis(500);
 /// wireless stall does not cost the user their cursor, short enough that a dead
 /// machine is noticed before they reach for the power button.
 const CURSOR_LIVENESS: Duration = Duration::from_millis(2_000);
+
+/// How far the real pointer must be from where the virtual cursor believes it is
+/// before [`Engine::resync_local_cursor`] believes the pointer instead.
+///
+/// A fraction of a monitor, so it is resolution-independent — normalised
+/// coordinates are what the rest of the layout speaks. A tenth is well beyond any
+/// single motion event on an ordinary mouse and well below the width of a screen,
+/// which is the gap this exists to close: on Wayland the pointer can be anywhere
+/// by the time capture activates.
+///
+/// The cost of being wrong in each direction is not symmetric, and that is why
+/// this is a threshold rather than a correction on every event. Too high and the
+/// cursor takes a moment to catch up. Too low and the virtual cursor is welded to
+/// the physical one, which cannot leave its own screen — so the cursor could never
+/// cross onto a peer at all.
+const RESYNC_THRESHOLD: f64 = 0.1;
+
+/// Distance between two normalised positions, as a fraction of a monitor.
+fn norm_distance(a: NormPos, b: NormPos) -> f64 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+/// Believe the capture backend about where the real pointer is, when it says
+/// something no delta could explain.
+///
+/// This is what [`CapturedEvent::PointerMotion`]'s `position` is for. The virtual
+/// cursor is integrated from deltas, so anything that moves the real pointer
+/// without producing one — a focus-follows-mouse warp, a game recentring, or a
+/// backend that only sees input some of the time — leaves the two out of step, and
+/// the drift never corrects itself.
+///
+/// It matters most on Wayland, where the portal delivers input only while it has
+/// capture *activated*: the user moves their pointer freely in between and the
+/// router sees none of it, so without this the first crossing after any ordinary
+/// mouse use would need a whole screen's width of travel.
+///
+/// Deliberately only on a discontinuity, and only while the cursor is on this
+/// machine. Correcting on every event would weld the virtual cursor to the
+/// physical one, and a physical pointer cannot leave the edge of its own screen —
+/// so the motion that is *supposed* to carry the cursor onto a peer would be
+/// undone before it ever crossed.
+///
+/// Returns whether anything was corrected. Any actions the warp produces are
+/// discarded on purpose: this fixes what the router *believes*, and moving
+/// anything is the job of the events that follow.
+fn resync_cursor(
+    router: &mut InputRouter,
+    local: NodeId,
+    monitors: &[Monitor],
+    position: Point,
+) -> bool {
+    if !router.owns_cursor() {
+        return false;
+    }
+    let Some(monitor) = monitors
+        .iter()
+        .find(|m| m.local_bounds.contains(position))
+        .cloned()
+    else {
+        // A position on no monitor this machine has. Nothing to resynchronise
+        // against, and guessing would be worse than the drift.
+        return false;
+    };
+    let target = GlobalMonitorId::new(local, monitor.id);
+    let believed = router.cursor().norm_position(router.layout());
+    let landing = monitor.local_bounds.normalize(position);
+    if target == router.cursor().monitor() && norm_distance(believed, landing) < RESYNC_THRESHOLD {
+        return false;
+    }
+    match router.warp(target, landing) {
+        Ok(_) => {
+            tracing::trace!(
+                x = position.x,
+                y = position.y,
+                "the real pointer moved without us seeing it; resynchronising"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "could not resynchronise the cursor");
+            false
+        }
+    }
+}
 
 /// How long a pairing exchange may sit waiting for someone to type a PIN.
 ///
@@ -827,6 +911,14 @@ impl Engine {
         });
         match self.platform.capture.start(sink) {
             Ok(()) => tracing::info!("input capture running"),
+            // Already running, so there is nothing to report and nothing to fix.
+            // Both callers are legitimate and can both fire on one launch: the one
+            // at boot, and the one on the edge where `CAPTURE_INPUT` is granted. A
+            // backend that accepted the sink while its permission dialog was still
+            // on screen has already done the work by the time the grant lands.
+            Err(PlatformError::AlreadyCapturing) => {
+                tracing::debug!("input capture was already running")
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "input capture unavailable; this node can be driven but cannot drive");
                 self.notice(
@@ -996,7 +1088,10 @@ impl Engine {
 
     async fn on_captured(&mut self, event: CapturedEvent) {
         let actions = match event {
-            CapturedEvent::PointerMotion { dx, dy, .. } => self.router.motion(dx, dy),
+            CapturedEvent::PointerMotion { dx, dy, position } => {
+                self.resync_local_cursor(position);
+                self.router.motion(dx, dy)
+            }
             CapturedEvent::Button { button, pressed } => {
                 self.router.route(InputEvent::Pointer(PointerEvent::Button {
                     button,
@@ -1152,6 +1247,17 @@ impl Engine {
         if let Err(e) = self.platform.injector.inject(&monitor, event) {
             tracing::debug!(error = %e, "injection failed");
         }
+    }
+
+    /// Believe the capture backend about where the real pointer is, when it says
+    /// something no delta could explain. See [`resync_cursor`].
+    fn resync_local_cursor(&mut self, position: Point) {
+        resync_cursor(
+            &mut self.router,
+            self.local,
+            self.state.local_monitors(),
+            position,
+        );
     }
 
     /// Push the suppression flag to the capture backend when, and only when, it
@@ -1966,9 +2072,11 @@ impl Engine {
         if gained.contains(Capabilities::CAPTURE_INPUT) {
             // The permission this machine needs to capture may arrive long after
             // startup — a Wayland consent dialog is answered whenever the user gets
-            // to it — and the one `start_capture` at boot has already failed by then.
-            // No guard is needed: this only fires on a bit that was absent and is now
-            // present, which is a fresh grant rather than a retry against a refusal.
+            // to it — and the one `start_capture` at boot may well have failed by
+            // then. No guard is needed: this only fires on a bit that was absent and
+            // is now present, which is a fresh grant rather than a retry against a
+            // refusal, and a backend that took the sink at boot answers with
+            // `AlreadyCapturing`, which `start_capture` treats as the no-op it is.
             tracing::info!("this machine can capture input again; starting capture");
             self.start_capture();
         }
@@ -2952,6 +3060,118 @@ mod tests {
     fn router_with_cursor_on(layout: &GlobalLayout, monitor: GlobalMonitorId) -> InputRouter {
         let cursor = VirtualCursor::at(layout, monitor, NormPos::new(0.5, 0.5)).unwrap();
         InputRouter::new(node(1), layout.clone(), cursor)
+    }
+
+    #[test]
+    fn a_cursor_that_moved_without_us_seeing_it_is_resynchronised() {
+        // The Wayland case in one test: the portal only delivers input while it
+        // has capture activated, so the user moves their pointer freely in
+        // between. Without this the virtual cursor stays where the last crossing
+        // left it, and the next one needs a whole screen's width of travel.
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(1, 0));
+        let monitors = [mon(0, 0, 1920)];
+
+        assert!(resync_cursor(
+            &mut router,
+            node(1),
+            &monitors,
+            Point::new(1900.0, 540.0)
+        ));
+        assert!(router.owns_cursor());
+        // At the right-hand edge now, so the next nudge crosses.
+        let actions = router.motion(64.0, 0.0);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, RouteAction::Handoff { .. })),
+            "the cursor did not reach the peer: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_motion_does_not_drag_the_cursor_back_off_the_edge() {
+        // The regression this threshold exists to prevent, and it would be a bad
+        // one: on a backend that reports a real position for every event, the
+        // physical pointer is pinned at the edge of its own screen while the user
+        // pushes onward. Correcting to it on every event would undo exactly the
+        // motion that is supposed to carry the cursor onto a peer.
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(1, 0));
+        let monitors = [mon(0, 0, 1920)];
+
+        // Physically at the edge and staying there; the virtual cursor arrives to
+        // meet it and then must be allowed to keep going.
+        for _ in 0..40 {
+            resync_cursor(&mut router, node(1), &monitors, Point::new(1919.0, 540.0));
+            let actions = router.motion(64.0, 0.0);
+            if actions
+                .iter()
+                .any(|a| matches!(a, RouteAction::Handoff { .. }))
+            {
+                return;
+            }
+        }
+        panic!("the cursor never crossed onto the peer");
+    }
+
+    #[test]
+    fn a_position_the_cursor_is_already_at_changes_nothing() {
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(1, 0));
+        let monitors = [mon(0, 0, 1920)];
+        assert!(!resync_cursor(
+            &mut router,
+            node(1),
+            &monitors,
+            Point::new(960.0, 540.0)
+        ));
+    }
+
+    #[test]
+    fn a_peer_holding_the_cursor_is_not_dragged_home_by_a_local_pointer() {
+        // While a peer owns the cursor the local pointer is parked and suppressed,
+        // and where it happens to be says nothing about where the user is
+        // pointing. Resynchronising to it would snatch the cursor back.
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(2, 0));
+        let monitors = [mon(0, 0, 1920)];
+        assert!(!resync_cursor(
+            &mut router,
+            node(1),
+            &monitors,
+            Point::new(10.0, 10.0)
+        ));
+        assert_eq!(router.owner(), node(2));
+    }
+
+    #[test]
+    fn a_position_on_no_local_monitor_is_ignored_rather_than_guessed_at() {
+        // A stale monitor list, or a compositor reporting a zone this machine no
+        // longer has. Warping to the nearest screen would teleport the pointer.
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(1, 0));
+        let monitors = [mon(0, 0, 1920)];
+        assert!(!resync_cursor(
+            &mut router,
+            node(1),
+            &monitors,
+            Point::new(9000.0, 9000.0)
+        ));
+    }
+
+    #[test]
+    fn resynchronising_moves_nothing_by_itself() {
+        // It corrects a belief. A local injection here would fight the compositor,
+        // which on Wayland has the real pointer pinned at a barrier while capture
+        // is active.
+        let layout = two_machines();
+        let mut router = router_with_cursor_on(&layout, gid(1, 0));
+        let monitors = [mon(0, 0, 1920)];
+        resync_cursor(&mut router, node(1), &monitors, Point::new(100.0, 100.0));
+        // Nothing was handed over and nothing was released: same node, same owner.
+        assert!(router.owns_cursor());
+        assert!(router.held_keys().is_empty());
     }
 
     #[test]

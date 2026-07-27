@@ -109,10 +109,30 @@ pub struct Stroke {
     pub alphabetic: bool,
 }
 
-/// One keyboard layout, indexed the way injection needs to ask about it.
+/// What one key produces, indexed the way *capture* needs to ask about it.
+///
+/// The mirror image of [`Stroke`]. Injection asks "which key produces this
+/// character"; capture is handed a keycode by libei and has to ask "what does this
+/// key produce right now", which needs the levels in the other order and the
+/// modifiers that reach each of them.
+#[derive(Debug, Clone, Default)]
+struct KeyLevels {
+    /// Keysym per zero-based level, `None` where the level is empty.
+    keysyms: Vec<Option<u32>>,
+    /// Modifiers that reach each level, `None` where the level needs something
+    /// this backend does not track as a level shift (a Control or Alt level is a
+    /// VT switch, never a character).
+    mods: Vec<Option<LevelMods>>,
+    /// Whether Caps Lock swaps this key's first two levels.
+    alphabetic: bool,
+}
+
+/// One keyboard layout, indexed both ways: by keysym for injection, and by
+/// keycode for capture.
 #[derive(Debug, Default)]
 pub struct Keymap {
     strokes: HashMap<u32, Stroke>,
+    keys: HashMap<u32, KeyLevels>,
     level3_keycode: Option<u32>,
 }
 
@@ -130,6 +150,7 @@ impl Keymap {
         let symbols = section(text, "xkb_symbols").unwrap_or("");
 
         let mut strokes: HashMap<u32, Stroke> = HashMap::new();
+        let mut keys: HashMap<u32, KeyLevels> = HashMap::new();
         let mut level3_keycode = None;
 
         for key in parse_keys(symbols) {
@@ -159,6 +180,19 @@ impl Keymap {
             let type_name = key.type_for(group);
             let alphabetic = is_alphabetic(&levels, type_name);
 
+            // The capture index, built in the same pass so the two directions
+            // cannot disagree about a key's levels or its type.
+            keys.insert(
+                keycode,
+                KeyLevels {
+                    keysyms: levels.clone(),
+                    mods: (0..levels.len())
+                        .map(|index| level_mods(&types, type_name, index, levels.len()))
+                        .collect(),
+                    alphabetic,
+                },
+            );
+
             for (index, keysym) in levels.iter().enumerate() {
                 let Some(keysym) = *keysym else { continue };
                 let Some(mods) = level_mods(&types, type_name, index, levels.len()) else {
@@ -185,6 +219,7 @@ impl Keymap {
 
         Self {
             strokes,
+            keys,
             level3_keycode,
         }
     }
@@ -192,6 +227,67 @@ impl Keymap {
     /// How to type `keysym`, or `None` if this layout cannot.
     pub fn stroke(&self, keysym: u32) -> Option<Stroke> {
         self.strokes.get(&keysym).copied()
+    }
+
+    /// What pressing `keycode` produces with `held` down, or `None` if this
+    /// layout gives the key no meaning.
+    ///
+    /// The capture direction, and the one that keeps WinXtend's central promise:
+    /// the keysym comes from *this* machine's layout, so a Norwegian `å` is
+    /// resolved here and crosses the wire as text rather than as the keycode a US
+    /// desktop would read as `[`.
+    ///
+    /// `caps_locked` is applied the way the compositor would: on an alphabetic key
+    /// it swaps the first two levels, so `a` with Caps Lock on really does resolve
+    /// to `A`. It is deliberately *not* folded into `held` by the caller, because
+    /// Caps Lock does nothing at all to a key the layout did not mark alphabetic —
+    /// pressing `1` with it on still gives `1`.
+    ///
+    /// Only Shift and Level 3 are consulted. Ctrl, Alt and Super are masked out on
+    /// purpose and [`crate::keyres::RawKey::text`] says why: `Ctrl+C` has to cross
+    /// the wire as the character `c` plus a Ctrl bit, because the control character
+    /// `0x03` is not something any receiver can inject.
+    pub fn keysym(&self, keycode: u32, held: LevelMods, caps_locked: bool) -> Option<u32> {
+        let key = self.keys.get(&keycode)?;
+        let mut wanted = held;
+        if key.alphabetic && caps_locked {
+            wanted.shift = !wanted.shift;
+        }
+        // Exact first, then give up one modifier at a time. A key with two levels
+        // pressed with AltGr held has no level-3 entry to find, and the compositor
+        // would produce its shifted or base symbol rather than nothing; reporting
+        // `None` there would drop a keystroke the user really typed.
+        for candidate in [
+            wanted,
+            LevelMods {
+                shift: wanted.shift,
+                level3: false,
+            },
+            LevelMods {
+                shift: false,
+                level3: wanted.level3,
+            },
+            LevelMods::NONE,
+        ] {
+            if let Some(keysym) = key
+                .mods
+                .iter()
+                .position(|m| *m == Some(candidate))
+                .and_then(|index| key.keysyms.get(index).copied().flatten())
+            {
+                return Some(keysym);
+            }
+        }
+        None
+    }
+
+    /// Whether `keycode` is the layout's level-3 shift.
+    ///
+    /// Asked of every captured modifier press, so that right Alt on a Norwegian
+    /// layout reports [`wx_proto::Modifiers::ALT_GR`] and right Alt on a layout
+    /// that has no level 3 does not.
+    pub fn is_level3(&self, keycode: u32) -> bool {
+        self.level3_keycode == Some(keycode)
     }
 
     /// The first keysym in `candidates` this layout can produce.
@@ -374,14 +470,7 @@ fn parse_types(body: &str) -> HashMap<String, Vec<Option<LevelMods>>> {
         let Some((mods, level)) = statement[at + 4..].split_once(']') else {
             continue;
         };
-        let Some(level) = level
-            .trim()
-            .trim_start_matches('=')
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|l| *l >= 1)
-        else {
+        let Some(level) = parse_level(level) else {
             continue;
         };
 
@@ -414,6 +503,19 @@ fn parse_types(body: &str) -> HashMap<String, Vec<Option<LevelMods>>> {
         }
     }
     types
+}
+
+/// The level a `map[...]=` entry names.
+///
+/// Both spellings occur and mean the same thing: mutter serialises `= 2`, and
+/// `xkbcomp -xkb` writes `= Level2`. Only understanding the bare number leaves
+/// every shifted level on a keymap in the other spelling unreachable — which does
+/// not fail, it silently types the base character, so `A` comes out as `a` and
+/// `Å` as `å`.
+fn parse_level(token: &str) -> Option<usize> {
+    let token = token.trim().trim_start_matches('=').trim();
+    let digits = token.strip_prefix("Level").unwrap_or(token);
+    digits.parse::<usize>().ok().filter(|l| *l >= 1)
 }
 
 /// One `key <NAME> { ... }` entry, as far as this module cares.
@@ -681,10 +783,43 @@ fn named_keysym(name: &str) -> Option<u32> {
     if name == "ISO_Level3_Shift" {
         return Some(XK_ISO_LEVEL3_SHIFT);
     }
+    // A dead key is not a character and must not be read as one. Without these,
+    // every accented character on a layout that composes them is unreachable in
+    // both directions: injection cannot find the accent to press, and capture
+    // reports the key as producing nothing at all.
+    if let Some(keysym) = dead_named_keysym(name) {
+        return Some(keysym);
+    }
     LATIN1_NAMES
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, c)| *c as u32)
+}
+
+/// `dead_acute` and its neighbours, by name.
+///
+/// The same block [`super::keys::dead_keysym`] and [`super::keys::dead_accent`]
+/// cover by number, spelled the way a keymap serialised with names writes them.
+/// Kept here rather than there because it is a *parsing* concern — what a token in
+/// a keymap file means — and the round trip through all three is a test.
+fn dead_named_keysym(name: &str) -> Option<u32> {
+    let combining = match name {
+        "dead_grave" => '\u{0300}',
+        "dead_acute" => '\u{0301}',
+        "dead_circumflex" => '\u{0302}',
+        "dead_tilde" => '\u{0303}',
+        "dead_macron" => '\u{0304}',
+        "dead_breve" => '\u{0306}',
+        "dead_abovedot" => '\u{0307}',
+        "dead_diaeresis" => '\u{0308}',
+        "dead_abovering" => '\u{030a}',
+        "dead_doubleacute" => '\u{030b}',
+        "dead_caron" => '\u{030c}',
+        "dead_cedilla" => '\u{0327}',
+        "dead_ogonek" => '\u{0328}',
+        _ => return None,
+    };
+    super::keys::dead_keysym(combining)
 }
 
 /// X11 keysym names for printable Latin-1, in codepoint order.
@@ -833,14 +968,14 @@ fn quoted(s: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::linux_wayland::keys::{char_keysyms, keysym_for_char};
+    use crate::linux_wayland::keys::{char_keysyms, keysym_for_char, KEY_LEFTALT};
 
     /// The shape mutter actually sends, cut down to the keys under test: numeric
     /// keysyms, tab-indented, `symbols[N]=` for multi-group keys and a bare list
     /// for single-group ones.
-    pub(super) const US: &str = r#"
+    pub(crate) const US: &str = r#"
 xkb_keymap {
 xkb_keycodes "evdev" {
 	minimum = 8;
@@ -914,7 +1049,7 @@ xkb_symbols "pc_us" {
 
     /// A Norwegian layout in the other spelling: named keysyms, bare symbol lists,
     /// which is what a `libxkbcommon`-serialised keymap looks like.
-    pub(super) const NO: &str = r#"
+    pub(crate) const NO: &str = r#"
 xkb_keymap {
 xkb_keycodes "evdev" {
 	<AD11> = 34;
@@ -947,6 +1082,56 @@ xkb_symbols "pc_no" {
 		symbols[1]= [ 8, parenleft, bracketleft, NoSymbol ]
 	};
 	key <RALT> { [ ISO_Level3_Shift ] };
+};
+};
+"#;
+
+    /// The third spelling, and the one that broke: `xkbcomp -xkb` writes levels as
+    /// `Level2` rather than `2`, and dead keys by name. Taken from the output of
+    /// `setxkbmap -layout no -print | xkbcomp -xkb`, cut down to the keys under
+    /// test.
+    ///
+    /// Both differences fail *silently* rather than loudly. An unparsed `Level2`
+    /// leaves every shifted level unreachable, so `Å` types as `å`; an unparsed
+    /// `dead_diaeresis` leaves the key producing nothing at all, so every accented
+    /// character on the layout becomes untypable in both directions.
+    pub(crate) const NO_NAMED: &str = r#"
+xkb_keymap {
+xkb_keycodes "evdev+aliases(qwerty)" {
+    <AD01> = 24;
+    <AD11> = 34;
+    <AD12> = 35;
+    <RALT> = 108;
+};
+xkb_types "complete" {
+    type "ALPHABETIC" {
+        modifiers= Shift+Lock;
+        map[Shift]= Level2;
+        map[Lock]= Level2;
+    };
+    type "FOUR_LEVEL" {
+        modifiers= Shift+LevelThree;
+        map[Shift]= Level2;
+        map[LevelThree]= Level3;
+        map[Shift+LevelThree]= Level4;
+    };
+};
+xkb_symbols "pc_no" {
+    key <AD01> {
+        type[Group1]= "ALPHABETIC",
+        symbols[Group1]= [ q, Q ]
+    };
+    key <AD11> {
+        type[Group1]= "ALPHABETIC",
+        symbols[Group1]= [ aring, Aring ]
+    };
+    key <AD12> {
+        type[Group1]= "FOUR_LEVEL",
+        symbols[Group1]= [ dead_diaeresis, dead_circumflex, dead_tilde, dead_caron ]
+    };
+    key <RALT> {
+        symbols[Group1]= [ ISO_Level3_Shift ]
+    };
 };
 };
 "#;
@@ -1247,6 +1432,197 @@ xkb_symbols "s" {
             let _ = Keymap::parse(&US[..end], 0);
         }
     }
+
+    // -- the capture direction -------------------------------------------
+    //
+    // The same fixtures read the other way round. Every assertion below is the
+    // inverse of one above it, which is the point: a keymap that injects `å`
+    // correctly and captures it as `[` would keep the cross-layout promise in one
+    // direction only, and the failure would look like the peer's bug.
+
+    #[test]
+    fn a_captured_keycode_resolves_through_this_machines_layout() {
+        // The whole guarantee in one assertion. Keycode 34 is `[` on a US layout
+        // and `å` on a Norwegian one; the answer must come from the keymap the
+        // compositor handed over, not from the number.
+        assert_eq!(
+            us().keysym(26, LevelMods::NONE, false),
+            Some(keysym_for_char('['))
+        );
+        assert_eq!(
+            Keymap::parse(NO, 0).keysym(26, LevelMods::NONE, false),
+            Some(keysym_for_char('å'))
+        );
+    }
+
+    #[test]
+    fn shift_and_altgr_select_the_level_they_reach() {
+        let km = us();
+        // <AC01>, FOUR_LEVEL: a A á Á.
+        for (mods, expected) in [
+            (LevelMods::NONE, 'a'),
+            (LevelMods::SHIFT, 'A'),
+            (LevelMods::LEVEL3, 'á'),
+            (LevelMods::SHIFT_LEVEL3, 'Á'),
+        ] {
+            assert_eq!(
+                km.keysym(30, mods, false),
+                Some(keysym_for_char(expected)),
+                "{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_lock_flips_a_letter_and_leaves_a_digit_alone() {
+        let km = us();
+        // <AD01> is ALPHABETIC, so Caps Lock reaches it...
+        assert_eq!(km.keysym(16, LevelMods::NONE, true), Some('Q' as u32));
+        assert_eq!(km.keysym(16, LevelMods::SHIFT, true), Some('q' as u32));
+        // ...and <AE01> is not, so it does not. Folding Caps Lock into the shift
+        // for every key would turn `1` into `!` whenever the light was on.
+        assert_eq!(km.keysym(2, LevelMods::NONE, true), Some('1' as u32));
+        assert_eq!(km.keysym(2, LevelMods::SHIFT, true), Some('!' as u32));
+    }
+
+    #[test]
+    fn a_modifier_this_backend_will_not_reach_does_not_swallow_the_keystroke() {
+        // <AE01> has two levels and no level-3 entry. AltGr+1 still produces `1`
+        // on the desktop, so reporting nothing would drop a key the user pressed.
+        let km = us();
+        assert_eq!(km.keysym(2, LevelMods::LEVEL3, false), Some('1' as u32));
+        assert_eq!(
+            km.keysym(2, LevelMods::SHIFT_LEVEL3, false),
+            Some('!' as u32)
+        );
+    }
+
+    #[test]
+    fn a_level_that_needs_control_is_not_mistaken_for_a_shifted_character() {
+        // <FK01> declares CTRL+ALT, whose second level is a VT switch. Its base
+        // level is still F1 and must resolve; the second must never be reachable
+        // by Shift, or holding Shift on F1 would report an XF86 keysym.
+        let km = us();
+        assert_eq!(km.keysym(59, LevelMods::NONE, false), Some(0xffbe));
+        assert_eq!(km.keysym(59, LevelMods::SHIFT, false), Some(0xffbe));
+    }
+
+    #[test]
+    fn a_keycode_the_layout_says_nothing_about_resolves_to_nothing() {
+        // Not a panic and not a guess: the caller reports it as an unmapped key
+        // and lets `KeyResolver` forward the raw code.
+        assert_eq!(us().keysym(200, LevelMods::NONE, false), None);
+    }
+
+    #[test]
+    fn the_layout_names_its_own_altgr_key() {
+        // Right Alt is `ISO_Level3_Shift` on both fixtures, so capture reports
+        // ALT_GR for it. A layout that put level 3 elsewhere must not have right
+        // Alt claim the bit.
+        assert!(us().is_level3(KEY_RIGHTALT));
+        assert!(Keymap::parse(NO, 0).is_level3(KEY_RIGHTALT));
+        assert!(!us().is_level3(KEY_LEFTALT));
+    }
+
+    #[test]
+    fn a_dead_key_on_the_layout_is_reported_as_the_keysym_it_is() {
+        // The Norwegian `¨` key: level 1 is `diaeresis`, which is where dead-key
+        // composition starts. Capture has to hand the keysym up unchanged so
+        // `keys::dead_accent` can classify it.
+        let km = Keymap::parse(NO, 0);
+        assert_eq!(km.keysym(27, LevelMods::NONE, false), Some(0xa8));
+    }
+
+    #[test]
+    fn what_injection_types_is_what_capture_reads_back() {
+        // Round trip through both indexes on both fixtures. A disagreement here is
+        // exactly the bug that makes a character survive one hop and not the
+        // return journey.
+        for (name, text) in [("us", US), ("no", NO)] {
+            let km = Keymap::parse(text, 0);
+            for c in ['a', 'A', '[', 'å', 'ø', 'æ', '7', '/'] {
+                let Some(stroke) = km.stroke_for_any(char_keysyms(c)) else {
+                    continue;
+                };
+                let back = km.keysym(stroke.keycode, stroke.mods, false);
+                assert_eq!(
+                    back.and_then(crate::linux_wayland::keys::char_for_keysym),
+                    Some(c),
+                    "{name}: {c:?} typed on {} {:?} read back as {back:?}",
+                    stroke.keycode,
+                    stroke.mods
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_level_named_rather_than_numbered_is_still_a_level() {
+        // Measured against a real `xkbcomp -xkb` keymap: without this every
+        // shifted character silently types its base instead, so `Å` comes out as
+        // `å` and the failure looks like a stuck Shift rather than a parse gap.
+        assert_eq!(parse_level("Level2"), Some(2));
+        assert_eq!(parse_level("= Level4"), Some(4));
+        assert_eq!(parse_level(" 2 "), Some(2));
+        assert_eq!(parse_level("Level0"), None);
+        assert_eq!(parse_level("Any"), None);
+
+        let km = Keymap::parse(NO_NAMED, 0);
+        assert_eq!(km.keysym(26, LevelMods::NONE, false), Some(0xe5)); // å
+        assert_eq!(km.keysym(26, LevelMods::SHIFT, false), Some(0xc5)); // Å
+        assert_eq!(km.stroke(0xc5).unwrap().mods, LevelMods::SHIFT);
+    }
+
+    #[test]
+    fn a_dead_key_written_by_name_is_a_dead_key_and_not_nothing() {
+        // The other half of the same real keymap. A `dead_diaeresis` nobody
+        // recognises leaves the key with no symbol at any level, which makes every
+        // accented character on the layout untypable in both directions — and
+        // reports the keystroke as unmapped rather than as the start of a
+        // composition.
+        let km = Keymap::parse(NO_NAMED, 0);
+        assert_eq!(km.keysym(27, LevelMods::NONE, false), Some(0xfe57));
+        assert_eq!(km.keysym(27, LevelMods::SHIFT, false), Some(0xfe52));
+        assert_eq!(km.keysym(27, LevelMods::LEVEL3, false), Some(0xfe53));
+        // And injection can find them, which is what makes a character the
+        // receiver has no single key for reachable at all.
+        assert_eq!(km.stroke(0xfe57).unwrap().keycode, 27);
+    }
+
+    #[test]
+    fn every_dead_key_this_backend_composes_is_readable_by_name() {
+        // Three tables have to agree: the name a keymap writes, the keysym it
+        // stands for, and the combining mark `keyres` composes with. A gap in any
+        // of them is a character that works on one layout and not another.
+        for combining in [
+            '\u{0300}', '\u{0301}', '\u{0302}', '\u{0303}', '\u{0304}', '\u{0306}', '\u{0307}',
+            '\u{0308}', '\u{030a}', '\u{030b}', '\u{030c}', '\u{0327}', '\u{0328}',
+        ] {
+            let keysym = crate::linux_wayland::keys::dead_keysym(combining).unwrap();
+            let name = DEAD_NAMES
+                .iter()
+                .find(|n| dead_named_keysym(n) == Some(keysym))
+                .unwrap_or_else(|| panic!("{combining:?} has no name"));
+            assert_eq!(parse_keysym(name), Some(keysym), "{name}");
+        }
+    }
+
+    /// Every `dead_*` spelling this module claims to read.
+    const DEAD_NAMES: &[&str] = &[
+        "dead_grave",
+        "dead_acute",
+        "dead_circumflex",
+        "dead_tilde",
+        "dead_macron",
+        "dead_breve",
+        "dead_abovedot",
+        "dead_diaeresis",
+        "dead_abovering",
+        "dead_doubleacute",
+        "dead_caron",
+        "dead_cedilla",
+        "dead_ogonek",
+    ];
 
     #[test]
     fn keysym_tokens_cover_the_spellings_a_keymap_uses() {

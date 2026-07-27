@@ -3,8 +3,8 @@
 //! | Concern | Mechanism | State |
 //! |---|---|---|
 //! | Displays | `wl_output` + `xdg_output` | implemented, see [`display`] |
-//! | Capture | libei via the RemoteDesktop portal | session and transport implemented; event translation a skeleton |
-//! | Injection | libei | implemented, see [`inject`] and [`keymap`] |
+//! | Capture | libei via the InputCapture portal | implemented, see [`capture`] |
+//! | Injection | libei via the RemoteDesktop portal | implemented, see [`inject`] and [`keymap`] |
 //! | Clipboard | `wl_data_device` / `zwlr_data_control_manager_v1` | skeleton |
 //! | Locking | systemd-logind | skeleton |
 //!
@@ -29,8 +29,8 @@
 //! # The shape Wayland forces on this
 //!
 //! Wayland deliberately has no API for "read all input" or "synthesise input" —
-//! that was the point of the redesign. Both go through
-//! `xdg-desktop-portal`'s `RemoteDesktop` interface, which means:
+//! that was the point of the redesign. Both go through `xdg-desktop-portal`, which
+//! means:
 //!
 //! * A **user consent dialog** the first time the agent runs, and a session handle
 //!   that the portal can revoke at any moment. Refusal and revocation are both final
@@ -44,61 +44,60 @@
 //! * **libei** (`ei_*`) as the actual transport for events once the portal has
 //!   handed over a file descriptor. The private `driver` module owns that.
 //!
-//! # One session, both directions
+//! # Two portals, two sessions — and why that is not the mistake it looks like
 //!
-//! `SelectDevices` asks for keyboard and pointer together and the portal answers with
-//! a single session covering both, so [`WaylandCapture`] and [`WaylandInjector`] share
-//! one [`PortalSession`]. Creating one each would mean two consent dialogs, two
-//! sessions to revoke, and two chances to leak one.
+//! Injection and capture are **different interfaces**, not two halves of one.
 //!
-//! Session handles are per D-Bus connection, which is the other reason the connection
-//! is owned in one place: reconnecting invalidates every handle taken out over the old
-//! one.
+//! `RemoteDesktop` is the portal for *driving* a desktop. Every device its session
+//! offers is an emulation device — on GNOME 50 the seat produces "WinXtend virtual
+//! pointer", "WinXtend virtual keyboard" and "WinXtend shared virtual absolute
+//! pointer" — and its session object has no zones, no barriers, no
+//! `Enable`/`Disable`/`Release` and no activation. Measured on the alpha target:
+//! ten seconds of real typing and mousing through it produced zero captured
+//! events, handshaking as both Receiver and Sender.
 //!
-//! The session grants input permission and nothing else, which is why it publishes
-//! capabilities *on top of* what the backend already advertises rather than in place
-//! of them. Display enumeration needs no portal, so a refusal must not take this
-//! machine's screens out of the layout.
+//! `InputCapture` is the portal for *receiving* input, and it is what GNOME 50
+//! ships for the first time. It has zones, barriers, an activation that pins the
+//! pointer and suppresses local delivery, and a `ConnectToEIS` of its own.
 //!
-//! # What a live session advertises today
+//! So [`PortalSession`] holds two sessions, and the user answers two consent
+//! dialogs — once per launch each. Sharing one is not an option that was passed
+//! over; it is not on offer. What *is* shared is the rule they both obey: a
+//! session publishes only its own capability bit and leaves everything else on the
+//! advertised set alone, so losing one does not unadvertise the other and neither
+//! takes this machine's screens out of peers' layouts. [`session`] owns that.
 //!
-//! [`Capabilities::INJECT_INPUT`], and only that. The portal grants keyboard and
-//! pointer access that serves both directions, but a capability bit is a promise
-//! about what this backend can *do*: [`WaylandInjector`] translates the whole of
-//! [`InputEvent`] onto libei, while [`WaylandCapture::start`] still returns
-//! [`PlatformError::Unsupported`] because the reverse translation is a skeleton.
-//! So [`SESSION_CAPABILITIES`] — what a live session contributes to the advertised
-//! set — is `INJECT_INPUT`, and capture is the half [`SESSION_OWNED_CAPABILITIES`]
-//! is waiting on.
+//! Session handles are per D-Bus connection, which is why each connection is owned
+//! in one place: reconnecting invalidates every handle taken out over the old one.
 //!
-//! Claiming capture here would have peers sit waiting for input from a machine
-//! that will never send any. Claiming injection before it worked would have been
-//! the worse mistake in the other direction — the cursor crossing onto a desktop
-//! where the keyboard goes dead — which is why the bit was withheld until the
-//! translation existed, and why it also silences `Engine::on_peer_ready`'s notice
-//! about a peer that has screens and cannot take input.
+//! # What a live session advertises
 //!
-//! The lifecycle it feeds is not theoretical. The full transition — `0` →
-//! `INJECT_INPUT` on the grant, back to `0` on revocation, with the new set
-//! re-advertised to peers each time — was verified by hand on real hardware; see
-//! the log at the top of the private `driver` module.
+//! [`Capabilities::INJECT_INPUT`] from the `RemoteDesktop` session and
+//! [`Capabilities::CAPTURE_INPUT`] from the `InputCapture` one, each only while its
+//! own session is live and each dropped the moment it is revoked. A capability bit
+//! is a promise about what this backend can *do*, so neither is claimed on the
+//! strength of the other: a user who grants injection and refuses capture has a
+//! machine that can be driven and cannot drive, and peers are told exactly that.
 //!
-//! One thing to check before building capture on top of this. Every device this
-//! session offers is an *emulation* device — on GNOME 50 the seat produces "WinXtend
-//! virtual pointer", "WinXtend virtual keyboard" and "WinXtend shared virtual absolute
-//! pointer" — which is exactly what injection needed and is why this half landed on
-//! the session as it stands. `RemoteDesktop` is the portal for *driving* a desktop;
-//! the portal for *receiving* input is `org.freedesktop.portal.InputCapture`, which
-//! is present on the alpha target (version 1, `SupportedCapabilities` 15) and has a
-//! `ConnectToEIS` of its own. Whether capture can be served from this session or
-//! needs that one is the first question to settle in the capture slice, not an
-//! assumption to inherit.
+//! Capture is probed at runtime rather than assumed. GNOME before 50 ships no
+//! `InputCapture` implementation at all, and a desktop without one reports
+//! [`SessionState::Unsupported`] and advertises nothing — it does not put a dialog
+//! on screen and it does not retry.
 //!
-//! There is no global grab, so [`InputCapture::set_suppress_local`] cannot be
-//! implemented the way it is on X11 or Windows. The portal session itself is
-//! exclusive while active, which is the closest equivalent; a compositor that does
-//! not honour that leaves keystrokes reaching local windows, and the backend should
-//! report that honestly rather than pretend.
+//! # Suppression
+//!
+//! There is no global grab on Wayland, so [`InputCapture::set_suppress_local`]
+//! cannot be implemented the way it is on X11 or Windows. The `InputCapture`
+//! session's *activation* is the equivalent, and on the alpha target it is a real
+//! one: across five runs a focused full-screen editor received 0 keys, 0 buttons
+//! and 0 scroll events while capture was active, and the pointer was pinned rather
+//! than merely quiet.
+//!
+//! So suppression is implemented and reported truthfully rather than refused. The
+//! one thing the portal will not do is let a client *start* an activation — only
+//! the user crossing an armed barrier does that — so a request to suppress while
+//! nothing is activated is an error rather than a silent success. The reasoning,
+//! and the measurements, are at the top of [`capture`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -114,6 +113,7 @@ use crate::traits::{
 };
 use crate::{LiveCapabilities, PlatformBackend, PlatformInfo};
 
+pub mod capture;
 pub mod display;
 pub mod keymap;
 pub mod keys;
@@ -131,14 +131,25 @@ mod driver_stub;
 use driver_stub as driver;
 
 #[cfg(target_os = "linux")]
+mod capture_driver;
+#[cfg(not(target_os = "linux"))]
+mod capture_driver_stub;
+#[cfg(not(target_os = "linux"))]
+use capture_driver_stub as capture_driver;
+
+#[cfg(target_os = "linux")]
 mod inject;
 #[cfg(not(target_os = "linux"))]
 mod inject_stub;
 #[cfg(not(target_os = "linux"))]
 use inject_stub as inject;
 
+pub use capture::CaptureState;
 pub use display::WaylandDisplays;
-pub use session::{SessionState, SESSION_CAPABILITIES, SESSION_OWNED_CAPABILITIES};
+pub use session::{
+    SessionState, INPUT_CAPTURE_CAPABILITIES, PORTAL_INPUT_CAPTURE, PORTAL_REMOTE_DESKTOP,
+    REMOTE_DESKTOP_CAPABILITIES,
+};
 pub use token::RESTORE_TOKEN_FILE;
 
 use session::SharedSession;
@@ -152,12 +163,11 @@ fn todo_err(operation: &'static str) -> PlatformError {
     }
 }
 
-/// The `RemoteDesktop` portal session, shared by capture and injection.
+/// The `RemoteDesktop` portal session, which injection sends on.
 ///
-/// Held behind an [`Arc`] by both, so the session is torn down exactly once — when
-/// the whole [`PlatformBackend`] is dropped — rather than when either side happens to
-/// stop first. Injection outliving capture is the ordinary case: a machine can go on
-/// being driven by a peer long after it has stopped driving anything itself.
+/// Held behind an [`Arc`], so the session is torn down exactly once — when the
+/// whole [`PlatformBackend`] is dropped — rather than when any one user of it
+/// happens to stop first.
 pub struct PortalSession {
     /// Dropped first, which signals the thread and waits for it. Ordering is not
     /// load-bearing — the thread holds its own handle on the state — but reads in
@@ -179,14 +189,14 @@ impl PortalSession {
     fn inert(live: LiveCapabilities, base: Capabilities) -> Self {
         Self {
             _driver: None,
-            shared: Arc::new(SharedSession::new(live, base)),
+            shared: Arc::new(remote_desktop_session(live, base)),
             transport: Arc::new(inject::Transport::new()),
         }
     }
 
     /// Start acquiring the session in the background.
     fn starting(live: LiveCapabilities, base: Capabilities, config_dir: &Path) -> Self {
-        let shared = Arc::new(SharedSession::new(live, base));
+        let shared = Arc::new(remote_desktop_session(live, base));
         let transport = Arc::new(inject::Transport::new());
         let driver = driver::start(
             Arc::clone(&shared),
@@ -216,45 +226,121 @@ impl PortalSession {
     }
 }
 
-/// Input capture over the portal session.
+fn remote_desktop_session(live: LiveCapabilities, base: Capabilities) -> SharedSession {
+    SharedSession::new(
+        live,
+        base,
+        REMOTE_DESKTOP_CAPABILITIES,
+        PORTAL_REMOTE_DESKTOP,
+    )
+}
+
+fn input_capture_session(live: LiveCapabilities, base: Capabilities) -> SharedSession {
+    SharedSession::new(live, base, INPUT_CAPTURE_CAPABILITIES, PORTAL_INPUT_CAPTURE)
+}
+
+/// The `InputCapture` portal session, which capture receives on.
 ///
-/// The session and its libei transport are in place; what is not yet here is the
-/// translation of `ei_event`s into [`crate::traits::CapturedEvent`], which needs the
-/// same libxkbcommon path as the X11 backend (`xkb_state_key_get_utf8`) because libei
-/// reports evdev keycodes rather than text.
+/// Its own type rather than a second field on [`PortalSession`] because it is a
+/// different portal with a different lifecycle: it can be granted while injection
+/// is refused, or the other way round, and each has to be able to say so.
+pub struct CaptureSession {
+    _driver: Option<capture_driver::Driver>,
+    shared: Arc<SharedSession>,
+    state: Arc<CaptureState>,
+}
+
+impl CaptureSession {
+    /// A session that was never asked for, and never will be.
+    fn inert(live: LiveCapabilities, base: Capabilities) -> Self {
+        Self {
+            _driver: None,
+            shared: Arc::new(input_capture_session(live, base)),
+            state: Arc::new(CaptureState::new()),
+        }
+    }
+
+    /// Start acquiring the session in the background.
+    fn starting(live: LiveCapabilities, base: Capabilities) -> Self {
+        let shared = Arc::new(input_capture_session(live, base));
+        let state = Arc::new(CaptureState::new());
+        let driver = capture_driver::start(Arc::clone(&shared), Arc::clone(&state));
+        Self {
+            _driver: Some(driver),
+            shared,
+            state,
+        }
+    }
+
+    pub fn state(&self) -> SessionState {
+        self.shared.state()
+    }
+
+    /// The error to give a caller that wants to *begin* capturing.
+    ///
+    /// Deliberately more permissive than asking whether the session is live. The
+    /// agent starts capture as it boots, which is while the consent dialog is
+    /// still on screen — there is no other moment for it to do so, because it
+    /// starts capture once and never retries. Refusing then would leave a machine
+    /// that can never drive anything however the user answers the dialog.
+    ///
+    /// So a session that is still being acquired accepts the sink and arms itself
+    /// the moment it is granted; [`CaptureState::attach`] is where that happens. A
+    /// session that has already failed, been refused, or was never started at all
+    /// refuses, because nothing is coming.
+    fn require_startable(&self) -> Result<()> {
+        match self.shared.state() {
+            SessionState::Starting | SessionState::Active => Ok(()),
+            // `Idle` means no driver was ever spawned — `current_platform` rather
+            // than `current_platform_in`. Nothing will ever grant this.
+            _ => Err(self.shared.error().unwrap_or_else(capture::no_session)),
+        }
+    }
+}
+
+/// Input capture over the `InputCapture` portal session.
 ///
-/// [`InputCapture::start`] still reports the *session's* answer first, so a caller
-/// that has lost permission is told that rather than being told capture is merely
-/// unimplemented — those need different responses from the agent, and only one of
-/// them is something the user can act on.
+/// The translation itself is [`capture`]; what lives here is the order the two
+/// answers are given in. The *session's* answer comes first, so a caller that has
+/// lost permission — or is running on a desktop with no `InputCapture` portal at
+/// all — is told that rather than being told capture merely is not running. Those
+/// need different responses from the agent, and only one of them is something the
+/// user can act on.
+///
+/// [`InputCapture::stop`] and [`InputCapture::set_suppress_local`] are
+/// deliberately *not* gated on it, for the same reason
+/// [`InputInjector::release_all`] is not: they run when input is being torn down,
+/// which is exactly the moment the session may already have gone, and refusing
+/// then is how a modifier ends up stranded on a peer.
 pub struct WaylandCapture {
-    portal: Arc<PortalSession>,
+    session: Arc<CaptureSession>,
 }
 
 impl InputCapture for WaylandCapture {
-    fn start(&mut self, _sink: CaptureSink) -> Result<()> {
-        self.portal.require()?;
-        Err(todo_err("input capture"))
+    fn start(&mut self, sink: CaptureSink) -> Result<()> {
+        self.session.require_startable()?;
+        self.session.state.start(sink)
     }
 
     fn stop(&mut self) -> Result<()> {
-        Err(PlatformError::NotCapturing)
+        self.session.state.stop()
     }
 
     fn is_capturing(&self) -> bool {
-        false
+        self.session.state.is_capturing()
     }
 
-    /// TODO: Wayland has no grab. The portal session is the only exclusivity
-    /// available, so this should report [`PlatformError::Unsupported`] on
-    /// compositors that do not provide it rather than silently letting input reach
-    /// both machines.
-    fn set_suppress_local(&mut self, _suppress: bool) -> Result<()> {
-        Err(todo_err("input suppression"))
+    /// Suppression is real on this backend, and is reported truthfully.
+    ///
+    /// See the module docs for what was measured, and [`capture`] for why asking
+    /// to suppress while the compositor has not activated the session is an error
+    /// rather than a quiet success.
+    fn set_suppress_local(&mut self, suppress: bool) -> Result<()> {
+        self.session.state.set_suppress_local(suppress)
     }
 
     fn suppresses_local(&self) -> bool {
-        false
+        self.session.state.suppresses_local()
     }
 }
 
@@ -345,12 +431,12 @@ impl ScreenSaverControl for WaylandSession {
 /// is no error to report when they do.
 ///
 /// Capture and injection are absent here because at startup nobody has consented to
-/// them. Injection appears in [`PlatformBackend::current_capabilities`] once the
-/// portal grants a session — [`SESSION_CAPABILITIES`] is where that happens — and
-/// goes away again the moment the session does. Capture, clipboard and screensaver
-/// sync stay unadvertised in both places because they still return
-/// [`PlatformError::Unsupported`]. Claiming any of them would make a peer hand this
-/// node the cursor and then watch it disappear.
+/// them. Each appears in [`PlatformBackend::current_capabilities`] once *its* portal
+/// grants a session — [`REMOTE_DESKTOP_CAPABILITIES`] and
+/// [`INPUT_CAPTURE_CAPABILITIES`] are where that happens — and goes away again the
+/// moment that session does. Clipboard and screensaver sync stay unadvertised in
+/// both places because they still return [`PlatformError::Unsupported`]. Claiming
+/// either would make a peer hand this node work it cannot do.
 fn capabilities(has_displays: bool) -> Capabilities {
     if has_displays {
         Capabilities::HAS_DISPLAYS
@@ -369,7 +455,8 @@ pub fn backend() -> Result<PlatformBackend> {
         displays,
         base,
         live.clone(),
-        PortalSession::inert(live, base),
+        PortalSession::inert(live.clone(), base),
+        CaptureSession::inert(live, base),
     ))
 }
 
@@ -385,7 +472,8 @@ pub fn backend_in(config_dir: &Path) -> Result<PlatformBackend> {
         displays,
         base,
         live.clone(),
-        PortalSession::starting(live, base, config_dir),
+        PortalSession::starting(live.clone(), base, config_dir),
+        CaptureSession::starting(live, base),
     ))
 }
 
@@ -412,8 +500,10 @@ fn assemble(
     base: Capabilities,
     live: LiveCapabilities,
     portal: PortalSession,
+    capture: CaptureSession,
 ) -> PlatformBackend {
     let portal = Arc::new(portal);
+    let capture = Arc::new(capture);
     PlatformBackend {
         info: PlatformInfo {
             platform: Platform::Linux,
@@ -425,9 +515,7 @@ fn assemble(
         },
         live_capabilities: live,
         displays: Box::new(displays),
-        capture: Box::new(WaylandCapture {
-            portal: Arc::clone(&portal),
-        }),
+        capture: Box::new(WaylandCapture { session: capture }),
         injector: Box::new(WaylandInjector {
             inner: inject::Injector::new(Arc::clone(&portal.transport)),
             portal,
@@ -483,8 +571,13 @@ mod tests {
 
     #[test]
     fn suppression_is_refused_rather_than_silently_ignored() {
-        // Silently succeeding here would mean keystrokes reach the local desktop
-        // and the remote peer at the same time, with nothing to indicate why.
+        // The contract this test has always encoded, unchanged: suppression must
+        // never be silently false. What changed underneath it is *why* it refuses.
+        // Suppression on this backend is real — the `InputCapture` portal's
+        // activation is exclusive, and that was measured — but the portal gives a
+        // client no way to start an activation, so on a backend with no session at
+        // all there is nothing suppressing anything and saying otherwise would be
+        // the "my keystrokes went to both computers" failure.
         let mut backend = backend().unwrap();
         assert!(backend.capture.set_suppress_local(true).is_err());
         assert!(!backend.capture.suppresses_local());
@@ -510,54 +603,106 @@ mod tests {
     }
 
     #[test]
-    fn capture_and_injection_share_one_session() {
-        // Two sessions would mean two consent dialogs and two things to revoke. The
-        // observable consequence of sharing: revoking once silences both.
+    fn each_portal_can_be_refused_without_taking_the_other_with_it() {
+        // Capture and injection are separate interfaces with separate consent
+        // dialogs, so either can be granted while the other is refused. A user who
+        // says yes to being driven and no to driving has a machine that must
+        // advertise exactly that — and revoking one must not silence the other.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
-        let shared = Arc::new(SharedSession::new(live.clone(), Capabilities::NONE));
-        let portal = detached(Arc::clone(&shared));
-        let mut capture = WaylandCapture {
-            portal: Arc::clone(&portal),
-        };
-        let mut injector = injector_on(Arc::clone(&portal));
+        let inject_shared = Arc::new(remote_desktop_session(live.clone(), Capabilities::NONE));
+        let capture_shared = Arc::new(input_capture_session(live.clone(), Capabilities::NONE));
+        let mut capture = capture_on(Arc::clone(&capture_shared));
+        let mut injector = injector_on(detached(Arc::clone(&inject_shared)));
 
-        shared.starting();
-        shared.activate(SESSION_OWNED_CAPABILITIES);
-        assert_eq!(portal.state(), SessionState::Active);
+        inject_shared.starting();
+        inject_shared.activate(REMOTE_DESKTOP_CAPABILITIES);
+        capture_shared.starting();
+        capture_shared.activate(INPUT_CAPTURE_CAPABILITIES);
+        assert!(live
+            .get()
+            .contains(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT));
 
-        shared.denied("the user closed the sharing indicator");
+        capture_shared.denied("the user closed the sharing indicator");
 
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
         assert!(
-            live.get().is_empty(),
-            "a revoked session advertises nothing"
+            live.get().contains(Capabilities::INJECT_INPUT),
+            "losing capture stopped this machine being driven"
         );
         assert!(matches!(
             capture.start(Box::new(|_| {})),
             Err(PlatformError::PermissionDenied(_))
         ));
-        assert!(matches!(
-            injector.inject(&monitor(), &nudge()),
-            Err(PlatformError::PermissionDenied(_))
-        ));
+        assert!(injector.inject(&monitor(), &nudge()).is_err());
     }
 
     #[test]
     fn a_live_session_advertises_what_it_was_granted_and_only_that() {
         // The dynamic half of `PlatformInfo`: a Wayland node holds these only while
-        // the portal session does, so peers get the real answer rather than the one
-        // that was true at startup. Driven with an explicit grant rather than with
-        // the shipped `SESSION_CAPABILITIES`, which is only half of it today.
+        // its portal session does, so peers get the real answer rather than the one
+        // that was true at startup.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
-        let shared = SharedSession::new(live.clone(), Capabilities::NONE);
+        let shared = remote_desktop_session(live.clone(), Capabilities::NONE);
         shared.starting();
         assert!(
             live.get().is_empty(),
             "nothing is advertised while the dialog is still up"
         );
-        shared.activate(SESSION_OWNED_CAPABILITIES);
-        assert!(live
-            .get()
-            .contains(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT));
+        shared.activate(REMOTE_DESKTOP_CAPABILITIES);
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+    }
+
+    #[test]
+    fn capture_can_be_started_while_the_consent_dialog_is_still_up() {
+        // The agent starts capture as it boots, once, and never retries — see
+        // `Engine::start_capture`. The portal session takes as long as the user
+        // takes to answer, so refusing during that window leaves a machine that
+        // can never drive anything however they answer.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = Arc::new(input_capture_session(live, Capabilities::NONE));
+        let mut capture = capture_on(Arc::clone(&shared));
+
+        shared.starting();
+        assert!(capture.start(Box::new(|_| {})).is_ok());
+        assert!(capture.is_capturing());
+        // ...and nothing is claimed to be suppressed on the strength of it.
+        assert!(!capture.suppresses_local());
+    }
+
+    #[test]
+    fn capture_cannot_be_started_on_a_session_that_will_never_arrive() {
+        // The other side of the same rule. A refusal is final, and a backend built
+        // by `current_platform` has no driver at all, so accepting a sink either
+        // way would be a promise of events that are never coming.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let never_asked = Arc::new(input_capture_session(live.clone(), Capabilities::NONE));
+        assert!(capture_on(never_asked).start(Box::new(|_| {})).is_err());
+
+        let refused = Arc::new(input_capture_session(live, Capabilities::NONE));
+        refused.starting();
+        refused.denied("the consent dialog was dismissed");
+        assert!(matches!(
+            capture_on(refused).start(Box::new(|_| {})),
+            Err(PlatformError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn capture_is_advertised_only_while_the_portal_is_really_capturing_for_us() {
+        // `CAPTURE_INPUT` is a promise that this machine can drive a peer. A
+        // desktop with no `InputCapture` portal at all — everything before GNOME
+        // 50 — must never make it, and must not be reported as a permission the
+        // user could go and grant.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = input_capture_session(live.clone(), Capabilities::NONE);
+        shared.starting();
+        shared.unsupported("this desktop has no org.freedesktop.portal.InputCapture portal");
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+        assert!(matches!(
+            shared.error(),
+            Some(PlatformError::Unsupported { .. })
+        ));
     }
 
     #[test]
@@ -568,11 +713,11 @@ mod tests {
         // whose libei devices never arrived must not come back as
         // `PermissionDenied` and send somebody to a settings panel.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
-        let shared = Arc::new(SharedSession::new(live.clone(), Capabilities::NONE));
+        let shared = Arc::new(remote_desktop_session(live.clone(), Capabilities::NONE));
         let mut injector = injector_on(detached(Arc::clone(&shared)));
 
         shared.starting();
-        shared.activate(SESSION_CAPABILITIES);
+        shared.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert_eq!(shared.state(), SessionState::Active);
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
 
@@ -593,6 +738,16 @@ mod tests {
         })
     }
 
+    fn capture_on(shared: Arc<SharedSession>) -> WaylandCapture {
+        WaylandCapture {
+            session: Arc::new(CaptureSession {
+                _driver: None,
+                shared,
+                state: Arc::new(CaptureState::new()),
+            }),
+        }
+    }
+
     fn injector_on(portal: Arc<PortalSession>) -> WaylandInjector {
         WaylandInjector {
             inner: inject::Injector::new(Arc::clone(&portal.transport)),
@@ -609,10 +764,10 @@ mod tests {
         // a regression nobody would think to look for in the session code.
         let base = capabilities(true);
         let live = LiveCapabilities::fixed(base);
-        let shared = SharedSession::new(live.clone(), base);
+        let shared = remote_desktop_session(live.clone(), base);
 
         shared.starting();
-        shared.activate(SESSION_OWNED_CAPABILITIES);
+        shared.activate(REMOTE_DESKTOP_CAPABILITIES);
         assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
 
         shared.denied("the desktop portal revoked the session");
