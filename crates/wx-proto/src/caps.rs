@@ -10,21 +10,13 @@ use serde::{Deserialize, Serialize};
 
 /// Wire format version.
 ///
-/// Bumped for any change an older peer cannot decode. Appending an enum variant
-/// or a capability bit is safe to *receive* — unknown capability bits survive a
-/// round trip and no old build sends a variant it does not have — but it is not
-/// safe to *send*: a variant a peer's build has never heard of is a decode error
-/// on a stream where a decode error is terminal. So a new variant means a bump,
-/// and the sender gates on the version the peer advertised at its handshake.
-///
-/// * 2 — [`crate::ControlMsg::CapabilitiesChanged`], for Wayland nodes whose
-///   input permission comes and goes while the process runs.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Bumped only for changes that older peers cannot parse. Additive changes —
+/// appending an enum variant or a capability bit — do not require a bump,
+/// because peers ignore capabilities they do not recognise and never send
+/// variants the other side did not advertise support for.
+pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Oldest version this build can still talk to.
-///
-/// Left at 1 by the version-2 bump: a version-1 peer speaks a strict subset of
-/// this wire format, so it is only the newer messages it must never be sent.
 pub const MIN_COMPATIBLE_VERSION: u16 = 1;
 
 // A build whose floor is above its own version could not talk to anything, itself
@@ -67,6 +59,17 @@ impl Capabilities {
     pub const PRIVILEGED_INJECT: Self = Self(1 << 9);
     /// Can relay traffic between peers that cannot reach each other directly.
     pub const RELAY: Self = Self(1 << 10);
+    /// Understands [`crate::ControlMsg::CapabilitiesChanged`].
+    ///
+    /// A statement about this build's wire implementation rather than about the
+    /// machine it runs on, and the thing that makes appending that variant safe
+    /// under the policy at the top of this file: peers ignore capability bits they
+    /// do not recognise, so a build that predates the message simply never
+    /// advertises this and is never sent it. Without the bit there would be no way
+    /// to honour "never send a variant the other side did not advertise support
+    /// for", and an older peer would meet a variant it cannot decode on a stream
+    /// where a decode failure ends the session.
+    pub const CAPABILITY_UPDATES: Self = Self(1 << 11);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -222,6 +225,7 @@ mod tests {
             Capabilities::SCREENSAVER_SYNC,
             Capabilities::PRIVILEGED_INJECT,
             Capabilities::RELAY,
+            Capabilities::CAPABILITY_UPDATES,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {

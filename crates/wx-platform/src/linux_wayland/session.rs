@@ -119,7 +119,7 @@ impl SharedSession {
     /// Permission granted and the transport is up.
     pub fn activate(&self, granted: Capabilities) {
         if self.enter(SessionState::Active, String::new()) {
-            self.live.set(self.base.union(granted));
+            self.publish(granted);
         }
     }
 
@@ -174,11 +174,22 @@ impl SharedSession {
         }
     }
 
-    /// `base` with the session-granted bits cleared, whether or not `base` ever
-    /// had them. A caller passing `SESSION_CAPABILITIES` in as base would otherwise
-    /// keep advertising input after a refusal.
-    fn base_without_session(&self) -> Capabilities {
-        Capabilities(self.base.0 & !SESSION_CAPABILITIES.0)
+    /// Republish with the session's own bits set to `granted` and nothing else
+    /// touched.
+    ///
+    /// Written as a read-modify-write over the published set rather than as
+    /// `base | granted`, because this type owns [`SESSION_CAPABILITIES`] and
+    /// nothing more. `base` is the floor it can never publish less than; a bit
+    /// somebody else put on the live set — one that describes the build rather
+    /// than the portal — is not this type's to clear, and replacing the whole set
+    /// on every transition would silently drop it the moment the session came up
+    /// or went away. Only the session's own bits are set here, and `granted` is
+    /// masked so a caller cannot smuggle a foreign bit in through it either.
+    fn publish(&self, granted: Capabilities) {
+        let held = self.live.get().union(self.base);
+        self.live.set(Capabilities(
+            (held.0 & !SESSION_CAPABILITIES.0) | (granted.0 & SESSION_CAPABILITIES.0),
+        ));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Status> {
@@ -221,7 +232,7 @@ impl SharedSession {
         // Only the bits this session owns are dropped. Losing input permission does
         // not unplug the monitors, and clearing the whole set would tell peers to
         // drop this node out of the layout entirely.
-        self.live.set(self.base_without_session());
+        self.publish(Capabilities::NONE);
     }
 }
 
@@ -377,6 +388,28 @@ mod tests {
             live.get().contains(Capabilities::HAS_DISPLAYS),
             "losing input permission does not unplug the monitors"
         );
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
+        assert!(!live.get().contains(Capabilities::INJECT_INPUT));
+    }
+
+    #[test]
+    fn a_bit_this_session_does_not_own_survives_every_transition() {
+        // `CAPABILITY_UPDATES` says what this build's wire implementation
+        // understands, so it is true on a machine whose portal never answered and
+        // must not blink off when one does. The session owns capture and injection
+        // and nothing else; anything else on the published set is somebody's to
+        // keep, not this type's to overwrite.
+        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+        live.set(Capabilities::HAS_DISPLAYS.union(Capabilities::CAPABILITY_UPDATES));
+
+        s.starting();
+        s.activate(SESSION_CAPABILITIES);
+        assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));
+        assert!(live.get().contains(SESSION_CAPABILITIES));
+
+        s.denied("the desktop portal revoked the session");
+        assert!(live.get().contains(Capabilities::CAPABILITY_UPDATES));
+        assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
         assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
         assert!(!live.get().contains(Capabilities::INJECT_INPUT));
     }

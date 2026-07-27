@@ -52,7 +52,7 @@ use wx_platform::{CapturedEvent, PlatformBackend};
 use wx_proto::{
     Capabilities, ControlMsg, GlobalMonitorId, InputEvent, InputFrame, KeyAction, KeyPayload,
     Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos, PointerEvent, RejectReason, Reliability,
-    SequenceGate, CAPABILITIES_CHANGED_SINCE,
+    SequenceGate,
 };
 
 use crate::config::{Config, HotkeyAction};
@@ -1221,8 +1221,7 @@ impl Engine {
         let trusted = established.peer_was_paired;
         let info = established.peer.clone();
         let name = info.name.clone();
-        self.state
-            .on_session(info.clone(), established.peer_protocol, trusted, now);
+        self.state.on_session(info.clone(), trusted, now);
         {
             let trust = self.trust.lock().expect("trust store lock");
             let config = self.config.clone();
@@ -1932,11 +1931,11 @@ impl Engine {
             now = now.0,
             "local capabilities changed; re-advertising"
         );
-        // Only to peers new enough to decode it. A peer left out keeps the answer
-        // this node gave at its handshake, which is the same thing that happens on
-        // every build that predates this message.
-        self.broadcast_control_since(
-            CAPABILITIES_CHANGED_SINCE,
+        // Only to peers that advertised they understand it. One that did not is
+        // left with the capability set it learned at the handshake, which is
+        // exactly what a build predating this message has always done.
+        self.broadcast_control_capable(
+            Capabilities::CAPABILITY_UPDATES,
             ControlMsg::CapabilitiesChanged { capabilities: now },
         );
 
@@ -2604,19 +2603,25 @@ impl Engine {
         }
     }
 
-    /// Broadcast a message that older peers cannot decode.
+    /// Broadcast a message only to the peers that advertised support for it.
     ///
     /// Skipping a peer costs it one piece of news. Sending it anyway costs it the
     /// session: a variant its build does not have is a decode error, and a control
-    /// stream that fails to decode is torn down by construction. So every message
-    /// introduced after protocol version 1 goes out through here, keyed to the
-    /// version it was introduced in.
-    fn broadcast_control_since(&mut self, version: u16, msg: ControlMsg) {
+    /// stream that fails to decode is torn down by construction. So a message
+    /// added after a peer's build might have been made goes out through here,
+    /// keyed to the capability bit that says the peer can decode it.
+    ///
+    /// [`Engine::peer_supports`] is the predicate rather than
+    /// [`Engine::broadcast_optional`] because a peer missing the bit is an older
+    /// build rather than a feature being refused, and this fires every time a
+    /// portal session comes or goes — the helper's per-peer warning would be
+    /// repeated noise about something nobody can act on.
+    fn broadcast_control_capable(&mut self, required: Capabilities, msg: ControlMsg) {
         let peers: Vec<NodeId> = self
             .sessions
             .keys()
             .copied()
-            .filter(|n| self.state.can_receive(*n, version))
+            .filter(|n| self.state.is_reachable(*n) && self.peer_supports(*n, required))
             .collect();
         for node in peers {
             self.send_to(node, Outbound::Control(msg.clone()));
@@ -2702,7 +2707,16 @@ fn capabilities_for(platform: &PlatformBackend, monitors: &[Monitor]) -> Capabil
     // The live set, not `info.capabilities`: on Wayland input capture and injection
     // exist only while the portal session does, and the value fixed at startup would
     // keep telling peers this machine can drive them after the user revoked it.
-    with_displays(platform.current_capabilities(), !monitors.is_empty())
+    //
+    // `CAPABILITY_UPDATES` is added unconditionally because it describes this
+    // build's wire implementation rather than the machine: every node understands
+    // the message on every platform, whatever its portal has or has not granted.
+    with_displays(
+        platform
+            .current_capabilities()
+            .union(Capabilities::CAPABILITY_UPDATES),
+        !monitors.is_empty(),
+    )
 }
 
 /// `base` with `HAS_DISPLAYS` set to match whether a screen is actually attached.
@@ -3315,6 +3329,28 @@ mod tests {
         assert!(
             revoked.contains(Capabilities::HAS_DISPLAYS),
             "screens are not a portal permission and must survive a revocation"
+        );
+    }
+
+    #[test]
+    fn every_node_advertises_that_it_understands_capability_updates() {
+        // The bit peers gate `CapabilitiesChanged` on. It describes this build's
+        // wire implementation, not the machine, so it has to be advertised on every
+        // platform, with or without displays, and whatever the portal has granted —
+        // a node that dropped it while its permission was gone would stop being
+        // told about its peers' permissions too.
+        let platform = wx_platform::current_platform().unwrap();
+
+        platform
+            .live_capabilities
+            .set(Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT);
+        assert!(capabilities_for(&platform, &[mon(0, 0, 1920)])
+            .contains(Capabilities::CAPABILITY_UPDATES));
+
+        platform.live_capabilities.set(Capabilities::NONE);
+        assert!(
+            capabilities_for(&platform, &[]).contains(Capabilities::CAPABILITY_UPDATES),
+            "a headless node with no permission still understands the message"
         );
     }
 

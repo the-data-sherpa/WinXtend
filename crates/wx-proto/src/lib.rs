@@ -48,7 +48,7 @@ pub use caps::{
 pub use codec::{decode, encode_datagram, encode_frame, CodecError, FrameReader};
 pub use control::{
     ClipboardFormat, Compression, ControlMsg, Layout, NodeInfo, Placement, RejectReason,
-    VideoCodec, VideoConfig, CAPABILITIES_CHANGED_SINCE,
+    VideoCodec, VideoConfig,
 };
 pub use geom::{Edge, Monitor, NormPos, Point, Rect};
 pub use ids::{GlobalMonitorId, IdParseError, MonitorId, NodeId, Signature};
