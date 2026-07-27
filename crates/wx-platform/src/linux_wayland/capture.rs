@@ -26,7 +26,7 @@
 //! entirely. It is a private, unstable interface and it routes around the decision
 //! the user is being asked to make, so it is explicitly not an option here.
 //!
-//! # Suppression is real, and measured
+//! # Suppression is real, and was measured — by the investigation, not here
 //!
 //! While the portal session is *activated* the compositor sends this client every
 //! keystroke, button and scroll, and sends local windows none of them. Across five
@@ -36,8 +36,11 @@
 //! merely going quiet. A pointer-only session still suppressed the keyboard and a
 //! keyboard-only session still suppressed buttons and scroll.
 //!
-//! So [`crate::traits::InputCapture::set_suppress_local`] is implemented rather
-//! than refused, and [`CaptureState::suppresses_local`] answers with the one thing
+//! Those numbers come from the investigation recorded on issue #7 that
+//! commissioned this slice; they were not re-derived here. They stand, and the
+//! conclusion drawn from them is why
+//! [`crate::traits::InputCapture::set_suppress_local`] is implemented rather than
+//! refused, and why [`CaptureState::suppresses_local`] answers with the one thing
 //! that is actually true: whether the compositor has this session activated.
 //!
 //! # What the compositor does *not* send, and what follows from it

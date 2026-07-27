@@ -91,9 +91,12 @@
 //! session's *activation* is the equivalent, and on the alpha target it is a real
 //! one: across five runs a focused full-screen editor received 0 keys, 0 buttons
 //! and 0 scroll events while capture was active, and the pointer was pinned rather
-//! than merely quiet.
+//! than merely quiet. That measurement is inherited, not this change's own: it was
+//! made by the investigation recorded on issue #7 that commissioned this slice,
+//! and is not re-derived here.
 //!
-//! So suppression is implemented and reported truthfully rather than refused. The
+//! It stands, and so suppression is implemented and reported truthfully rather
+//! than refused — returning `Unsupported` would be the inaccurate answer. The
 //! one thing the portal will not do is let a client *start* an activation — only
 //! the user crossing an armed barrier does that — so a request to suppress while
 //! nothing is activated is an error rather than a silent success. The reasoning,
