@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | Displays | `wl_output` + `xdg_output` | implemented, see [`display`] |
 //! | Capture | libei via the RemoteDesktop portal | session and transport implemented; event translation a skeleton |
-//! | Injection | libei | session and transport implemented; event translation a skeleton |
+//! | Injection | libei | implemented, see [`inject`] and [`keymap`] |
 //! | Clipboard | `wl_data_device` / `zwlr_data_control_manager_v1` | skeleton |
 //! | Locking | systemd-logind | skeleton |
 //!
@@ -15,6 +15,9 @@
 //! Display enumeration is deliberately first: it is the one piece that needs no
 //! portal, no consent dialog and no libei, so a Linux machine can appear in the
 //! layout editor and be arranged before it can capture or inject anything.
+//! Injection came second, before capture, because a node that can only be driven
+//! is already useful — it can be the receiving end of a mesh — and because it is
+//! testable on one machine with no peer.
 //!
 //! # Why this backend matters more than its line count suggests
 //!
@@ -57,39 +60,39 @@
 //! of them. Display enumeration needs no portal, so a refusal must not take this
 //! machine's screens out of the layout.
 //!
-//! # What a live session advertises today: nothing
+//! # What a live session advertises today
 //!
-//! The portal grants keyboard and pointer access, but this backend still cannot use
-//! it: [`WaylandCapture::start`], [`WaylandInjector::inject`] and
-//! [`WaylandInjector::warp_cursor`] return [`PlatformError::Unsupported`] because the
-//! translation between [`InputEvent`] and `ei` events is a skeleton. So
-//! [`SESSION_CAPABILITIES`] — what a live session contributes to the advertised set —
-//! is empty, and `HAS_DISPLAYS` is the only thing this backend claims. Advertising
-//! injection here would invite peers to push the cursor onto a desktop where the
-//! keyboard goes dead, and would silence `Engine::on_peer_ready`'s warning, which
-//! fires precisely on a peer that has screens and does not advertise injection.
+//! [`Capabilities::INJECT_INPUT`], and only that. The portal grants keyboard and
+//! pointer access that serves both directions, but a capability bit is a promise
+//! about what this backend can *do*: [`WaylandInjector`] translates the whole of
+//! [`InputEvent`] onto libei, while [`WaylandCapture::start`] still returns
+//! [`PlatformError::Unsupported`] because the reverse translation is a skeleton.
+//! So [`SESSION_CAPABILITIES`] — what a live session contributes to the advertised
+//! set — is `INJECT_INPUT`, and capture is the half [`SESSION_OWNED_CAPABILITIES`]
+//! is waiting on.
 //!
-//! That constant is the one switch: the injection (#6) and capture (#7) slices set it
-//! to [`SESSION_OWNED_CAPABILITIES`] and everything else here already works.
+//! Claiming capture here would have peers sit waiting for input from a machine
+//! that will never send any. Claiming injection before it worked would have been
+//! the worse mistake in the other direction — the cursor crossing onto a desktop
+//! where the keyboard goes dead — which is why the bit was withheld until the
+//! translation existed, and why it also silences `Engine::on_peer_ready`'s notice
+//! about a peer that has screens and cannot take input.
 //!
 //! The lifecycle it feeds is not theoretical. The full transition — `0` →
-//! `CAPTURE_INPUT | INJECT_INPUT` on the grant, back to `0` on revocation, with the
-//! new set re-advertised to peers each time — was verified by hand on real hardware
-//! earlier in this branch's history, against a revision whose session capabilities
-//! were still populated; see the log at the top of the private `driver` module. The
-//! shipped default no longer produces that transition, but the machinery that
-//! produced it is unchanged, and `HAS_DISPLAYS` exercises the same publish path on
-//! every display hotplug.
+//! `INJECT_INPUT` on the grant, back to `0` on revocation, with the new set
+//! re-advertised to peers each time — was verified by hand on real hardware; see
+//! the log at the top of the private `driver` module.
 //!
 //! One thing to check before building capture on top of this. Every device this
 //! session offers is an *emulation* device — on GNOME 50 the seat produces "WinXtend
 //! virtual pointer", "WinXtend virtual keyboard" and "WinXtend shared virtual absolute
-//! pointer", which is the injection direction. `RemoteDesktop` is the portal for
-//! driving a desktop; the portal for *receiving* input is
-//! `org.freedesktop.portal.InputCapture`, which is present on the alpha target
-//! (version 1, `SupportedCapabilities` 15) and has a `ConnectToEIS` of its own.
-//! Whether capture can be served from this session or needs that one is the first
-//! question to settle in the capture slice, not an assumption to inherit.
+//! pointer" — which is exactly what injection needed and is why this half landed on
+//! the session as it stands. `RemoteDesktop` is the portal for *driving* a desktop;
+//! the portal for *receiving* input is `org.freedesktop.portal.InputCapture`, which
+//! is present on the alpha target (version 1, `SupportedCapabilities` 15) and has a
+//! `ConnectToEIS` of its own. Whether capture can be served from this session or
+//! needs that one is the first question to settle in the capture slice, not an
+//! assumption to inherit.
 //!
 //! There is no global grab, so [`InputCapture::set_suppress_local`] cannot be
 //! implemented the way it is on X11 or Windows. The portal session itself is
@@ -112,6 +115,8 @@ use crate::traits::{
 use crate::{LiveCapabilities, PlatformBackend, PlatformInfo};
 
 pub mod display;
+pub mod keymap;
+pub mod keys;
 pub mod session;
 pub mod token;
 
@@ -124,6 +129,13 @@ mod driver;
 mod driver_stub;
 #[cfg(not(target_os = "linux"))]
 use driver_stub as driver;
+
+#[cfg(target_os = "linux")]
+mod inject;
+#[cfg(not(target_os = "linux"))]
+mod inject_stub;
+#[cfg(not(target_os = "linux"))]
+use inject_stub as inject;
 
 pub use display::WaylandDisplays;
 pub use session::{SessionState, SESSION_CAPABILITIES, SESSION_OWNED_CAPABILITIES};
@@ -152,6 +164,11 @@ pub struct PortalSession {
     /// the order things actually happen.
     _driver: Option<driver::Driver>,
     shared: Arc<SharedSession>,
+    /// The libei devices, published by the driver thread and used by
+    /// [`WaylandInjector`]. Held here rather than on the injector so that the
+    /// driver has somewhere to put them the moment the compositor offers them,
+    /// which is before anything asks to inject.
+    transport: Arc<inject::Transport>,
 }
 
 impl PortalSession {
@@ -163,16 +180,23 @@ impl PortalSession {
         Self {
             _driver: None,
             shared: Arc::new(SharedSession::new(live, base)),
+            transport: Arc::new(inject::Transport::new()),
         }
     }
 
     /// Start acquiring the session in the background.
     fn starting(live: LiveCapabilities, base: Capabilities, config_dir: &Path) -> Self {
         let shared = Arc::new(SharedSession::new(live, base));
-        let driver = driver::start(Arc::clone(&shared), config_dir.to_path_buf());
+        let transport = Arc::new(inject::Transport::new());
+        let driver = driver::start(
+            Arc::clone(&shared),
+            Arc::clone(&transport),
+            config_dir.to_path_buf(),
+        );
         Self {
             _driver: Some(driver),
             shared,
+            transport,
         }
     }
 
@@ -234,35 +258,40 @@ impl InputCapture for WaylandCapture {
     }
 }
 
-/// TODO: inject through the same libei connection: `ei_device_keyboard_key`,
-/// `ei_device_pointer_motion_absolute`, `ei_device_button_button`,
-/// `ei_device_scroll_delta`, each followed by `ei_device_frame`. The frame call is
-/// mandatory — events without a frame are buffered and never delivered, which
-/// presents as injection silently doing nothing.
+/// Input injection over the portal session's libei transport.
 ///
-/// Text is the hard case again, for the same reason as X11: libei carries evdev
-/// keycodes, not characters. The keymap must be searched for a keycode producing
-/// the wanted keysym, and where none exists the compositor cannot be asked to
-/// remap. Falling back to [`wx_proto::KeyPayload::RawKeyCode`] loses the character,
-/// so the practical answer is to upload our own xkb keymap to the `ei` keyboard
-/// device — which libei supports precisely for this case.
+/// The translation itself is [`inject`]; what lives here is the order the two
+/// answers are given in. The *session's* answer comes first, so a caller that has
+/// lost permission is told that rather than being told the transport is merely
+/// absent — those need different responses from the agent, and only one of them is
+/// something the user can act on.
+///
+/// Text is resolved against the receiving desktop's own keyboard layout; see
+/// [`keymap`] for why that is the only route Wayland leaves open and what it
+/// cannot do.
 pub struct WaylandInjector {
     portal: Arc<PortalSession>,
+    inner: inject::Injector,
 }
 
 impl InputInjector for WaylandInjector {
-    fn inject(&mut self, _monitor: &Monitor, _event: &InputEvent) -> Result<()> {
+    fn inject(&mut self, monitor: &Monitor, event: &InputEvent) -> Result<()> {
         self.portal.require()?;
-        Err(todo_err("input injection"))
+        self.inner.inject(monitor, event)
     }
 
-    fn warp_cursor(&mut self, _monitor: &Monitor, _pos: NormPos) -> Result<()> {
+    fn warp_cursor(&mut self, monitor: &Monitor, pos: NormPos) -> Result<()> {
         self.portal.require()?;
-        Err(todo_err("cursor warping"))
+        self.inner.warp_cursor(monitor, pos)
     }
 
+    /// Deliberately not gated on [`PortalSession::require`].
+    ///
+    /// This runs on disconnect and at shutdown, which are exactly the moments the
+    /// session may already have been revoked — and refusing to clear then is how a
+    /// modifier ends up stranded on a desktop with nothing left to release it.
     fn release_all(&mut self) -> Result<()> {
-        Ok(())
+        self.inner.release_all()
     }
 }
 
@@ -316,12 +345,12 @@ impl ScreenSaverControl for WaylandSession {
 /// is no error to report when they do.
 ///
 /// Capture and injection are absent here because at startup nobody has consented to
-/// them — and, until the event translation lands, they stay absent afterwards too:
-/// [`SESSION_CAPABILITIES`] is empty, so a granted portal session adds nothing to
-/// [`PlatformBackend::current_capabilities`] either. Clipboard and screensaver sync
-/// stay unadvertised because they still return [`PlatformError::Unsupported`].
-/// Claiming any of them would make a peer hand this node the cursor and then watch
-/// it disappear.
+/// them. Injection appears in [`PlatformBackend::current_capabilities`] once the
+/// portal grants a session — [`SESSION_CAPABILITIES`] is where that happens — and
+/// goes away again the moment the session does. Capture, clipboard and screensaver
+/// sync stay unadvertised in both places because they still return
+/// [`PlatformError::Unsupported`]. Claiming any of them would make a peer hand this
+/// node the cursor and then watch it disappear.
 fn capabilities(has_displays: bool) -> Capabilities {
     if has_displays {
         Capabilities::HAS_DISPLAYS
@@ -399,7 +428,10 @@ fn assemble(
         capture: Box::new(WaylandCapture {
             portal: Arc::clone(&portal),
         }),
-        injector: Box::new(WaylandInjector { portal }),
+        injector: Box::new(WaylandInjector {
+            inner: inject::Injector::new(Arc::clone(&portal.transport)),
+            portal,
+        }),
         clipboard: Box::new(WaylandClipboard),
         screensaver: Box::new(WaylandSession),
     }
@@ -483,16 +515,11 @@ mod tests {
         // observable consequence of sharing: revoking once silences both.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
         let shared = Arc::new(SharedSession::new(live.clone(), Capabilities::NONE));
-        let portal = Arc::new(PortalSession {
-            _driver: None,
-            shared: Arc::clone(&shared),
-        });
+        let portal = detached(Arc::clone(&shared));
         let mut capture = WaylandCapture {
             portal: Arc::clone(&portal),
         };
-        let mut injector = WaylandInjector {
-            portal: Arc::clone(&portal),
-        };
+        let mut injector = injector_on(Arc::clone(&portal));
 
         shared.starting();
         shared.activate(SESSION_OWNED_CAPABILITIES);
@@ -519,7 +546,7 @@ mod tests {
         // The dynamic half of `PlatformInfo`: a Wayland node holds these only while
         // the portal session does, so peers get the real answer rather than the one
         // that was true at startup. Driven with an explicit grant rather than with
-        // the shipped `SESSION_CAPABILITIES`, which is empty today.
+        // the shipped `SESSION_CAPABILITIES`, which is only half of it today.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
         let shared = SharedSession::new(live.clone(), Capabilities::NONE);
         shared.starting();
@@ -534,33 +561,43 @@ mod tests {
     }
 
     #[test]
-    fn a_granted_session_still_advertises_no_input_until_it_can_perform_any() {
-        // The backend's own rule applied to the granted branch: capture and
-        // injection still return `Unsupported`, so consent alone must not make this
-        // node look drivable to peers. The one line that changes when #6 and #7 land.
+    fn a_granted_session_with_no_transport_reports_that_rather_than_a_refusal() {
+        // The session state and the transport are two different answers, and the
+        // agent responds to them differently: a refusal is something the user can
+        // act on, a missing transport is not. So a session the portal granted but
+        // whose libei devices never arrived must not come back as
+        // `PermissionDenied` and send somebody to a settings panel.
         let live = LiveCapabilities::fixed(Capabilities::NONE);
         let shared = Arc::new(SharedSession::new(live.clone(), Capabilities::NONE));
-        let mut injector = WaylandInjector {
-            portal: Arc::new(PortalSession {
-                _driver: None,
-                shared: Arc::clone(&shared),
-            }),
-        };
+        let mut injector = injector_on(detached(Arc::clone(&shared)));
 
         shared.starting();
         shared.activate(SESSION_CAPABILITIES);
         assert_eq!(shared.state(), SessionState::Active);
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+
+        let err = injector.inject(&monitor(), &nudge()).unwrap_err();
         assert!(
-            live.get().is_empty(),
-            "a granted session advertises nothing it cannot yet do"
+            !matches!(err, PlatformError::PermissionDenied(_)),
+            "nobody refused anything; the transport is simply not there: {err}"
         );
-        assert!(
-            matches!(
-                injector.inject(&monitor(), &nudge()),
-                Err(PlatformError::Unsupported { .. })
-            ),
-            "the reason the bit is withheld: injection is still a skeleton"
-        );
+    }
+
+    /// A portal session with no driver behind it, for the rules that are about
+    /// state rather than about a live compositor.
+    fn detached(shared: Arc<SharedSession>) -> Arc<PortalSession> {
+        Arc::new(PortalSession {
+            _driver: None,
+            shared,
+            transport: Arc::new(inject::Transport::new()),
+        })
+    }
+
+    fn injector_on(portal: Arc<PortalSession>) -> WaylandInjector {
+        WaylandInjector {
+            inner: inject::Injector::new(Arc::clone(&portal.transport)),
+            portal,
+        }
     }
 
     #[test]

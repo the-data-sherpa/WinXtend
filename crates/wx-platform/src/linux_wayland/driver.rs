@@ -48,11 +48,25 @@
 //! * clean teardown of a live session in ~260 ms.
 //!
 //! The capability transition in that list was observed against a revision whose
-//! [`super::session::SESSION_CAPABILITIES`] still held `CAPTURE_INPUT | INJECT_INPUT`.
-//! It is empty now — see the note there and in [`super`] for why — so the shipped
-//! build no longer produces the `0` → `3` → `0` movement. The publish path that
-//! produced it is unchanged and is the same one `HAS_DISPLAYS` goes through, and the
-//! evidence stands for the day #6 and #7 set the constant back.
+//! [`super::session::SESSION_CAPABILITIES`] held `CAPTURE_INPUT | INJECT_INPUT`. It
+//! holds `INJECT_INPUT` alone today — injection is implemented and capture is not —
+//! so the shipped build moves `0` → `2` → `0` rather than `0` → `3` → `0`. The
+//! publish path is unchanged.
+//!
+//! Also verified by hand on the same desktop while #6 landed, through the real
+//! `WaylandInjector` rather than a scratch client — see the note at the top of
+//! [`super::inject`] for what the session's devices turn out to be good for:
+//!
+//! * `ei_text` is **not** offered: the target ships libei 1.5.0, whose EIS side does
+//!   not implement the interface, so the capability is never negotiated even though
+//!   this client asks for it;
+//! * `RemoteDesktop.NotifyKeyboardKeysym` is refused once `ConnectToEIS` has been
+//!   called — *"Session is not allowed to call NotifyKeyboard methods"* — so the
+//!   portal's D-Bus input methods and libei are mutually exclusive and the choice
+//!   made here is final for the session;
+//! * the absolute pointer's region matches the monitor rectangle
+//!   [`super::display`] reports exactly, offsets and all, so wire positions need no
+//!   scaling to reach it.
 //!
 //! Not proven, deliberately: portal-*initiated* revocation through the shell's
 //! screen-sharing indicator. An external `Close` on the session object is refused with
@@ -75,6 +89,7 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::oneshot;
 
+use super::inject::Transport;
 use super::session::{SharedSession, SESSION_CAPABILITIES};
 use super::token::RestoreTokenStore;
 
@@ -112,7 +127,7 @@ pub struct Driver {
 /// Returns immediately: the consent dialog can sit on screen for as long as the user
 /// takes, and nothing above this may block on that. Progress and failure are reported
 /// through `shared`.
-pub fn start(shared: Arc<SharedSession>, config_dir: PathBuf) -> Driver {
+pub fn start(shared: Arc<SharedSession>, transport: Arc<Transport>, config_dir: PathBuf) -> Driver {
     shared.starting();
     let (stop_tx, stop_rx) = oneshot::channel();
     let thread_shared = Arc::clone(&shared);
@@ -131,7 +146,7 @@ pub fn start(shared: Arc<SharedSession>, config_dir: PathBuf) -> Driver {
                     return;
                 }
             };
-            runtime.block_on(run(&thread_shared, &config_dir, stop_rx));
+            runtime.block_on(run(&thread_shared, &transport, &config_dir, stop_rx));
         });
 
     match spawned {
@@ -172,6 +187,7 @@ impl Drop for Driver {
 
 async fn run(
     shared: &SharedSession,
+    transport: &Transport,
     config_dir: &std::path::Path,
     mut stop: oneshot::Receiver<()>,
 ) {
@@ -216,18 +232,22 @@ async fn run(
     // The whole set, not a subset of it: a grant missing either device type never
     // reaches here, because `accept_granted` refuses it.
     //
-    // `SESSION_CAPABILITIES` is empty today, so this publishes nothing and the node
-    // goes on advertising only its displays. That is deliberate, not an oversight:
-    // the portal really did grant keyboard and pointer, but `WaylandCapture::start`
-    // and `WaylandInjector::inject` still return `Unsupported` because the
-    // translation between `InputEvent` and `ei` events is not written yet, and a node
-    // that claimed injection here would have peers push the cursor onto a desktop
-    // where nothing they type arrives. Repopulating the constant is the whole of what
-    // #6 and #7 have to change on this path — the state machine, the activation and
-    // revocation edges and the re-advertisement above them are already right.
+    // `SESSION_CAPABILITIES` holds injection and not capture, because that is what
+    // this backend can do: a peer may drive this machine, and must not sit waiting
+    // for input from it. Repopulating the other half is the whole of what #7 has to
+    // change on this path — the state machine, the activation and revocation edges
+    // and the re-advertisement above them are already right.
+    //
+    // The transport is published *before* the capabilities, so no peer can be told
+    // this machine accepts input during the window where the injector would still
+    // find nothing to send on.
+    transport.attach(live.connection.clone());
     shared.activate(SESSION_CAPABILITIES);
 
-    let reason = pump(live.connection, live.events, &live.session, stop).await;
+    let reason = pump(live.connection, live.events, &live.session, transport, stop).await;
+    // Before the state change, so an injector that races teardown finds the
+    // transport gone rather than a connection the compositor has already dropped.
+    transport.detach();
     teardown(shared, live.session, reason).await;
 }
 
@@ -416,12 +436,10 @@ async fn negotiate(
 /// go nowhere, against the rule this backend is built on that it advertises nothing
 /// it cannot do.
 ///
-/// Checked even though [`super::session::SESSION_CAPABILITIES`] is empty and a half
-/// grant would therefore publish nothing either way. What is at stake is the restore
-/// token: this refusal runs before the token is persisted, and a token recorded for a
-/// half grant would restore that same half grant silently on every later launch, with
-/// no dialog left to correct it — including after #6 and #7 make the difference
-/// visible.
+/// What is most at stake is the restore token: this refusal runs before the token is
+/// persisted, and a token recorded for a half grant would restore that same half
+/// grant silently on every later launch, with
+/// no dialog left to correct it.
 ///
 /// Reported as a refusal rather than a fault because that is what it is: the portal
 /// answered the request, and what came back is less than was asked for. The message
@@ -465,6 +483,7 @@ async fn pump(
     connection: reis::event::Connection,
     mut events: reis::tokio::EiConvertEventStream,
     session: &Session<RemoteDesktop>,
+    transport: &Transport,
     mut stop: oneshot::Receiver<()>,
 ) -> Ended {
     // Subscribing is a D-Bus round trip, and shutdown has to be able to interrupt it
@@ -511,7 +530,7 @@ async fn pump(
 
             event = events.next() => match event {
                 Some(Ok(event)) => {
-                    if let Some(ended) = on_ei_event(&connection, event) {
+                    if let Some(ended) = on_ei_event(&connection, transport, event) {
                         return ended;
                     }
                 }
@@ -531,19 +550,29 @@ async fn pump(
 }
 
 /// Handle one `ei` event, returning `Some` if it ended the session.
-fn on_ei_event(connection: &reis::event::Connection, event: EiEvent) -> Option<Ended> {
+fn on_ei_event(
+    connection: &reis::event::Connection,
+    transport: &Transport,
+    event: EiEvent,
+) -> Option<Ended> {
     match event {
         EiEvent::SeatAdded(added) => {
             // Nothing is offered until the capabilities are bound, so this is what
             // makes the compositor create the devices at all. Asking for everything
-            // the session covers now means #6 and #7 have their devices without
-            // renegotiating — and without a second dialog.
+            // the session covers means #7 gets its devices without renegotiating —
+            // and without a second dialog.
             added.seat.bind_capabilities(
                 DeviceCapability::Pointer
                     | DeviceCapability::PointerAbsolute
                     | DeviceCapability::Button
                     | DeviceCapability::Scroll
-                    | DeviceCapability::Keyboard,
+                    | DeviceCapability::Keyboard
+                    // Asked for although the alpha target's EIS does not implement
+                    // `ei_text`: binding a capability the server never offers costs
+                    // nothing, and the day one does offer it the injector gets a
+                    // direct "produce this string" route with no renegotiation. See
+                    // the note at the top of `super::keymap`.
+                    | DeviceCapability::Text,
             );
             if let Err(e) = connection.flush() {
                 return Some(Ended::Broken(format!("flushing the libei transport: {e}")));
@@ -557,8 +586,39 @@ fn on_ei_event(connection: &reis::event::Connection, event: EiEvent) -> Option<E
                 keyboard = added.device.has_capability(DeviceCapability::Keyboard),
                 pointer = added.device.has_capability(DeviceCapability::Pointer),
                 absolute = added.device.has_capability(DeviceCapability::PointerAbsolute),
+                text = added.device.has_capability(DeviceCapability::Text),
+                keymap = added.device.keymap().is_some(),
                 "libei device offered"
             );
+            transport.device_added(&added.device);
+            None
+        }
+        // Nothing may be emulated before this, and everything queued before it is
+        // discarded — which is one of the two ways injection ends up a silent
+        // no-op, the other being a missing frame.
+        EiEvent::DeviceResumed(resumed) => {
+            transport.device_resumed(&resumed.device);
+            None
+        }
+        // A pause is reversible and routine, so the device keeps its slot and its
+        // keymap; only sending on it is forbidden until it resumes.
+        EiEvent::DevicePaused(paused) => {
+            transport.device_paused(&paused.device);
+            None
+        }
+        EiEvent::DeviceRemoved(removed) => {
+            transport.device_lost(&removed.device);
+            None
+        }
+        // Carries the layout group and the desktop's locked modifiers, both of
+        // which change what keycode produces a given character.
+        EiEvent::KeyboardModifiers(mods) => {
+            tracing::trace!(
+                locked = mods.locked,
+                group = mods.group,
+                "libei keyboard modifier state"
+            );
+            transport.modifiers(&mods.device, mods.locked, mods.group);
             None
         }
         EiEvent::Disconnected(gone) => {
@@ -1178,3 +1238,9 @@ mod tests {
         assert!(!failure.discards_token);
     }
 }
+
+/// The loopback EIS server: see the module docs for what it covers that the
+/// tests above cannot.
+#[cfg(test)]
+#[path = "eis_loopback.rs"]
+mod eis_loopback;

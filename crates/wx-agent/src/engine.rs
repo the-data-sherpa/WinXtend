@@ -3318,8 +3318,8 @@ mod tests {
 
     #[test]
     fn a_machine_that_advertises_nothing_refuses_everything() {
-        // The state every peer is in before its handshake, and the state a Linux
-        // backend is in for most of the alpha.
+        // The state every peer is in before its handshake, and the state the
+        // skeleton backends — macOS, X11, evdev — are in for the whole of the alpha.
         let mut allowed = true;
         let logs = captured_logs(|| {
             allowed = permit_optional(

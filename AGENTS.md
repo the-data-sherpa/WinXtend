@@ -75,6 +75,21 @@ real compositor on one box, with no extra packages:
   `ApplyMonitorsConfig` on `org.gnome.Mutter.DisplayConfig` is the ground truth to
   compare against; supported scales are listed per mode.
 
+- **Input injection, end to end, with no second machine** — drive the real
+  `WaylandInjector` from a scratch binary and read the result back rather than
+  eyeballing it. `zenity --entry --timeout=45` prints its contents to stdout when
+  Enter is injected, which turns "did it type?" into an assertion; for pointer work
+  a small GTK4 window with `Gtk.EventControllerMotion`/`GestureClick`/
+  `EventControllerScroll` printing each event is the equivalent. Always inject into
+  a window the test owns — the events go to whatever has focus.
+
+  Two traps when testing across layouts. `gsettings set org.gnome.desktop.input-sources
+  current` is **ignored** by GNOME Shell, so it does not switch the active layout;
+  inject `<Super>space` (the real `switch-input-source` binding) instead, and confirm
+  the switch happened by injecting a `KeyPayload::RawKeyCode` for a key whose meaning
+  differs between the two layouts. Changing `input-sources sources` does work, so
+  restore it from a shell `trap` rather than at the end of the script.
+
 - **Headless (CI)** — anything that opens a Wayland connection must skip, not
   fail. Reproduce with
   `env -u WAYLAND_DISPLAY -u DISPLAY -u XDG_SESSION_TYPE XDG_RUNTIME_DIR=$(mktemp -d) cargo test`.
@@ -94,12 +109,26 @@ are deliberately separated from everything touching D-Bus or libei (`driver.rs`,
 `cfg(target_os = "linux")` with a stub alongside), so this crate compiles and tests on
 all three platforms with no session. Keep that division.
 
+## Wayland text injection has one route, and it has a hard limit
+
+`RemoteDesktop` + `ConnectToEIS` is the only transport, and once `ConnectToEIS` has
+been called the portal refuses the `Notify*` D-Bus methods outright — the two are
+mutually exclusive, so the choice is final for the session. That leaves resolving
+each character against the keymap the compositor hands over. The reasoning, the two
+alternatives that do not work, and what consequently *cannot* be injected are in the
+module docs of `crates/wx-platform/src/linux_wayland/keymap.rs`; read those before
+proposing a fourth approach, because the obvious ones have been measured and ruled
+out on the alpha target.
+
 ## Windows-only code can be checked from Linux
 
 `cargo check --target x86_64-pc-windows-msvc` needs no MSVC toolchain (checking does not
 link), but the root workspace still fails: `aws-lc-sys`/`ring` build scripts want `lib.exe`.
-To validate a `cfg(windows)` block without waiting for CI, copy the module into a throwaway
-crate whose only dependency is `windows`, and run clippy against that target — `--all-targets`
+`-p wx-platform` alone does succeed, on both `x86_64-pc-windows-msvc` and
+`aarch64-apple-darwin`, which covers every `cfg` block in the platform crate and is the
+cheapest way to prove a backend stub still compiles. For a crate that does not build
+that way, copy the module into a throwaway crate whose only dependency is `windows`, and
+run clippy against that target — `--all-targets`
 covers `cfg(test)` code too, so the Windows tests get compiled as well. This turns a
 push-and-wait CI loop into a local one. It proves compilation and lints, not behaviour;
 anything touching the real registry, clipboard, or desktop still needs a Windows run.

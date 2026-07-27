@@ -19,7 +19,7 @@ windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.12", features = ["client", "unstable"] }
 # Already in the tree via wayland-backend; a direct edge adds no crate to the build.
-rustix = { version = "1.1.4", features = ["event"] }
+rustix = { version = "1.1.4", features = ["event", "time"] }
 # The portal session. `ashpd` wraps the `Request`-object dance that every
 # xdg-desktop-portal call is; `reis` speaks the libei protocol in pure Rust, so no
 # machine — CI included — needs `libei-dev` or a C toolchain to build this.
