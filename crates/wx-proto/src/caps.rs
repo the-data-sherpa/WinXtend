@@ -41,6 +41,13 @@ impl Capabilities {
     pub const HAS_DISPLAYS: Self = Self(1 << 2);
     pub const CLIPBOARD_TEXT: Self = Self(1 << 3);
     pub const CLIPBOARD_IMAGE: Self = Self(1 << 4);
+    /// Defined, but advertised by no backend: nothing implements the
+    /// `FileTransfer*` half of the protocol, and `wx-platform`'s
+    /// `no_backend_claims_a_capability_nothing_implements` keeps it that way.
+    /// The bit itself stays. Reusing a bit index would read an older peer's
+    /// advertisement as a capability it never claimed, so a capability that
+    /// turns out to be unimplemented stops being advertised rather than being
+    /// removed.
     pub const FILE_TRANSFER: Self = Self(1 << 5);
     /// Can encode and send its screen as video.
     pub const VIDEO_SOURCE: Self = Self(1 << 6);

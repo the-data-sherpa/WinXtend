@@ -96,7 +96,9 @@ anything touching the real registry, clipboard, or desktop still needs a Windows
 - **Protocol enums and capability bits are append-only.** postcard encodes variants by
   index, so deleting one silently reinterprets every older peer's messages. Stop
   *advertising* a capability rather than removing it — see the note at the top of
-  `crates/wx-proto/src/lib.rs`.
+  `crates/wx-proto/src/lib.rs` for the variants, and `Capabilities::FILE_TRANSFER` in
+  `crates/wx-proto/src/caps.rs` for a bit that is deliberately defined and advertised
+  by nothing.
 - **Optional features are gated on what the peer advertised, before they send.**
   `Engine::peer_supports` / `send_optional` / `broadcast_optional` in
   `crates/wx-agent/src/engine.rs` are that seam, and a refusal is a `warn` naming the
