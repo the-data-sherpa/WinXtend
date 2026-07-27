@@ -14,6 +14,11 @@
 //! the result over as a [`RawKey`]. Everything after that is platform-independent
 //! and lives here, so the composition rules cannot drift between backends.
 //!
+//! The one thing here that runs on the *receiving* side is [`decompose`], the
+//! inverse of [`compose`]: an injector whose layout has no single key for `é` types
+//! the dead acute and then `e` instead. It shares these tables precisely so the two
+//! directions cannot disagree about which accent produces which character.
+//!
 //! # Why composition is our problem and not the OS's
 //!
 //! Dead keys (`'` then `a` giving `á`) are normally resolved by the OS as part of

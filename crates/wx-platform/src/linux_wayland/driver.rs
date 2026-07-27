@@ -1238,3 +1238,9 @@ mod tests {
         assert!(!failure.discards_token);
     }
 }
+
+/// The loopback EIS server: see the module docs for what it covers that the
+/// tests above cannot.
+#[cfg(test)]
+#[path = "eis_loopback.rs"]
+mod eis_loopback;

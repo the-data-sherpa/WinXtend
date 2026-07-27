@@ -30,9 +30,12 @@ layout editor.
 > - **Linux/Wayland is the alpha target, and it is being built now.** Display
 >   enumeration works: a `wl_output`/`xdg_output` client enumerates monitors, and
 >   `capabilities()` advertises `HAS_DISPLAYS` only when enumeration actually found
->   one. Capture, injection, clipboard, and input suppression do not — the portal
->   and `libei` work is unlanded, so the backend advertises none of them and refuses
->   what it cannot do, on purpose
+>   one. Input injection works too, over `libei` on the `xdg-desktop-portal`
+>   `RemoteDesktop` session, so a Linux box can already be the receiving end of a
+>   mesh; `INJECT_INPUT` appears only while the portal keeps that session granted,
+>   and goes away again the moment it does not. Capture, clipboard, and input
+>   suppression still do not work, so the backend advertises none of them and
+>   refuses what it cannot do, on purpose
 >   (`crates/wx-platform/src/linux_wayland/mod.rs::the_backend_advertises_nothing_it_cannot_do`
 >   and `::suppression_is_refused_rather_than_silently_ignored`). macOS, X11, and
 >   evdev are further back than Wayland now is: compiling skeletons, documented down
