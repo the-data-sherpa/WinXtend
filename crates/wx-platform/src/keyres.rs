@@ -361,6 +361,28 @@ fn recover_control_char(c: char, modifiers: Modifiers) -> Option<KeyPayload> {
     }))
 }
 
+/// Split a precomposed character back into a base letter and the combining accent
+/// that produces it.
+///
+/// The inverse of [`compose`], and the one thing a *receiving* backend needs from
+/// these tables. A keyboard layout with no key for `é` — which is most of them —
+/// almost always still has a dead acute, and pressing that followed by `e` is how
+/// the character is typed on that machine. Without this the receiver can only
+/// refuse a composed character outright, which is precisely the outcome resolving
+/// keystrokes to text was meant to avoid.
+///
+/// `None` for anything these tables do not cover, including characters that are
+/// already a base letter.
+pub fn decompose(c: char) -> Option<(char, char)> {
+    for accent in Accent::ALL {
+        let (bases, composed) = accent.table();
+        if let Some(index) = composed.chars().position(|x| x == c) {
+            return Some((bases.chars().nth(index)?, accent.combining()));
+        }
+    }
+    None
+}
+
 /// Compose a pending accent with the text that followed it.
 ///
 /// Prefers a precomposed codepoint where Unicode has one, because a few older
@@ -415,6 +437,24 @@ enum Accent {
 }
 
 impl Accent {
+    /// Every accent, so the tables can be walked without a list that drifts out
+    /// of step with the enum.
+    const ALL: [Accent; 13] = [
+        Accent::Acute,
+        Accent::Grave,
+        Accent::Circumflex,
+        Accent::Tilde,
+        Accent::Diaeresis,
+        Accent::Ring,
+        Accent::Cedilla,
+        Accent::Caron,
+        Accent::Macron,
+        Accent::Breve,
+        Accent::DotAbove,
+        Accent::DoubleAcute,
+        Accent::Ogonek,
+    ];
+
     fn classify(c: char) -> Option<Self> {
         Some(match c {
             '\'' | '\u{00b4}' | '\u{0301}' => Accent::Acute,
@@ -595,21 +635,7 @@ mod tests {
     fn compose_tables_are_positionally_aligned() {
         // A length mismatch would silently pair the wrong accent with the wrong
         // letter, and only some users of some layouts would ever notice.
-        for accent in [
-            Accent::Acute,
-            Accent::Grave,
-            Accent::Circumflex,
-            Accent::Tilde,
-            Accent::Diaeresis,
-            Accent::Ring,
-            Accent::Cedilla,
-            Accent::Caron,
-            Accent::Macron,
-            Accent::Breve,
-            Accent::DotAbove,
-            Accent::DoubleAcute,
-            Accent::Ogonek,
-        ] {
+        for accent in Accent::ALL {
             let (bases, composed) = accent.table();
             assert_eq!(
                 bases.chars().count(),
@@ -627,23 +653,47 @@ mod tests {
     fn every_accent_classifies_its_own_spacing_and_combining_forms() {
         // Round-tripping matters because a platform may report either form, and a
         // form we do not classify degrades to naive concatenation.
-        for accent in [
-            Accent::Acute,
-            Accent::Grave,
-            Accent::Circumflex,
-            Accent::Tilde,
-            Accent::Diaeresis,
-            Accent::Ring,
-            Accent::Cedilla,
-            Accent::Caron,
-            Accent::Macron,
-            Accent::Breve,
-            Accent::DotAbove,
-            Accent::DoubleAcute,
-            Accent::Ogonek,
-        ] {
+        for accent in Accent::ALL {
             assert_eq!(Accent::classify(accent.spacing()), Some(accent));
             assert_eq!(Accent::classify(accent.combining()), Some(accent));
+        }
+    }
+
+    #[test]
+    fn a_composed_character_splits_back_into_its_dead_key_and_base() {
+        // What a receiver does when its layout has no single key for the
+        // character: type the dead accent and then the letter, which is how
+        // somebody sitting at that keyboard would.
+        assert_eq!(decompose('é'), Some(('e', '\u{301}')));
+        assert_eq!(decompose('ô'), Some(('o', '\u{302}')));
+        assert_eq!(decompose('ñ'), Some(('n', '\u{303}')));
+        assert_eq!(decompose('Ü'), Some(('U', '\u{308}')));
+        assert_eq!(decompose('ç'), Some(('c', '\u{327}')));
+    }
+
+    #[test]
+    fn a_character_that_is_already_a_base_letter_does_not_decompose() {
+        for c in ['a', 'Z', '[', 'ß', '€'] {
+            assert_eq!(decompose(c), None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn composition_and_decomposition_are_inverses() {
+        // The two directions share one table, so a drift between them would mean
+        // a receiver typing a different character from the one the sender
+        // resolved.
+        for accent in Accent::ALL {
+            let (bases, _) = accent.table();
+            for base in bases.chars() {
+                let composed = compose(accent.combining(), &base.to_string());
+                let one = composed.chars().next().unwrap();
+                assert_eq!(
+                    decompose(one),
+                    Some((base, accent.combining())),
+                    "{accent:?} + {base:?}"
+                );
+            }
         }
     }
 

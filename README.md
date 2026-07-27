@@ -173,7 +173,7 @@ for what the next release is about.
 |---|---|---|---|---|---|
 | Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| Input injection | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| Input injection | ✅ | ⚠️ | ⚠️ | ✅ libei via the portal | ⚠️ |
 | Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ⚠️ | n/a |
 | Screen capture | ✅ GDI | ⚠️ | ⚠️ | ⚠️ | n/a |
 
@@ -193,7 +193,7 @@ for what the next release is about.
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ⚠️ display enumeration landed; capture, injection, and clipboard are the alpha, and the standing gap in every tool in this space |
+| Wayland | ⚠️ display enumeration, the portal session and input injection landed; capture and clipboard are what is left of the alpha, and the standing gap in every tool in this space |
 
 ## Building
 
@@ -376,8 +376,9 @@ platform; as the Wayland backend grows, the Linux total rises with it.
 
 The alpha is Linux/Wayland. Roughly in order of value:
 
-1. **The Wayland backend.** Capture, injection, and clipboard against the portal
-   and `wlr`/`libei` interfaces; display enumeration already works. This is the
+1. **The Wayland backend.** Capture and clipboard against the portal and
+   `wlr`/`libei` interfaces; display enumeration and input injection already work,
+   so a Linux machine can already be the *receiving* end of a mesh. This is the
    alpha, it is the standing gap in every tool in this space, and it is the
    strongest reason to prefer this one.
 2. **Validate between two physical Linux machines** over a real network. Nothing
