@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml/badge.svg)](https://github.com/the-data-sherpa/WinXtend/actions/workflows/ci.yml)
 
-**Share one keyboard and mouse across every machine on your desk.** Move the cursor
-off the edge of one screen and it appears on the next machine — today that means
-Windows, with Linux/Wayland the alpha target — and no KVM switch in sight.
+**Share one keyboard and mouse across every machine on your desk.** The idea: move
+the cursor off the edge of one screen and it appears on the next machine, no KVM
+switch in sight. The complete backend today is Windows, with Linux/Wayland the
+alpha target.
 
 A spiritual successor to Synergy, Barrier, and [hydra](https://github.com/PacAnimal/hydra),
 written in Rust, with a QUIC transport, zero-configuration discovery, and a visual
@@ -232,9 +233,9 @@ The authority for that list is the "Install Tauri system dependencies" step in
 The engine job in the same workflow installs no packages at all, because GitHub's
 runners ship a C toolchain preinstalled.
 
-Verified on Ubuntu 26.04. `libwebkit2gtk-4.1-dev` is the Tauri 2 dependency and
-exists on Ubuntu 24.04 and newer; on 22.04 you would need the `4.0` package and a
-Tauri 1 build, which this tree is not.
+Verified on Ubuntu 26.04. `libwebkit2gtk-4.1-dev` is the Tauri 2 dependency. These
+are the current Debian/Ubuntu package names; on an older release, check them against
+that release's own package index.
 
 ### Windows prerequisites
 
@@ -344,11 +345,11 @@ examples, not an exhaustive list:
 - `crates/wx-platform/src/windows/` sits behind `#[cfg(target_os = "windows")]` and
   is the largest block of tests in the crate. None of it exists in a Linux or macOS
   build, which is why Windows reports the highest total of the three.
-- `crates/wx-platform/src/linux_wayland/mod.rs` declares its `wl_output` protocol
-  module under `#[cfg(target_os = "linux")]`, so that module's tests exist only on
-  Linux and are absent from a Windows or macOS build. The gates run in both
-  directions, not only Windows-ward, which is why Linux and macOS do not report the
-  same total as each other either.
+- `crates/wx-platform/src/linux_wayland/mod.rs` declares its `outputs` module — the
+  `wl_output`/`xdg_output` client — under `#[cfg(target_os = "linux")]`, so that
+  module's tests exist only on Linux and are absent from a Windows or macOS build.
+  The gates run in both directions, not only Windows-ward, which is why Linux and
+  macOS do not report the same total as each other either.
 - `crates/wx-agent/src/autostart.rs` uses both mechanisms. Several of its tests are
   `#[cfg(windows)]` outright, so off Windows they are not compiled and cannot be
   counted; `registering_is_idempotent_and_removable` is instead
