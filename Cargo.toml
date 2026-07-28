@@ -13,11 +13,12 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-# Set by the Wayland portal path: `zbus`, and `ashpd` on top of it, both declare
-# 1.87. Nothing else here needs it, but `rust-version` is not target-aware, so the
+# Set by the locked dependency graph: `rcgen` (a direct `wx-net` dependency) and
+# the `time` crates it pulls in declare 1.88; the Wayland portal path (`zbus`,
+# `ashpd`) declares 1.87 below that. `rust-version` is not target-aware, so the
 # workspace has to state the highest of them or a build on an older toolchain fails
 # with a dependency error rather than a clear "this crate needs a newer Rust".
-rust-version = "1.87"
+rust-version = "1.88"
 
 [workspace.dependencies]
 wx-proto = { path = "crates/wx-proto" }
