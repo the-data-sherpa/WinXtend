@@ -93,14 +93,37 @@ struct Status {
     detail: String,
 }
 
-/// What a live `RemoteDesktop` session is worth to peers.
+/// What the devices on a live `RemoteDesktop` session are worth to peers.
 ///
 /// [`Capabilities::INJECT_INPUT`], and only that. The portal grants keyboard and
 /// pointer access, but its devices are emulation devices — the seat offers
-/// "WinXtend virtual keyboard" and friends — so what this session buys is the
-/// ability to *be driven*. Capture comes from the other portal entirely; see
+/// "WinXtend virtual keyboard" and friends — so what they buy is the ability to
+/// *be driven*. Capture comes from the other portal entirely; see
 /// [`INPUT_CAPTURE_CAPABILITIES`].
-pub const REMOTE_DESKTOP_CAPABILITIES: Capabilities = Capabilities::INJECT_INPUT;
+pub const INJECT_CAPABILITIES: Capabilities = Capabilities::INJECT_INPUT;
+
+/// What clipboard access on a live `RemoteDesktop` session is worth to peers.
+///
+/// Both bits together, because the portal's clipboard is not per-format: what is
+/// granted is access to the selection, and every format this backend maps rides
+/// the same `SelectionRead`/`SetSelection` pair. Both were measured round-tripping
+/// byte-exact on the alpha target with no focused surface, so claiming one and
+/// withholding the other would be a false modesty peers would pay for.
+///
+/// Granted separately from [`INJECT_CAPABILITIES`]: the consent dialog carries
+/// "Allow Clipboard Access" as its own toggle, and `Start` answers
+/// `clipboard_enabled` separately from the device list.
+pub const CLIPBOARD_CAPABILITIES: Capabilities =
+    Capabilities::CLIPBOARD_TEXT.union(Capabilities::CLIPBOARD_IMAGE);
+
+/// Everything a `RemoteDesktop` session may ever publish.
+///
+/// The `owned` mask, not a grant: one dialog answers for input and clipboard
+/// independently, so the session has to be able to publish either half alone.
+/// What it *actually* publishes is whatever [`super::driver`] hands
+/// [`SharedSession::activate`] after reading `Start`'s results.
+pub const REMOTE_DESKTOP_CAPABILITIES: Capabilities =
+    INJECT_CAPABILITIES.union(CLIPBOARD_CAPABILITIES);
 
 /// What a live `InputCapture` session is worth to peers.
 ///
@@ -340,10 +363,81 @@ mod tests {
             live.get().is_empty(),
             "nothing is granted until Start returns"
         );
-        s.activate(REMOTE_DESKTOP_CAPABILITIES);
+        s.activate(INJECT_CAPABILITIES);
         assert_eq!(s.state(), SessionState::Active);
         assert!(live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(
+            !live.get().contains(Capabilities::CLIPBOARD_TEXT),
+            "one dialog, two answers: a granted device list says nothing about the clipboard"
+        );
         assert!(s.error().is_none());
+    }
+
+    #[test]
+    fn one_session_publishes_input_and_clipboard_independently() {
+        // The trap the `owned` mask exists for. The consent dialog carries "Allow
+        // Clipboard Access" as a toggle of its own, so all four answers are
+        // reachable and each has to be sayable — a user who granted the clipboard
+        // and refused remote interaction has a machine that syncs copy and paste
+        // and cannot be driven, and peers must be told exactly that.
+        for (granted, input, clipboard) in [
+            (
+                INJECT_CAPABILITIES.union(CLIPBOARD_CAPABILITIES),
+                true,
+                true,
+            ),
+            (INJECT_CAPABILITIES, true, false),
+            (CLIPBOARD_CAPABILITIES, false, true),
+            (Capabilities::NONE, false, false),
+        ] {
+            let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+            s.starting();
+            s.activate(granted);
+            assert_eq!(
+                live.get().contains(Capabilities::INJECT_INPUT),
+                input,
+                "{granted:?}"
+            );
+            assert_eq!(
+                live.get().contains(Capabilities::CLIPBOARD_TEXT),
+                clipboard,
+                "{granted:?}"
+            );
+            assert_eq!(
+                live.get().contains(Capabilities::CLIPBOARD_IMAGE),
+                clipboard,
+                "{granted:?}"
+            );
+            assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
+        }
+    }
+
+    #[test]
+    fn revoking_the_session_takes_the_clipboard_with_it() {
+        // The clipboard rides the injection session, so it dies with it. A peer
+        // still told this machine can paste would offer content to a backend whose
+        // portal has gone.
+        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+        s.starting();
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
+        assert!(live.get().contains(CLIPBOARD_CAPABILITIES));
+        s.denied("the desktop portal revoked the session");
+        assert!(!live.get().contains(Capabilities::CLIPBOARD_TEXT));
+        assert!(!live.get().contains(Capabilities::CLIPBOARD_IMAGE));
+        assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
+    }
+
+    #[test]
+    fn the_capture_session_can_never_publish_a_clipboard_bit() {
+        // The two sessions share one published set and each owns its own bits.
+        // `InputCapture` has no clipboard of its own — `RequestClipboard` is
+        // refused for it on the alpha target — so a grant that tried to claim one
+        // through it is masked away rather than believed.
+        let (_, capture, live) = both(Capabilities::NONE);
+        capture.starting();
+        capture.activate(INPUT_CAPTURE_CAPABILITIES.union(CLIPBOARD_CAPABILITIES));
+        assert!(live.get().contains(Capabilities::CAPTURE_INPUT));
+        assert!(!live.get().contains(Capabilities::CLIPBOARD_TEXT));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! | Windows | `WH_KEYBOARD_LL` / `WH_MOUSE_LL` | `SendInput` | implemented |
 //! | macOS | `CGEventTap` | `CGEventPost` | skeleton |
 //! | Linux/X11 | XInput2 raw events | XTEST | skeleton |
-//! | Linux/Wayland | libei via the InputCapture portal | libei via the RemoteDesktop portal | capture, injection and displays implemented; clipboard and locking still skeletons |
+//! | Linux/Wayland | libei via the InputCapture portal | libei via the RemoteDesktop portal | capture, injection, displays and clipboard implemented; locking still a skeleton |
 //! | Linux headless | evdev | uinput | skeleton |
 //!
 //! Wayland matters: it is the default on current Fedora, Ubuntu, and Steam Deck,

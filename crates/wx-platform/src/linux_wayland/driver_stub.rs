@@ -9,17 +9,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::clipboard::ClipboardState;
 use super::inject_stub::Transport;
 use super::session::SharedSession;
 
 /// A driver that never runs. Dropping it does nothing, because there is nothing.
 pub struct Driver;
 
-/// Takes the transport it will never fill, so the signature stays the one
+/// Takes the transports it will never fill, so the signature stays the one
 /// [`super::PortalSession::starting`] calls on every target.
 pub fn start(
     shared: Arc<SharedSession>,
     _transport: Arc<Transport>,
+    _clipboard: Arc<ClipboardState>,
     _config_dir: PathBuf,
 ) -> Driver {
     shared.unsupported("the xdg-desktop-portal RemoteDesktop session needs Linux");

@@ -28,7 +28,11 @@ rustix = { version = "1.1.4", features = ["event", "time"] }
 # `input_capture` receives from one. They are not interchangeable — see the note at
 # the top of `src/linux_wayland/capture.rs` — and `screencast` is there because
 # `remote_desktop` needs it.
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "input_capture"] }
+# `clipboard` is the third portal, and it is not a third session: it is asked for
+# on the `remote_desktop` one, which is the only kind `RequestClipboard` accepts.
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "input_capture", "clipboard"] }
 reis = { version = "0.7.0", features = ["tokio"] }
-tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync", "macros"] }
+# `io-util` for the clipboard: every selection moves over a pipe the portal hands
+# over as a file descriptor, so `AsyncReadExt`/`AsyncWriteExt` are load-bearing.
+tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
