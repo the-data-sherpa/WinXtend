@@ -48,10 +48,35 @@
 //! * clean teardown of a live session in ~260 ms.
 //!
 //! The capability transition in that list was observed against a revision whose
-//! session published `CAPTURE_INPUT | INJECT_INPUT` together. This session publishes
-//! [`super::session::REMOTE_DESKTOP_CAPABILITIES`] alone — capture comes from the
-//! `InputCapture` portal and has a session of its own — so this half moves
-//! `0` → `2` → `0`. The publish path is unchanged.
+//! session published `CAPTURE_INPUT | INJECT_INPUT` together. Capture comes from
+//! the `InputCapture` portal and has a session of its own, so this session
+//! publishes [`INJECT_CAPABILITIES`] and — separately —
+//! [`CLIPBOARD_CAPABILITIES`]. The publish path is unchanged.
+//!
+//! Verified by hand on the same desktop while #8 added the clipboard, driving the
+//! real `WaylandClipboard` with `wl-copy`/`wl-paste` as the application at the
+//! other end of the selection:
+//!
+//! * `CreateSession` → `SelectDevices` → **`RequestClipboard`** → `Start` granted
+//!   `devices=KEYBOARD|POINTER` and `clipboard_enabled=true` together, from one
+//!   dialog, publishing `INJECT_INPUT, CLIPBOARD_TEXT, CLIPBOARD_IMAGE`;
+//! * the restore token persisted for a clipboard-carrying request and restored on
+//!   the next launch with `restoring=true` and no dialog;
+//! * `SelectionOwnerChanged` arrives **immediately after `Start`** carrying the
+//!   selection that was already on the clipboard, which is why the subscription is
+//!   taken out before `Start` rather than after;
+//! * all four formats round-tripping byte-exact in both directions, non-ASCII
+//!   included; 24 MiB read in 262 ms and written in 414 ms with the event loop
+//!   still answering;
+//! * `SelectionRead` **failing** with `org.freedesktop.portal.Error.Failed:
+//!   Internal error` for a selection the calling session owns — see
+//!   [`super::clipboard::ClipboardState::read`], which is why a read of our own
+//!   offer is answered locally.
+//!
+//! Not proven on hardware: a session granted with the clipboard toggle *off*. The
+//! GNOME dialog does carry the switch — `xdg-desktop-portal-gnome` has
+//! `allow_remote_clipboard_switch` — but the run made to exercise it came back
+//! with `clipboard_enabled=true`, so only the tests cover that branch.
 //!
 //! Also verified by hand on the same desktop while #6 landed, through the real
 //! `WaylandInjector` rather than a scratch client — see the note at the top of
@@ -81,16 +106,20 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 use futures_util::StreamExt;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use wx_proto::Capabilities;
 
+use super::clipboard::ClipboardState;
+use super::clipboard_portal;
 use super::inject::Transport;
-use super::session::{SharedSession, REMOTE_DESKTOP_CAPABILITIES};
+use super::session::{SharedSession, CLIPBOARD_CAPABILITIES, INJECT_CAPABILITIES};
 use super::token::RestoreTokenStore;
 
 /// Name this client reports to the compositor.
@@ -127,7 +156,12 @@ pub struct Driver {
 /// Returns immediately: the consent dialog can sit on screen for as long as the user
 /// takes, and nothing above this may block on that. Progress and failure are reported
 /// through `shared`.
-pub fn start(shared: Arc<SharedSession>, transport: Arc<Transport>, config_dir: PathBuf) -> Driver {
+pub fn start(
+    shared: Arc<SharedSession>,
+    transport: Arc<Transport>,
+    clipboard: Arc<ClipboardState>,
+    config_dir: PathBuf,
+) -> Driver {
     shared.starting();
     let (stop_tx, stop_rx) = oneshot::channel();
     let thread_shared = Arc::clone(&shared);
@@ -146,7 +180,13 @@ pub fn start(shared: Arc<SharedSession>, transport: Arc<Transport>, config_dir: 
                     return;
                 }
             };
-            runtime.block_on(run(&thread_shared, &transport, &config_dir, stop_rx));
+            runtime.block_on(run(
+                &thread_shared,
+                &transport,
+                &clipboard,
+                &config_dir,
+                stop_rx,
+            ));
         });
 
     match spawned {
@@ -188,11 +228,16 @@ impl Drop for Driver {
 async fn run(
     shared: &SharedSession,
     transport: &Transport,
+    clipboard: &ClipboardState,
     config_dir: &std::path::Path,
     mut stop: oneshot::Receiver<()>,
 ) {
     let store = RestoreTokenStore::in_dir(config_dir);
     let had_token = store.load().is_some();
+    // Built here, before anything else, because the clipboard's signal streams
+    // borrow it and have to outlive every step below. It asks the user for
+    // nothing and costs one D-Bus introspection.
+    let clipboard_proxy = clipboard_portal::proxy().await;
 
     // Shutdown has to be able to interrupt the sequence, not just the event loop that
     // follows it. `Start` blocks until the user answers the consent dialog, and there
@@ -206,7 +251,7 @@ async fn run(
             shared.stopped();
             return;
         }
-        established = establish(&store) => established,
+        established = establish(&store, clipboard_proxy.as_deref()) => established,
     };
 
     let live = match established {
@@ -219,35 +264,64 @@ async fn run(
             // compositor would go on showing this machine as remotely controlled by
             // something that will never use the session.
             if let Some(session) = session {
-                close_session(session).await;
+                close_session(&session).await;
             }
             return;
         }
     };
 
     tracing::info!(
-        devices = ?live.granted,
+        devices = ?live.devices,
+        clipboard = live.clipboard.is_some(),
+        capabilities = %live.granted.describe(),
         "the desktop portal granted a RemoteDesktop session"
     );
-    // The whole set, not a subset of it: a grant missing either device type never
-    // reaches here, because `accept_granted` refuses it.
+    // The device set is whole or absent, never a subset: a grant missing exactly
+    // one device type never reaches here, because `accept_granted` refuses it.
     //
-    // `REMOTE_DESKTOP_CAPABILITIES` holds injection and not capture: this portal's
-    // devices are emulation devices, so what this session buys is the ability to be
-    // driven. Capture is `org.freedesktop.portal.InputCapture` and has a session of
-    // its own; see the note at the top of `super::capture`.
+    // Injection and not capture: this portal's devices are emulation devices, so
+    // what they buy is the ability to be driven. Capture is
+    // `org.freedesktop.portal.InputCapture` and has a session of its own; see the
+    // note at the top of `super::capture`.
     //
-    // The transport is published *before* the capabilities, so no peer can be told
-    // this machine accepts input during the window where the injector would still
-    // find nothing to send on.
-    transport.attach(live.connection.clone());
-    shared.activate(REMOTE_DESKTOP_CAPABILITIES);
+    // Both transports are published *before* the capabilities, so no peer can be
+    // told this machine accepts input or clipboard content during the window where
+    // the trait would still find nothing to send on.
+    let (connection, events) = match live.input {
+        Some(wired) => {
+            transport.attach(wired.connection.clone());
+            (Some(wired.connection), Some(wired.events))
+        }
+        None => (None, None),
+    };
+    // The sender is kept alive here for as long as the session is: the receiver
+    // in `pump` only stops yielding once every sender is gone, and dropping this
+    // one would turn that branch into a busy loop.
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    if live.clipboard.is_some() {
+        clipboard.attach(clipboard_portal::transport(command_tx.clone()));
+    }
+    shared.activate(live.granted);
 
-    let reason = pump(live.connection, live.events, &live.session, transport, stop).await;
-    // Before the state change, so an injector that races teardown finds the
-    // transport gone rather than a connection the compositor has already dropped.
+    let reason = pump(
+        Running {
+            session: Arc::clone(&live.session),
+            connection,
+            events,
+            clipboard: live.clipboard,
+            commands: command_rx,
+        },
+        clipboard_proxy.as_ref(),
+        transport,
+        clipboard,
+        stop,
+    )
+    .await;
+    // Before the state change, so a caller that races teardown finds the transport
+    // gone rather than a connection the compositor has already dropped.
     transport.detach();
-    teardown(shared, live.session, reason).await;
+    clipboard.detach();
+    teardown(shared, &live.session, reason).await;
 }
 
 /// Throw away a stored restore token the portal would not accept.
@@ -264,12 +338,40 @@ fn forget_rejected_token(store: &RestoreTokenStore, had_token: bool, failure: &F
     }
 }
 
-/// A portal session that has been granted, with its transport connected.
-struct Live {
-    session: Session<RemoteDesktop>,
-    granted: BitFlags<DeviceType>,
+/// A portal session that has been granted, with its transports connected.
+struct Live<'a> {
+    session: Arc<Session<RemoteDesktop>>,
+    /// What the grant is worth to peers: input, clipboard, or both.
+    granted: Capabilities,
+    /// The device types the portal actually handed over, for the log.
+    devices: BitFlags<DeviceType>,
+    /// Absent when the user granted the clipboard and refused remote interaction.
+    /// There is nothing to connect libei to in that case, and asking for it would
+    /// fail a session that is perfectly good for what it was granted.
+    input: Option<Wired>,
+    /// Absent when the clipboard was refused, or when this desktop has no
+    /// `Clipboard` portal at all.
+    clipboard: Option<clipboard_portal::Portal<'a>>,
+}
+
+/// The libei half of a granted session.
+struct Wired {
     connection: reis::event::Connection,
     events: reis::tokio::EiConvertEventStream,
+}
+
+/// Everything [`pump`] drives, once the session is live.
+///
+/// A struct rather than seven parameters because the clipboard added three of
+/// them, and because which ones are `None` is the interesting part: a session
+/// with no `events` was granted the clipboard and not the devices, and a session
+/// with no `clipboard` was granted the other way round.
+struct Running<'a> {
+    session: Arc<Session<RemoteDesktop>>,
+    connection: Option<reis::event::Connection>,
+    events: Option<reis::tokio::EiConvertEventStream>,
+    clipboard: Option<clipboard_portal::Portal<'a>>,
+    commands: mpsc::UnboundedReceiver<clipboard_portal::Command>,
 }
 
 /// Why the event loop stopped.
@@ -286,7 +388,7 @@ enum Ended {
 /// failed, if the sequence got that far.
 struct Aborted {
     failure: Failure,
-    session: Option<Session<RemoteDesktop>>,
+    session: Option<Arc<Session<RemoteDesktop>>>,
 }
 
 impl Aborted {
@@ -302,25 +404,31 @@ impl Aborted {
     }
 }
 
-/// Run the whole `CreateSession` → `SelectDevices` → `Start` → `ConnectToEIS`
-/// sequence and bring the `ei` connection up.
-async fn establish(store: &RestoreTokenStore) -> Result<Live, Aborted> {
+/// Run the whole `CreateSession` → `SelectDevices` → `RequestClipboard` →
+/// `Start` → `ConnectToEIS` sequence and bring the transports up.
+async fn establish<'a>(
+    store: &RestoreTokenStore,
+    clipboard: Option<&'a Clipboard>,
+) -> Result<Live<'a>, Aborted> {
     let proxy = RemoteDesktop::new()
         .await
         .map_err(Aborted::before_session)?;
     tracing::debug!(version = proxy.version(), "portal RemoteDesktop interface");
 
-    let session = proxy
-        .create_session(Default::default())
-        .await
-        .map_err(Aborted::before_session)?;
+    let session = Arc::new(
+        proxy
+            .create_session(Default::default())
+            .await
+            .map_err(Aborted::before_session)?,
+    );
 
-    match negotiate(&proxy, &session, store).await {
-        Ok(granted) => Ok(Live {
+    match negotiate(&proxy, &session, store, clipboard).await {
+        Ok(negotiated) => Ok(Live {
             session,
-            granted: granted.devices,
-            connection: granted.connection,
-            events: granted.events,
+            granted: negotiated.granted,
+            devices: negotiated.devices,
+            input: negotiated.input,
+            clipboard: negotiated.clipboard,
         }),
         Err(failure) => Err(Aborted {
             failure,
@@ -333,11 +441,12 @@ async fn establish(store: &RestoreTokenStore) -> Result<Live, Aborted> {
 ///
 /// Split out so that every failure from here on hands the session back to the caller
 /// to close, rather than abandoning it to the portal.
-async fn negotiate(
+async fn negotiate<'a>(
     proxy: &RemoteDesktop,
     session: &Session<RemoteDesktop>,
     store: &RestoreTokenStore,
-) -> Result<Negotiated, Failure> {
+    clipboard: Option<&'a Clipboard>,
+) -> Result<Negotiated<'a>, Failure> {
     // The restore token rides on SelectDevices, not on CreateSession: it is part of
     // *what* is being asked for, and the portal matches it against the device types
     // requested. Getting this wrong is silent — the session works and prompts every
@@ -366,8 +475,19 @@ async fn negotiate(
         .response()
         .map_err(|e| Failure::from_ashpd(e, sent, Stage::BeforeConsent))?;
 
+    // After `SelectDevices` and before `Start`, which is the only window the
+    // portal accepts it in: it is part of *what* the user is being asked to
+    // allow, and `Start` answers it. A desktop with no `Clipboard` portal, or one
+    // that refuses, leaves this `None` and costs nothing else — the injection
+    // session the user is about to consent to is not given back over it.
+    let clipboard = match clipboard {
+        Some(proxy) => clipboard_portal::request(proxy, session).await,
+        None => None,
+    };
+
     tracing::info!(
         restoring = restore_token.is_some(),
+        clipboard = clipboard.is_some(),
         "starting the portal session; a consent dialog appears unless a restore token covers it"
     );
     // `TokenSent::No` from here on: only `SelectDevices` carried the token, so an
@@ -381,11 +501,27 @@ async fn negotiate(
         .response()
         .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::Consent))?;
 
+    // Read from the results rather than assumed from having asked. The consent
+    // dialog carries "Allow Clipboard Access" as a toggle independent of remote
+    // interaction, so a user can grant one and refuse the other and this is the
+    // only place that says which.
+    let clipboard = match (clipboard, started.is_clipboard_enabled()) {
+        (Some(portal), true) => Some(portal),
+        (Some(_), false) => {
+            tracing::info!(
+                "the desktop portal granted the session without clipboard access; \
+                 clipboard sync is not advertised"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+
     // Checked before the token is persisted: a token is the portal's promise to
     // grant the same thing again without asking, and persisting one for a grant
     // this session is about to refuse would make every later launch restore the
     // same half grant silently, with no dialog left to fix it at.
-    accept_granted(started.devices())?;
+    let granted = accept_granted(started.devices(), clipboard.is_some())?;
 
     // Persisted before anything else can fail: a token thrown away because the libei
     // connection did not come up would cost the user another dialog for a problem
@@ -404,70 +540,111 @@ async fn negotiate(
         ),
     }
 
-    let granted = started.devices();
+    let devices = started.devices();
 
-    let fd = proxy
-        .connect_to_eis(session, Default::default())
-        .await
-        .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::AfterGrant))?;
+    // Skipped when no devices were granted. `ConnectToEIS` on a session with
+    // nothing to emulate on buys an empty seat at best, and failing over it would
+    // throw away a clipboard grant the user did make.
+    let input = if granted.contains(INJECT_CAPABILITIES) {
+        let fd = proxy
+            .connect_to_eis(session, Default::default())
+            .await
+            .map_err(|e| Failure::from_ashpd(e, TokenSent::No, Stage::AfterGrant))?;
 
-    let context = ei::Context::new(UnixStream::from(fd))
-        .map_err(|e| Failure::broken(format!("opening the libei transport: {e}")))?;
-    let (connection, events) = context
-        .handshake_tokio(EI_CLIENT_NAME, ei::handshake::ContextType::Sender)
-        .await
-        .map_err(|e| Failure::broken(format!("the libei handshake failed: {e}")))?;
-    tracing::debug!("libei transport connected");
+        let context = ei::Context::new(UnixStream::from(fd))
+            .map_err(|e| Failure::broken(format!("opening the libei transport: {e}")))?;
+        let (connection, events) = context
+            .handshake_tokio(EI_CLIENT_NAME, ei::handshake::ContextType::Sender)
+            .await
+            .map_err(|e| Failure::broken(format!("the libei handshake failed: {e}")))?;
+        tracing::debug!("libei transport connected");
+        Some(Wired { connection, events })
+    } else {
+        tracing::info!(
+            "the desktop portal granted clipboard access without input devices; \
+             this machine can sync the clipboard and cannot be driven"
+        );
+        None
+    };
 
     Ok(Negotiated {
-        devices: granted,
-        connection,
-        events,
+        granted,
+        devices,
+        input,
+        clipboard,
     })
 }
 
-/// Refuse a grant that is missing either device type.
-///
-/// [`wx_proto::Capabilities`] has no per-device granularity: the session owns
-/// `CAPTURE_INPUT | INJECT_INPUT` together or it owns neither. So a grant covering
-/// only the pointer has no honest way to be published — claiming keyboard capability
-/// the session cannot deliver would have peers route keystrokes here that silently
-/// go nowhere, against the rule this backend is built on that it advertises nothing
-/// it cannot do.
-///
-/// What is most at stake is the restore token: this refusal runs before the token is
-/// persisted, and a token recorded for a half grant would restore that same half
-/// grant silently on every later launch, with
-/// no dialog left to correct it.
-///
-/// Reported as a refusal rather than a fault because that is what it is: the portal
-/// answered the request, and what came back is less than was asked for. The message
-/// names the missing device so a user who mis-clicked the dialog can see which box
-/// to tick next time.
-fn accept_granted(granted: BitFlags<DeviceType>) -> Result<(), Failure> {
-    let missing: Vec<&str> = [
-        (DeviceType::Keyboard, "keyboard"),
-        (DeviceType::Pointer, "pointer"),
-    ]
-    .into_iter()
-    .filter(|(device, _)| !granted.contains(*device))
-    .map(|(_, name)| name)
-    .collect();
+/// The device types this session asks for, with the names a user reads.
+const DEVICE_NAMES: [(DeviceType, &str); 2] = [
+    (DeviceType::Keyboard, "keyboard"),
+    (DeviceType::Pointer, "pointer"),
+];
 
-    if missing.is_empty() {
-        return Ok(());
+/// Decide what a grant is worth, and refuse the one shape that cannot be published
+/// honestly.
+///
+/// One dialog answers two independent questions — the device list and the
+/// clipboard toggle — so three of the four outcomes are real and each is
+/// advertised as itself. A machine that can sync the clipboard and cannot be
+/// driven is a perfectly good node, and giving that session back because the
+/// devices were withheld would throw away a grant the user did make.
+///
+/// The refusal that remains is a *half* device grant. [`wx_proto::Capabilities`]
+/// has no per-device granularity: `INJECT_INPUT` is keyboard and pointer together
+/// or it is nothing. So a grant covering only the pointer has no honest way to be
+/// published — claiming keyboard capability the session cannot deliver would have
+/// peers route keystrokes here that silently go nowhere, against the rule this
+/// backend is built on that it advertises nothing it cannot do.
+///
+/// What is most at stake is the restore token: this refusal runs before the token
+/// is persisted, and a token recorded for a half grant would restore that same
+/// half grant silently on every later launch, with no dialog left to correct it.
+///
+/// Reported as a refusal rather than a fault because that is what it is: the
+/// portal answered the request, and what came back is less than was asked for. The
+/// message names the missing device so a user who mis-clicked the dialog can see
+/// which box to tick next time.
+fn accept_granted(devices: BitFlags<DeviceType>, clipboard: bool) -> Result<Capabilities, Failure> {
+    let missing: Vec<&str> = DEVICE_NAMES
+        .into_iter()
+        .filter(|(device, _)| !devices.contains(*device))
+        .map(|(_, name)| name)
+        .collect();
+
+    // Some devices but not all: the one grant with no honest publication.
+    if !missing.is_empty() && missing.len() < DEVICE_NAMES.len() {
+        return Err(Failure::refused(format!(
+            "the desktop portal withheld {} access; this machine needs keyboard and pointer together, so the session was given back",
+            missing.join(" and ")
+        )));
     }
-    Err(Failure::refused(format!(
-        "the desktop portal withheld {} access; this machine needs keyboard and pointer together, so the session was given back",
-        missing.join(" and ")
-    )))
+
+    let granted = if missing.is_empty() {
+        INJECT_CAPABILITIES
+    } else {
+        Capabilities::NONE
+    }
+    .union(if clipboard {
+        CLIPBOARD_CAPABILITIES
+    } else {
+        Capabilities::NONE
+    });
+
+    if granted.is_empty() {
+        return Err(Failure::refused(
+            "the desktop portal withheld both input and clipboard access, so the session was given back",
+        ));
+    }
+    Ok(granted)
 }
 
 /// What [`negotiate`] produces: everything a [`Live`] needs except the session.
-struct Negotiated {
+struct Negotiated<'a> {
+    granted: Capabilities,
     devices: BitFlags<DeviceType>,
-    connection: reis::event::Connection,
-    events: reis::tokio::EiConvertEventStream,
+    input: Option<Wired>,
+    clipboard: Option<clipboard_portal::Portal<'a>>,
 }
 
 /// Drive the `ei` connection until the session ends.
@@ -479,12 +656,20 @@ struct Negotiated {
 /// on GNOME 50, losing the session arrives as `DeviceRemoved`, `SeatRemoved`, then
 /// `Disconnected` on the `ei` stream.
 async fn pump(
-    connection: reis::event::Connection,
-    mut events: reis::tokio::EiConvertEventStream,
-    session: &Session<RemoteDesktop>,
+    running: Running<'_>,
+    proxy: Option<&Arc<Clipboard>>,
     transport: &Transport,
+    clipboard: &ClipboardState,
     mut stop: oneshot::Receiver<()>,
 ) -> Ended {
+    let Running {
+        session,
+        connection,
+        events,
+        clipboard: portal,
+        mut commands,
+    } = running;
+
     // Subscribing is a D-Bus round trip, and shutdown has to be able to interrupt it
     // like everything else in here: `Driver::drop` joins this thread on the promise
     // that no path is bounded only by however long the bus takes to answer.
@@ -502,6 +687,16 @@ async fn pump(
         },
     };
     let mut closed = std::pin::pin!(OptionStream(closed));
+    // Each of these is absent when its half of the session was not granted, and
+    // `OptionStream` turns an absent one into a branch that simply never fires
+    // rather than a second copy of this loop.
+    let mut events = std::pin::pin!(OptionStream(events));
+    let (owner_changes, transfers) = match portal {
+        Some(portal) => (Some(portal.owner_changes), Some(portal.transfers)),
+        None => (None, None),
+    };
+    let mut owner_changes = std::pin::pin!(OptionStream(owner_changes));
+    let mut transfers = std::pin::pin!(OptionStream(transfers));
 
     loop {
         tokio::select! {
@@ -529,8 +724,11 @@ async fn pump(
 
             event = events.next() => match event {
                 Some(Ok(event)) => {
-                    if let Some(ended) = on_ei_event(&connection, transport, event) {
-                        return ended;
+                    // Present whenever the stream is: both come from the same grant.
+                    if let Some(connection) = &connection {
+                        if let Some(ended) = on_ei_event(connection, transport, event) {
+                            return ended;
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -543,6 +741,56 @@ async fn pump(
                         "the compositor closed the libei transport".into(),
                     );
                 }
+            },
+
+            // Somebody copied something, here or in another application. The one
+            // event source `change_serial` needs: no polling, and no hashing a
+            // megabyte of image to discover that nothing happened.
+            change = owner_changes.next() => match change {
+                Some((_, changed)) => {
+                    tracing::debug!(
+                        mime_types = ?changed.mime_types(),
+                        ours = ?changed.session_is_owner(),
+                        "the clipboard selection changed"
+                    );
+                    clipboard.selection_changed(
+                        changed.mime_types().to_vec(),
+                        changed.session_is_owner(),
+                    );
+                }
+                // The signal stream only ends with the bus connection, which the
+                // `closed` branch above reports; nothing more to say here.
+                None => return Ended::Broken(
+                    "the connection to the desktop portal went away".into(),
+                ),
+            },
+
+            // Somebody is pasting from a selection this machine owns, and is
+            // blocked in their own paste until the bytes arrive.
+            transfer = transfers.next() => match transfer {
+                Some((_, mime, serial)) => {
+                    if let Some(proxy) = proxy {
+                        clipboard_portal::serve_transfer(proxy, &session, clipboard, mime, serial);
+                    }
+                }
+                None => return Ended::Broken(
+                    "the connection to the desktop portal went away".into(),
+                ),
+            },
+
+            // A trait call on another thread wants something of the portal.
+            command = commands.recv() => match command {
+                Some(command) => {
+                    // Nothing holds a sender without a granted clipboard, so a
+                    // command with no proxy behind it cannot arrive; the `if let`
+                    // is what the type says rather than a case to handle.
+                    if let Some(proxy) = proxy {
+                        clipboard_portal::dispatch(command, proxy, &session);
+                    }
+                }
+                // `run` keeps a sender alive for the life of the session, so this
+                // only happens once the session is already ending.
+                None => return Ended::Stopped,
             },
         }
     }
@@ -640,7 +888,7 @@ fn on_ei_event(
 }
 
 /// Close the session and record why it ended.
-async fn teardown(shared: &SharedSession, session: Session<RemoteDesktop>, reason: Ended) {
+async fn teardown(shared: &SharedSession, session: &Session<RemoteDesktop>, reason: Ended) {
     // The state is set before the close is attempted, so a portal that never answers
     // cannot leave the agent advertising capabilities it no longer has.
     match &reason {
@@ -662,7 +910,7 @@ async fn teardown(shared: &SharedSession, session: Session<RemoteDesktop>, reaso
 ///
 /// Closing a session the portal already closed fails, and that is fine: the point is
 /// to leave nothing behind when *we* are the ones ending it.
-async fn close_session(session: Session<RemoteDesktop>) {
+async fn close_session(session: &Session<RemoteDesktop>) {
     match tokio::time::timeout(TEARDOWN_TIMEOUT, session.close()).await {
         Ok(Ok(())) => tracing::debug!("portal session closed"),
         Ok(Err(e)) => tracing::debug!(error = %e, "the portal session was already gone"),
@@ -671,6 +919,7 @@ async fn close_session(session: Session<RemoteDesktop>) {
 }
 
 /// How a failure during [`establish`] should be reported.
+#[derive(Debug)]
 struct Failure {
     detail: String,
     kind: FailureKind,
@@ -678,6 +927,7 @@ struct Failure {
     discards_token: bool,
 }
 
+#[derive(Debug)]
 enum FailureKind {
     Denied,
     Unsupported,
@@ -1172,7 +1422,44 @@ mod tests {
 
     #[test]
     fn a_grant_covering_both_devices_is_accepted() {
-        assert!(accept_granted(wanted_devices()).is_ok());
+        assert_eq!(
+            accept_granted(wanted_devices(), false).unwrap(),
+            INJECT_CAPABILITIES
+        );
+    }
+
+    #[test]
+    fn one_dialog_answers_for_input_and_the_clipboard_separately() {
+        // "Allow Clipboard Access" is its own toggle beside "Allow Remote
+        // Interaction", so all four answers are reachable and three of them are
+        // grants. A machine that can sync copy and paste and cannot be driven is
+        // a perfectly good node, and handing that session back over the devices
+        // would throw away a grant the user did make.
+        assert_eq!(
+            accept_granted(wanted_devices(), true).unwrap(),
+            INJECT_CAPABILITIES.union(CLIPBOARD_CAPABILITIES)
+        );
+        assert_eq!(
+            accept_granted(BitFlags::empty(), true).unwrap(),
+            CLIPBOARD_CAPABILITIES,
+            "clipboard granted and input refused is a session worth keeping"
+        );
+        assert_eq!(
+            accept_granted(wanted_devices(), false).unwrap(),
+            INJECT_CAPABILITIES,
+            "input granted and the clipboard refused must not claim the clipboard"
+        );
+    }
+
+    #[test]
+    fn a_grant_of_nothing_at_all_is_still_given_back() {
+        let failure = accept_granted(BitFlags::empty(), false).unwrap_err();
+        assert!(matches!(failure.kind, FailureKind::Denied));
+        assert!(
+            failure.detail.contains("input and clipboard"),
+            "{}",
+            failure.detail
+        );
     }
 
     #[test]
@@ -1180,7 +1467,7 @@ mod tests {
         // `Capabilities` cannot say "pointer but not keyboard", so a session that
         // published anything here would be claiming a capability it cannot honour
         // and peers would send keystrokes into a void. Refusing says so instead.
-        let failure = accept_granted(DeviceType::Pointer.into()).unwrap_err();
+        let failure = accept_granted(DeviceType::Pointer.into(), false).unwrap_err();
         assert!(matches!(failure.kind, FailureKind::Denied));
         assert!(
             failure.detail.contains("withheld keyboard"),
@@ -1209,12 +1496,15 @@ mod tests {
         // The self-heal for the other direction: a token for a grant that is refused
         // would restore the same half grant on every later launch with no dialog, so
         // the session would be wedged with nothing the user could act on.
-        let no_keyboard = accept_granted(DeviceType::Pointer.into()).unwrap_err();
+        let no_keyboard = accept_granted(DeviceType::Pointer.into(), false).unwrap_err();
         assert!(no_keyboard.discards_token);
+        // And it stays refused when the clipboard *was* granted: the half grant is
+        // the shape with no honest publication, whatever else came with it.
+        let with_clipboard = accept_granted(DeviceType::Pointer.into(), true).unwrap_err();
+        assert!(with_clipboard.discards_token);
 
-        let none_at_all = accept_granted(BitFlags::empty()).unwrap_err();
+        let none_at_all = accept_granted(BitFlags::empty(), false).unwrap_err();
         assert!(none_at_all.discards_token);
-        assert!(none_at_all.detail.contains("withheld keyboard and pointer"));
     }
 
     #[test]

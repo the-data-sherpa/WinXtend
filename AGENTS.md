@@ -135,8 +135,19 @@ libei devices are client-owned emulation devices. Capture is
 So the backend holds two sessions and the user answers two consent dialogs per
 launch; only `RemoteDesktop` has a restore token at the versions the alpha target
 has. `SharedSession` in `crates/wx-platform/src/linux_wayland/session.rs` is
-parameterised by which capability bit it owns precisely so one being revoked cannot
+parameterised by which capability bits it owns precisely so one being revoked cannot
 unadvertise the other.
+
+The clipboard is a third interface and deliberately **not** a third session:
+`org.freedesktop.portal.Clipboard` refuses `RequestClipboard` for anything that is
+not a `RemoteDesktop` session, so it rides that one — asked for between
+`SelectDevices` and `Start`, which is the only window the portal accepts it in.
+One dialog, two independent toggles: `Start` answers `clipboard_enabled` separately
+from the device list, so the session publishes `INJECT_CAPABILITIES` and
+`CLIPBOARD_CAPABILITIES` independently and either can be withheld. Everything
+measured about it — why no `wlr`/`ext` data-control route exists on this target,
+and the portal calls that fail — is in the module docs of
+`crates/wx-platform/src/linux_wayland/clipboard.rs` and `clipboard_portal.rs`.
 
 Everything measured about the capture side — that suppression is real and
 exclusive, that the compositor sends a capturing client no modifier state and no

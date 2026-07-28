@@ -5,7 +5,7 @@
 //! | Displays | `wl_output` + `xdg_output` | implemented, see [`display`] |
 //! | Capture | libei via the InputCapture portal | implemented, see [`capture`] |
 //! | Injection | libei via the RemoteDesktop portal | implemented, see [`inject`] and [`keymap`] |
-//! | Clipboard | `wl_data_device` / `zwlr_data_control_manager_v1` | skeleton |
+//! | Clipboard | the Clipboard portal, on the RemoteDesktop session | implemented, see [`clipboard`] |
 //! | Locking | systemd-logind | skeleton |
 //!
 //! The unimplemented parts are sketched from the libei and xdg-desktop-portal
@@ -46,7 +46,10 @@
 //!
 //! # Two portals, two sessions — and why that is not the mistake it looks like
 //!
-//! Injection and capture are **different interfaces**, not two halves of one.
+//! Injection and capture are **different interfaces**, not two halves of one. The
+//! clipboard is neither: it is a third interface that has no session of its own
+//! and rides the `RemoteDesktop` one. See [`clipboard`] for why there is no
+//! `wlr-data-control` route to it on this target and no fallback to build one on.
 //!
 //! `RemoteDesktop` is the portal for *driving* a desktop. Every device its session
 //! offers is an emulation device — on GNOME 50 the seat produces "WinXtend virtual
@@ -117,6 +120,7 @@ use crate::traits::{
 use crate::{LiveCapabilities, PlatformBackend, PlatformInfo};
 
 pub mod capture;
+pub mod clipboard;
 pub mod display;
 pub mod keymap;
 pub mod keys;
@@ -125,6 +129,9 @@ pub mod token;
 
 #[cfg(target_os = "linux")]
 mod outputs;
+
+#[cfg(target_os = "linux")]
+mod clipboard_portal;
 
 #[cfg(target_os = "linux")]
 mod driver;
@@ -148,13 +155,15 @@ mod inject_stub;
 use inject_stub as inject;
 
 pub use capture::CaptureState;
+pub use clipboard::ClipboardState;
 pub use display::WaylandDisplays;
 pub use session::{
-    SessionState, INPUT_CAPTURE_CAPABILITIES, PORTAL_INPUT_CAPTURE, PORTAL_REMOTE_DESKTOP,
-    REMOTE_DESKTOP_CAPABILITIES,
+    SessionState, CLIPBOARD_CAPABILITIES, INJECT_CAPABILITIES, INPUT_CAPTURE_CAPABILITIES,
+    PORTAL_INPUT_CAPTURE, PORTAL_REMOTE_DESKTOP, REMOTE_DESKTOP_CAPABILITIES,
 };
 pub use token::RESTORE_TOKEN_FILE;
 
+use clipboard::SelectionTransport;
 use session::SharedSession;
 
 const BACKEND: &str = "linux-wayland";
@@ -182,6 +191,14 @@ pub struct PortalSession {
     /// driver has somewhere to put them the moment the compositor offers them,
     /// which is before anything asks to inject.
     transport: Arc<inject::Transport>,
+    /// The clipboard, which rides this same session.
+    ///
+    /// Here rather than on [`WaylandClipboard`] for the same reason as the
+    /// transport, and because it is a *separate grant on one session*:
+    /// `RequestClipboard` is refused for anything that is not a `RemoteDesktop`
+    /// session, so there is nowhere else for it to live, but the consent dialog
+    /// answers for it independently. See [`clipboard`].
+    clipboard: Arc<ClipboardState>,
 }
 
 impl PortalSession {
@@ -194,6 +211,7 @@ impl PortalSession {
             _driver: None,
             shared: Arc::new(remote_desktop_session(live, base)),
             transport: Arc::new(inject::Transport::new()),
+            clipboard: Arc::new(ClipboardState::new()),
         }
     }
 
@@ -201,15 +219,18 @@ impl PortalSession {
     fn starting(live: LiveCapabilities, base: Capabilities, config_dir: &Path) -> Self {
         let shared = Arc::new(remote_desktop_session(live, base));
         let transport = Arc::new(inject::Transport::new());
+        let clipboard = Arc::new(ClipboardState::new());
         let driver = driver::start(
             Arc::clone(&shared),
             Arc::clone(&transport),
+            Arc::clone(&clipboard),
             config_dir.to_path_buf(),
         );
         Self {
             _driver: Some(driver),
             shared,
             transport,
+            clipboard,
         }
     }
 
@@ -384,31 +405,66 @@ impl InputInjector for WaylandInjector {
     }
 }
 
-/// TODO: `wl_data_device` for the clipboard, or
-/// `zwlr_data_control_manager_v1` where the compositor offers it — the latter is
-/// what makes clipboard access work without a focused surface, which a headless
-/// agent never has.
+/// Clipboard access over the `org.freedesktop.portal.Clipboard` portal.
 ///
-/// MIME types map directly: `text/plain;charset=utf-8`, `text/html`, `image/png`,
-/// `text/uri-list`. No change counter exists, so
-/// [`ClipboardAccess::change_serial`] must be synthesised from selection events.
-pub struct WaylandClipboard;
+/// The content rules are [`clipboard`] and the portal calls are
+/// `clipboard_portal`; what lives here is the same ordering
+/// [`WaylandInjector`] uses, with one more answer to give. Three things can be
+/// wrong and the user can act on only two of them, so they are kept apart:
+///
+/// * the session is gone, being acquired, or was never asked for — reported by
+///   [`PortalSession::require`], the same answer injection gives;
+/// * the session is live and the clipboard toggle in its dialog was refused —
+///   [`clipboard::not_granted`], a permission the user can go back and grant;
+/// * the clipboard is fine and simply holds nothing in the format asked for —
+///   [`PlatformError::ClipboardEmpty`], which is not a failure at all.
+///
+/// [`ClipboardAccess::change_serial`] is deliberately *not* gated on any of them.
+/// It reads a counter this process owns, it is what the agent polls, and a
+/// backend whose change detection started returning errors the moment a session
+/// ended would turn one revocation into a stream of them.
+pub struct WaylandClipboard {
+    portal: Arc<PortalSession>,
+}
+
+impl WaylandClipboard {
+    /// The portal transport, or the most specific reason there is not one.
+    fn transport(&self) -> Result<Arc<dyn SelectionTransport>> {
+        match self.portal.clipboard.transport() {
+            Some(transport) => Ok(transport),
+            // The session's own answer first, when it has one: "the dialog was
+            // dismissed" and "the clipboard toggle was off" send the user to
+            // different places, and only the second is about the clipboard.
+            None => Err(self
+                .portal
+                .require()
+                .err()
+                .unwrap_or_else(clipboard::not_granted)),
+        }
+    }
+}
 
 impl ClipboardAccess for WaylandClipboard {
     fn available_formats(&self) -> Result<Vec<ClipboardFormat>> {
-        Err(todo_err("clipboard access"))
+        // The transport is required even though the answer is held locally: a
+        // machine with no clipboard session must say so rather than report an
+        // empty clipboard, which the agent would read as "nothing to sync".
+        self.transport()?;
+        Ok(self.portal.clipboard.available_formats())
     }
 
-    fn read(&self, _format: ClipboardFormat) -> Result<Vec<u8>> {
-        Err(todo_err("clipboard access"))
+    fn read(&self, format: ClipboardFormat) -> Result<Vec<u8>> {
+        let transport = self.transport()?;
+        self.portal.clipboard.read(&*transport, format)
     }
 
-    fn write(&self, _format: ClipboardFormat, _data: &[u8]) -> Result<()> {
-        Err(todo_err("clipboard access"))
+    fn write(&self, format: ClipboardFormat, data: &[u8]) -> Result<()> {
+        let transport = self.transport()?;
+        self.portal.clipboard.write(&*transport, format, data)
     }
 
     fn change_serial(&self) -> Result<u64> {
-        Err(todo_err("clipboard access"))
+        Ok(self.portal.clipboard.change_serial())
     }
 }
 
@@ -433,13 +489,16 @@ impl ScreenSaverControl for WaylandSession {
 /// invites peers to route the cursor into a desktop that does not exist, and there
 /// is no error to report when they do.
 ///
-/// Capture and injection are absent here because at startup nobody has consented to
-/// them. Each appears in [`PlatformBackend::current_capabilities`] once *its* portal
-/// grants a session — [`REMOTE_DESKTOP_CAPABILITIES`] and
+/// Capture, injection and the clipboard are absent here because at startup nobody
+/// has consented to any of them. Each appears in
+/// [`PlatformBackend::current_capabilities`] once its portal grants it —
+/// [`INJECT_CAPABILITIES`], [`CLIPBOARD_CAPABILITIES`] and
 /// [`INPUT_CAPTURE_CAPABILITIES`] are where that happens — and goes away again the
-/// moment that session does. Clipboard and screensaver sync stay unadvertised in
-/// both places because they still return [`PlatformError::Unsupported`]. Claiming
-/// either would make a peer hand this node work it cannot do.
+/// moment that grant does. Injection and the clipboard come from one dialog and
+/// two independent toggles, so either can appear without the other. Screensaver
+/// sync stays unadvertised in both places because it still returns
+/// [`PlatformError::Unsupported`]. Claiming any of them here would make a peer
+/// hand this node work it cannot do.
 fn capabilities(has_displays: bool) -> Capabilities {
     if has_displays {
         Capabilities::HAS_DISPLAYS
@@ -521,9 +580,9 @@ fn assemble(
         capture: Box::new(WaylandCapture { session: capture }),
         injector: Box::new(WaylandInjector {
             inner: inject::Injector::new(Arc::clone(&portal.transport)),
-            portal,
+            portal: Arc::clone(&portal),
         }),
-        clipboard: Box::new(WaylandClipboard),
+        clipboard: Box::new(WaylandClipboard { portal }),
         screensaver: Box::new(WaylandSession),
     }
 }
@@ -738,7 +797,103 @@ mod tests {
             _driver: None,
             shared,
             transport: Arc::new(inject::Transport::new()),
+            clipboard: Arc::new(ClipboardState::new()),
         })
+    }
+
+    fn clipboard_on(portal: Arc<PortalSession>) -> WaylandClipboard {
+        WaylandClipboard { portal }
+    }
+
+    /// A transport that answers, so the ordering below can be shown to stop
+    /// asking about the session once there is one.
+    struct FakeSelection;
+
+    impl SelectionTransport for FakeSelection {
+        fn selection_read(&self, _mime: &str) -> Result<Vec<u8>> {
+            Ok(b"read".to_vec())
+        }
+        fn set_selection(&self, _mimes: &[&'static str]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_clipboard_refuses_rather_than_pretending_when_nobody_has_consented() {
+        // The same rule capture and injection obey. An empty format list from a
+        // backend with no session would read to the agent as "the clipboard is
+        // empty", and it would go on syncing nothing forever without a word.
+        let backend = backend().unwrap();
+        assert!(backend.clipboard.available_formats().is_err());
+        assert!(backend.clipboard.read(ClipboardFormat::Utf8Text).is_err());
+        assert!(backend.clipboard.write(ClipboardFormat::Png, &[]).is_err());
+    }
+
+    #[test]
+    fn the_change_serial_answers_even_with_no_session_at_all() {
+        // Deliberately not gated on the session. It is what the agent polls, it
+        // reads a counter this process owns, and a backend whose change detection
+        // started erroring the moment a session ended would turn one revocation
+        // into a stream of them in the log.
+        let backend = backend().unwrap();
+        let serial = backend.clipboard.change_serial().unwrap();
+        assert_eq!(backend.clipboard.change_serial().unwrap(), serial);
+    }
+
+    #[test]
+    fn a_granted_session_with_the_clipboard_toggle_off_says_which_of_the_two_it_was() {
+        // One dialog, two answers, and they send the user to different places. A
+        // live session that simply was not given the clipboard must not be
+        // reported as a session problem — the thing to change is the toggle, and
+        // the message has to name it.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = Arc::new(remote_desktop_session(live, Capabilities::NONE));
+        shared.starting();
+        shared.activate(INJECT_CAPABILITIES);
+        let clipboard = clipboard_on(detached(shared));
+
+        let err = clipboard.available_formats().unwrap_err();
+        assert!(
+            matches!(&err, PlatformError::PermissionDenied(msg) if msg.contains("Clipboard")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_session_is_reported_as_the_session_rather_than_as_the_clipboard() {
+        // The other order. Sending somebody to look for a clipboard toggle in a
+        // dialog they dismissed would be advice they cannot act on.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = Arc::new(remote_desktop_session(live, Capabilities::NONE));
+        shared.starting();
+        shared.denied("the consent dialog was dismissed");
+        let clipboard = clipboard_on(detached(shared));
+
+        let err = clipboard.read(ClipboardFormat::Utf8Text).unwrap_err();
+        assert!(
+            matches!(&err, PlatformError::PermissionDenied(msg) if msg.contains("dismissed")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_granted_clipboard_stops_asking_the_session_anything() {
+        // Once the portal has handed over a clipboard, the session's state is no
+        // longer the answer to a clipboard question: the transport is.
+        let live = LiveCapabilities::fixed(Capabilities::NONE);
+        let shared = Arc::new(remote_desktop_session(live, Capabilities::NONE));
+        let portal = detached(shared);
+        portal.clipboard.attach(Arc::new(FakeSelection));
+        portal
+            .clipboard
+            .selection_changed(vec![clipboard::MIME_TEXT.into()], Some(false));
+
+        let clipboard = clipboard_on(portal);
+        assert_eq!(
+            clipboard.available_formats().unwrap(),
+            vec![ClipboardFormat::Utf8Text]
+        );
+        assert_eq!(clipboard.read(ClipboardFormat::Utf8Text).unwrap(), b"read");
     }
 
     fn capture_on(shared: Arc<SharedSession>) -> WaylandCapture {

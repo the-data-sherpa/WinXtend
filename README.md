@@ -37,9 +37,15 @@ layout editor.
 >   is active the compositor sends this agent every keystroke and local windows
 >   none of them, which was measured rather than assumed. Each capability appears
 >   only while its own portal session is granted and goes away the moment it is
->   not, and they can be refused independently. Clipboard still does not work, so
->   the backend advertises nothing for it and refuses what it cannot do, on purpose
->   (`crates/wx-platform/src/linux_wayland/mod.rs::the_backend_advertises_nothing_it_cannot_do`).
+>   not, and they can be refused independently. The clipboard platform layer works
+>   too, over `org.freedesktop.portal.Clipboard` — the only route to a selection on
+>   this desktop, because Mutter offers neither `wlr-data-control` nor its
+>   standardised successor and `wl_data_device` fails silently in both directions
+>   without a focused surface. It rides the `RemoteDesktop` session rather than
+>   opening one of its own, and is granted by its own toggle in the same dialog, so
+>   a user can allow input and refuse the clipboard and be advertised as exactly
+>   that. Clipboard *sync* still does not work end to end, for the same reason it
+>   does not on Windows: the agent does not act on clipboard messages yet.
 >   Two `xdg-desktop-portal` consent dialogs appear per launch, one per portal;
 >   only the `RemoteDesktop` half has a restore token to suppress its own.
 >   macOS, X11, and evdev are further back than Wayland now is: compiling
@@ -181,7 +187,7 @@ for what the next release is about.
 | Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⚠️ | ✅ libei via the InputCapture portal | ⚠️ |
 | Input injection | ✅ | ⚠️ | ⚠️ | ✅ libei via the RemoteDesktop portal | ⚠️ |
-| Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ⚠️ | n/a |
+| Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
 | Screen capture | ✅ GDI | ⚠️ | ⚠️ | ⚠️ | n/a |
 
 ✅ implemented · ⚠️ compiling skeleton, requirements documented, no implementation
@@ -200,7 +206,7 @@ for what the next release is about.
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ⚠️ display enumeration, input injection and input capture — including real local suppression — have landed; clipboard is what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
+| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and the clipboard platform layer have landed; packaging and two-machine validation are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
 
 ## Building
 
@@ -383,19 +389,18 @@ platform; as the Wayland backend grows, the Linux total rises with it.
 
 The alpha is Linux/Wayland. Roughly in order of value:
 
-1. **The Wayland backend.** Clipboard against the `wlr`/`wl_data_device`
-   interfaces; display enumeration, input injection and input capture already
-   work, so a Linux machine can be either end of a mesh. Wayland input is the
-   standing gap in every tool in this space, and it is the strongest reason to
-   prefer this one.
-2. **Validate between two physical Linux machines** over a real network. Nothing
+1. **Validate between two physical Linux machines** over a real network. Nothing
    here is trustworthy until a cursor actually crosses one; every test today runs
-   in a single process.
-3. **Wire clipboard sync into the agent.** The platform side already works.
-4. **Packaging for Linux** — a distributable agent, a systemd user unit, and a
+   in a single process. Display enumeration, input injection, input capture and
+   the clipboard all work on Wayland now, so a Linux machine can be either end of
+   a mesh. Wayland input is the standing gap in every tool in this space, and it
+   is the strongest reason to prefer this one.
+2. **Wire clipboard sync into the agent.** The platform side works on Windows and
+   on Wayland; nothing above the platform traits acts on it yet.
+3. **Packaging for Linux** — a distributable agent, a systemd user unit, and a
    first-run path that does not require `cargo`.
-5. **The macOS backend.**
-6. **Screen streaming, once there is a backend to stream from.** This is the one
+4. **The macOS backend.**
+5. **Screen streaming, once there is a backend to stream from.** This is the one
    place WinXtend would reach past a classic software KVM: a machine with no
    monitor attached sending its screen to the UI, so a headless mini-PC is usable
    rather than merely reachable. It is **not connected today** — `wx-video` exists
