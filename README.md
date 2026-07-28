@@ -44,8 +44,9 @@ layout editor.
 >   without a focused surface. It rides the `RemoteDesktop` session rather than
 >   opening one of its own, and is granted by its own toggle in the same dialog, so
 >   a user can allow input and refuse the clipboard and be advertised as exactly
->   that. Clipboard *sync* now works end to end on top of it: copy on one machine
->   and the content is pasteable on the other, for text, HTML and PNG images.
+>   that. Clipboard *sync* is now wired on top of it, for text, HTML and PNG
+>   images, and has been exercised between two agents with genuinely separate
+>   clipboards over real QUIC — though never yet between two physical machines.
 >   Two `xdg-desktop-portal` consent dialogs appear per launch, one per portal;
 >   only the `RemoteDesktop` half has a restore token to suppress its own.
 >   macOS, X11, and evdev are further back than Wayland now is: compiling
@@ -53,9 +54,11 @@ layout editor.
 >   further. On those platforms the agent starts and does nothing.
 > - **It has never moved a cursor — or a clipboard — between two physical
 >   machines.** Every test runs in a single process. The QUIC handshake and session
->   tests are real, but they are loopback. Clipboard sync has been watched working
->   between two agents, but on one desktop, where both share the same physical
->   clipboard.
+>   tests are real, but they are loopback. Clipboard sync is the best-covered of
+>   these: its end-to-end tests drive two agents with genuinely separate clipboards
+>   across two real QUIC endpoints, so the exchange is proven without the
+>   single-host confound — but still on loopback. The live desktop run was two
+>   agents sharing one physical clipboard. Issue #11 is the two-machine test.
 > - **Screen streaming is not connected.** `wx-video` compiles and its tests
 >   pass, but nothing depends on it and the agent hardcodes a refusal in the
 >   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
@@ -206,7 +209,7 @@ for what the next release is about.
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
 | Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit and the registration is tested against a scratch config root, but no systemd user manager has yet started it at a real login |
-| Clipboard sync across machines | ✅ text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Exercised live between two agents on one Wayland desktop, which is as far as one host goes — see issue #11 |
+| Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
