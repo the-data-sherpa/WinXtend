@@ -72,6 +72,15 @@ pub enum AutostartError {
     },
     #[error("this user has no configuration directory to write a unit into")]
     NoConfigDir,
+    /// A path that no systemd unit can name, whatever the escaping around it.
+    ///
+    /// Reported when registering rather than written out and hoped for: systemd
+    /// refuses to load a unit whose `ExecStart` path contains one of these, and
+    /// that refusal happens at the next login where nobody is watching, while
+    /// [`is_registered`] goes on answering yes. A loud failure here is the only
+    /// version of this the user can act on.
+    #[error("{path} cannot be named in a systemd unit: {reason}")]
+    UnrepresentablePath { path: String, reason: String },
 }
 
 /// Whether the agent is registered to start with the session.
@@ -195,8 +204,57 @@ pub mod linux_impl {
     /// Takes the path already rendered rather than a `Path` so that the one
     /// caller that has no real binary — the packaging step's equivalent — and
     /// the one that does agree on the rendering.
-    pub fn unit_text(exec_start: &Path) -> String {
-        UNIT_TEMPLATE.replace(EXEC_START, &quoted(exec_start))
+    pub fn unit_text(exec_start: &Path) -> Result<String, AutostartError> {
+        representable(exec_start)?;
+        Ok(UNIT_TEMPLATE.replace(EXEC_START, &quoted(exec_start)))
+    }
+
+    /// Characters systemd will not accept in an `ExecStart` executable path,
+    /// whatever is written around them.
+    ///
+    /// systemd unquotes and unescapes the value first and then requires the
+    /// resulting path to be "safe": no ASCII control character, no quote of
+    /// either kind, no backslash. Escaping does not buy its way past that check,
+    /// it only reaches it: `systemd-analyze verify --user` reads the escaped
+    /// newline in `ExecStart="/opt/win\ntend/wx-agent"` back as a real newline,
+    /// exactly as intended, and then calls the unit a fatal error that will not
+    /// be started. The same for `\t`, for `\x0b`, and for the `\\` and `\"`
+    /// [`quoted`] already writes.
+    ///
+    /// A space and a percent are deliberately not in this set: both are
+    /// expressible, and rendering them correctly is what [`quoted`] is for. This
+    /// is the set with no correct rendering at all.
+    fn unrepresentable(c: char) -> bool {
+        c.is_ascii_control() || matches!(c, '"' | '\'' | '\\')
+    }
+
+    /// Whether this path can be written into a unit and read back as itself.
+    ///
+    /// Two ways it cannot. It may hold a character systemd rejects outright, and
+    /// then no rendering works. Or it may not be UTF-8, and then a unit file —
+    /// which is text — can only carry a lossy transcription of it: the unit
+    /// would load happily and name a binary that does not exist, which is the
+    /// silent-at-every-login failure with the diagnosis removed.
+    fn representable(path: &Path) -> Result<(), AutostartError> {
+        let Some(rendered) = path.to_str() else {
+            return Err(AutostartError::UnrepresentablePath {
+                path: path.display().to_string(),
+                reason: "it is not valid UTF-8, and a unit file can only carry text — \
+                         systemd would read back a different path than this one"
+                    .to_owned(),
+            });
+        };
+        match rendered.chars().find(|c| unrepresentable(*c)) {
+            None => Ok(()),
+            Some(bad) => Err(AutostartError::UnrepresentablePath {
+                path: rendered.escape_debug().to_string(),
+                reason: format!(
+                    "systemd rejects '{}' in an ExecStart path however it is escaped; \
+                     move or reinstall the agent somewhere without it",
+                    bad.escape_debug()
+                ),
+            }),
+        }
     }
 
     /// A path as a single `ExecStart` word.
@@ -215,6 +273,10 @@ pub mod linux_impl {
     /// systemd resolves its specifiers across the whole directive — so a literal
     /// percent has to be written `%%` or the command silently becomes a
     /// different one, or the unit refuses to load, at the next login only.
+    ///
+    /// This renders; it does not decide. Whether a path can be expressed at all
+    /// is [`representable`]'s question, and [`unit_text`] asks it first, so
+    /// nothing reaches here that systemd would then reject.
     fn quoted(path: &Path) -> String {
         let escaped = path
             .display()
@@ -278,6 +340,10 @@ pub mod linux_impl {
     /// can be redirected completely, so the Linux tests touch nothing real.
     pub fn install_in(root: &Path) -> Result<PathBuf, AutostartError> {
         let exe = std::env::current_exe().map_err(AutostartError::ExePath)?;
+        // Rendered before anything is created, so that a path systemd cannot
+        // name is a refusal and not a half-built registration: no directory, no
+        // unit, no link, and an error that says which character did it.
+        let text = unit_text(&exe)?;
         let dir = unit_dir(root);
         std::fs::create_dir_all(&dir).map_err(io("creating", &dir))?;
 
@@ -285,7 +351,7 @@ pub mod linux_impl {
         // ExecStart names a binary that has moved fails at every login and says
         // nothing, which is worse than not being registered at all.
         let unit = unit_path(root);
-        std::fs::write(&unit, unit_text(&exe)).map_err(io("writing", &unit))?;
+        std::fs::write(&unit, text).map_err(io("writing", &unit))?;
 
         let link = link_path(root);
         let wants = link.parent().expect("the link path has a parent");
@@ -331,10 +397,12 @@ pub mod linux_impl {
     /// file would report that perfectly good registration as absent.
     pub fn is_registered_in(root: &Path) -> Result<bool, AutostartError> {
         let link = link_path(root);
-        // `symlink_metadata` first, so a dangling link reads as a link that is
-        // present rather than as a file that is not; `metadata` then follows it,
-        // which is the question being asked — is there a unit at the other end.
-        Ok(std::fs::symlink_metadata(&link).is_ok() && std::fs::metadata(&link).is_ok())
+        // `metadata` follows the link, which is the whole question — is there a
+        // unit at the other end. It answers no for a link with nothing behind it
+        // and no for no link at all, which are the two ways of not being
+        // registered; an `lstat` alongside it would add nothing, because a path
+        // `stat` succeeds on is a path `lstat` cannot fail on.
+        Ok(std::fs::metadata(&link).is_ok())
     }
 
     /// How long to wait for the reload before giving up on it.
@@ -840,7 +908,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_unit_is_a_session_service_ordered_after_the_portal() {
-        let unit = linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent"));
+        let unit = linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")).unwrap();
 
         assert!(
             unit.contains("ExecStart=\"/usr/bin/wx-agent\""),
@@ -880,7 +948,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_path_with_a_space_stays_one_argument() {
-        let unit = linux_impl::unit_text(std::path::Path::new("/opt/win xtend/wx-agent"));
+        let unit = linux_impl::unit_text(std::path::Path::new("/opt/win xtend/wx-agent")).unwrap();
         assert!(
             unit.contains("ExecStart=\"/opt/win xtend/wx-agent\""),
             "{unit}"
@@ -899,11 +967,59 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_path_with_a_percent_is_not_read_as_a_specifier() {
-        let unit = linux_impl::unit_text(std::path::Path::new("/opt/wx%20build/wx-agent"));
+        let unit = linux_impl::unit_text(std::path::Path::new("/opt/wx%20build/wx-agent")).unwrap();
         assert!(
             unit.contains("ExecStart=\"/opt/wx%%20build/wx-agent\""),
             "{unit}"
         );
+    }
+
+    /// A path systemd cannot name is refused, not written out and hoped for.
+    ///
+    /// The escaping route was tried against real systemd first, because it would
+    /// have been the better answer. It does not exist. `systemd-analyze verify
+    /// --user` on a unit rendering `ExecStart="/opt/win\ntend/wx-agent"` reads
+    /// the escape back correctly — it prints the path with a real newline in it
+    /// — and then says `Executable path contains special characters` and
+    /// `Unit configuration has fatal error, unit will not be started`. The
+    /// unescaped form fails differently and just as fatally, with
+    /// `Unbalanced quoting` and then `Service has no ExecStart=`. systemd
+    /// unescapes and *then* demands a "safe" path, so there is no rendering that
+    /// makes one of these work.
+    ///
+    /// Which leaves two options, and only one of them is honest: write a unit
+    /// that cannot load while `is_registered_in` reports the agent registered —
+    /// the exact silent-at-every-login failure this module is written against —
+    /// or refuse at `--install` time with an error naming the character. Hence
+    /// this.
+    ///
+    /// The same verification found three more characters in the same position,
+    /// which is why the check is a set rather than a newline: systemd rejects
+    /// `"`, `'` and `\` in an executable path too, and `/home/o'brien/wx-agent`
+    /// is a great deal more likely to exist than a path with a newline in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_systemd_cannot_express_is_refused_at_install_time() {
+        for bad in [
+            "/opt/win\ntend/wx-agent",
+            "/opt/win\ttend/wx-agent",
+            "/opt/win\x0btend/wx-agent",
+            "/home/o'brien/wx-agent",
+            "/opt/win\"tend/wx-agent",
+            "/opt/win\\tend/wx-agent",
+        ] {
+            let err = linux_impl::unit_text(std::path::Path::new(bad))
+                .expect_err("systemd will not load a unit naming this path");
+            assert!(
+                matches!(err, AutostartError::UnrepresentablePath { .. }),
+                "{bad:?}: {err}"
+            );
+            // The message has to be actionable: a user reading it must be able
+            // to tell which path was refused without re-running anything.
+            let text = err.to_string();
+            assert!(text.contains("wx-agent"), "{bad:?}: {text}");
+            assert!(text.contains("systemd unit"), "{bad:?}: {text}");
+        }
     }
 
     /// Enabling means the symlink `systemctl --user enable` would have made, in
@@ -973,7 +1089,7 @@ mod tests {
         let packaged = root.join("usr-lib-winxtend.service");
         std::fs::write(
             &packaged,
-            linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")),
+            linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")).unwrap(),
         )
         .unwrap();
 

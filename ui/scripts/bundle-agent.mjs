@@ -103,9 +103,30 @@ function quoted(path) {
   return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
 }
 
+// The characters systemd will not accept in an `ExecStart` executable path at
+// all, mirroring `linux_impl::unrepresentable`. systemd unquotes and unescapes
+// the value and *then* requires the result to be "safe", so escaping reaches
+// that check rather than getting past it: `systemd-analyze verify --user` reads
+// `"…win\ntend…"` back as the intended path and still calls the unit a fatal
+// error. `/usr/bin/wx-agent` contains none of these, so this never fires here —
+// it is the twin of the Rust refusal, kept so that the two substituters agree
+// about what is renderable as well as about how to render it.
+const UNREPRESENTABLE = /[\x00-\x1f\x7f"'\\]/u;
+
+function representable(path) {
+  const bad = UNREPRESENTABLE.exec(path);
+  if (bad) {
+    throw new Error(
+      `${JSON.stringify(path)} cannot be named in a systemd unit: systemd rejects ` +
+        `${JSON.stringify(bad[0])} in an ExecStart path however it is escaped`,
+    );
+  }
+  return path;
+}
+
 function generateUnit() {
   const template = readFileSync(join(repo, "packaging", "winxtend.service.in"), "utf8");
-  const unit = template.replaceAll("@EXEC_START@", quoted(INSTALLED_AGENT));
+  const unit = template.replaceAll("@EXEC_START@", quoted(representable(INSTALLED_AGENT)));
   if (unit.includes("@EXEC_START@")) throw new Error("the unit template still has a placeholder in it");
   const target = join(repo, "packaging", "winxtend.service");
   writeFileSync(target, unit);

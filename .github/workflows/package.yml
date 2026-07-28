@@ -103,7 +103,7 @@ jobs:
           # the check that exists precisely to catch it. The `\(` arm allows a
           # version constraint after the name.
           for dep in libwebkit2gtk-4.1-0 libgtk-3-0 xdg-desktop-portal \
-                     xdg-desktop-portal-gnome libei1; do
+                     xdg-desktop-portal-gnome; do
             echo "$control" | grep -qE "(^|[ ,])${dep}([ ,(]|\$)" \
               || { echo "::error::$dep is not a declared dependency"; fail=1; }
           done

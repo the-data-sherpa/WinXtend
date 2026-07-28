@@ -35,7 +35,7 @@
     "externalBin": ["binaries/wx-agent"],
     "linux": {
       "deb": {
-        "depends": ["xdg-desktop-portal", "xdg-desktop-portal-gnome", "libei1"],
+        "depends": ["xdg-desktop-portal", "xdg-desktop-portal-gnome"],
         "files": {
           "/usr/lib/systemd/user/winxtend.service": "../../packaging/winxtend.service"
         }

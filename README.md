@@ -221,8 +221,8 @@ sudo apt install ./WinXtend_0.1.0_amd64.deb
 ```
 
 `apt` rather than `dpkg -i` so that the runtime dependencies are pulled in:
-`xdg-desktop-portal`, `xdg-desktop-portal-gnome`, `libei1`, and the WebKitGTK
-stack Tauri needs. Then launch **WinXtend** from the app grid; it starts the
+`xdg-desktop-portal`, `xdg-desktop-portal-gnome`, and the WebKitGTK stack Tauri
+needs. Then launch **WinXtend** from the app grid; it starts the
 agent itself. What the package puts where:
 
 | Path | What it is |
