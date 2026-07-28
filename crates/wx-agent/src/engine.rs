@@ -1497,6 +1497,42 @@ impl Engine {
         // and a reconnecting node with a stale copy needs the other's.
         self.send_to(node, Outbound::Control(ControlMsg::LayoutRequest));
 
+        // Say what this machine can do *now*, not what it could when the handshake
+        // snapshot was taken.
+        //
+        // The two are routinely different, and the gap is not small. The accept loop
+        // clones `local_info` at the top of each iteration — before it awaits the
+        // next connection — so the `NodeInfo` a peer receives can be arbitrarily old,
+        // and on Wayland it is nearly always older than the portal grant: the consent
+        // dialog is answered seconds or minutes after the process starts, and the
+        // first peer usually connects in that window. `sync_capabilities` does not
+        // close it, because by the time the session exists the local capabilities
+        // have already finished changing and it only speaks on a transition.
+        //
+        // Measured on this desktop: alpha's grant landed two seconds before bravo
+        // connected, so bravo spent the whole session believing alpha could not take
+        // clipboard content, and refused to offer it any. Cheap to prevent — the
+        // receiving side's `set_peer_capabilities` is a no-op when nothing changed,
+        // so a peer whose snapshot was current pays one small message and logs
+        // nothing.
+        let capabilities = self.advertised_by(self.local);
+        if needs_capability_correction(
+            info.capabilities,
+            capabilities,
+            self.peer_supports(node, Capabilities::CAPABILITY_UPDATES),
+        ) {
+            tracing::info!(
+                peer = %node,
+                handshake = %info.capabilities.describe(),
+                now = %capabilities.describe(),
+                "this machine changed what it can do since the handshake; telling the peer"
+            );
+            self.send_to(
+                node,
+                Outbound::Control(ControlMsg::CapabilitiesChanged { capabilities }),
+            );
+        }
+
         // A machine with a place in the layout that cannot take input is the exact
         // failure capability negotiation exists to make visible: the cursor crosses
         // onto it and the keyboard goes dead with nothing anywhere to say why. It is
@@ -3010,6 +3046,10 @@ impl Engine {
         let peers: Vec<NodeId> = self.sessions.keys().copied().collect();
         for node in peers {
             if !self.clipboard_shared_with(node) {
+                // Said rather than skipped silently: "why did my copy not reach that
+                // machine" has exactly two answers, and this is the one the user
+                // chose themselves.
+                tracing::debug!(peer = %node, "not offering the clipboard: not sharing with this machine");
                 continue;
             }
             let theirs = self.advertised_by(node);
@@ -3550,6 +3590,21 @@ fn spawn_sender(session: Session) -> mpsc::Sender<Outbound> {
         }
     });
     tx
+}
+
+/// Whether a peer's idea of this machine, taken at the handshake, is already out of
+/// date.
+///
+/// Only when the peer can be told: a build that never advertised
+/// `CAPABILITY_UPDATES` cannot decode the message, and a control message a peer
+/// cannot decode closes the session rather than informing it. See
+/// [`Engine::broadcast_control_capable`].
+fn needs_capability_correction(
+    handshake: Capabilities,
+    now: Capabilities,
+    peer_understands_updates: bool,
+) -> bool {
+    peer_understands_updates && handshake != now
 }
 
 /// Whether clipboard content may cross to a machine at all.
@@ -4127,6 +4182,31 @@ mod tests {
             logs.contains("workshop-mac") && logs.contains(&node(2).short()),
             "the machine was not named: {logs}"
         );
+    }
+
+    #[test]
+    fn a_peer_is_corrected_when_the_handshake_snapshot_is_already_stale() {
+        // Measured on a real Wayland desktop while proving this slice out: the accept
+        // loop clones `local_info` at the top of each iteration, *before* it awaits
+        // the next connection, so the `NodeInfo` a peer receives can predate the
+        // portal grant by any amount. `sync_capabilities` does not close the gap
+        // either, because it only speaks on a transition and the transition happened
+        // before the session existed. The peer then spends the whole session
+        // believing this machine cannot take clipboard content, and refuses to offer
+        // it any — which is what actually happened, in both directions.
+        let granted = Capabilities::HAS_DISPLAYS
+            | Capabilities::CLIPBOARD_TEXT
+            | Capabilities::CAPABILITY_UPDATES;
+        let at_boot = Capabilities::HAS_DISPLAYS | Capabilities::CAPABILITY_UPDATES;
+        assert!(needs_capability_correction(at_boot, granted, true));
+        // Revocation is the same gap in reverse, and just as wrong to leave standing.
+        assert!(needs_capability_correction(granted, at_boot, true));
+
+        // A snapshot that was already current costs one comparison and no message.
+        assert!(!needs_capability_correction(granted, granted, true));
+        // And a peer that never claimed it understands the message is never sent one:
+        // a variant its build lacks is a decode error, which closes the session.
+        assert!(!needs_capability_correction(at_boot, granted, false));
     }
 
     #[test]

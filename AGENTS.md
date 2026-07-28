@@ -114,7 +114,33 @@ real compositor on one box, with no extra packages:
   A capture session pins the pointer and swallows the keyboard, so a test that
   wedges leaves whoever is at the machine unable to recover. Never start one
   without a bounded lifetime and a way to kill the agents from another terminal,
-  and say so before you run it.
+  and say so before you run it. Denying the *Input Capture* consent dialog is a
+  legitimate way to run a clipboard or layout test with no pointer hazard at all —
+  the clipboard rides the `RemoteDesktop` session, so it is unaffected — and only
+  `RemoteDesktop` has a restore token, so that is also the only dialog a relaunch
+  skips.
+
+  **The clipboard is confounded on one host in the same way the cursor is, and
+  worse.** Two agents in one desktop session share one physical clipboard, so
+  "machine A's clipboard" and "machine B's clipboard" are the same object. Every
+  message still flows and every payload still round-trips byte-exact, so the
+  transport, the format gating and the size limits are all genuinely testable this
+  way — but the write-back suppression in `crates/wx-agent/src/clipboard.rs` looks
+  broken and is not: the agent that *wrote* absorbs its own change correctly, and
+  the other agent then sees that write as a change nobody told it about and offers
+  it back. Read the two agents' logs separately — the writer must log zero
+  "offering the clipboard" — rather than concluding from the pair that there is a
+  loop. Between two real machines the second agent's clipboard never moves and the
+  exchange terminates. Issue #11 is the honest test here too.
+
+A peer's `NodeInfo` can predate a portal grant, and routinely does. The accept loop
+snapshots `local_info` at the top of each iteration — before it awaits the next
+connection — so what a peer learns at the handshake may be minutes old, and on
+Wayland the consent dialog is usually answered after the process starts and around
+when peers connect. `sync_capabilities` does not close that gap, because it only
+speaks on a transition and the transition already happened. `Engine::on_peer_ready`
+corrects the peer when the two differ; a new feature that depends on a peer's
+advertised capabilities should not assume the handshake value is current.
 
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
