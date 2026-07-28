@@ -121,7 +121,24 @@ real compositor on one box, with no extra packages:
   A capture session pins the pointer and swallows the keyboard, so a test that
   wedges leaves whoever is at the machine unable to recover. Never start one
   without a bounded lifetime and a way to kill the agents from another terminal,
-  and say so before you run it.
+  and say so before you run it. Denying the *Input Capture* consent dialog is a
+  legitimate way to run a clipboard or layout test with no pointer hazard at all —
+  the clipboard rides the `RemoteDesktop` session, so it is unaffected — and only
+  `RemoteDesktop` has a restore token, so that is also the only dialog a relaunch
+  skips.
+
+  **The clipboard is confounded on one host in the same way the cursor is, and
+  worse.** Two agents in one desktop session share one physical clipboard, so
+  "machine A's clipboard" and "machine B's clipboard" are the same object. Every
+  message still flows and every payload still round-trips byte-exact, so the
+  transport, the format gating and the size limits are all genuinely testable this
+  way — but the write-back suppression in `crates/wx-agent/src/clipboard.rs` looks
+  broken and is not: the agent that *wrote* absorbs its own change correctly, and
+  the other agent then sees that write as a change nobody told it about and offers
+  it back. Read the two agents' logs separately — the writer must log zero
+  "offering the clipboard" — rather than concluding from the pair that there is a
+  loop. Between two real machines the second agent's clipboard never moves and the
+  exchange terminates. Issue #11 is the honest test here too.
 
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
@@ -239,6 +256,24 @@ anything touching the real registry, clipboard, or desktop still needs a Windows
 - **`ControlMsg::MonitorsChanged` carries monitors and not capabilities.** Both sides
   therefore derive `HAS_DISPLAYS` from the monitor list, through `with_displays` in
   `engine.rs`. Keep it as one rule in one place.
+- **A peer's handshake `NodeInfo` can predate a portal grant, and routinely does.**
+  The accept loop snapshots `local_info` at the top of each iteration — before it
+  awaits the next connection — so what a peer learns at the handshake may be minutes
+  old, and on Wayland the consent dialog is usually answered after the process
+  starts and around when peers connect. `sync_capabilities` does not close that gap,
+  because it only speaks on a transition and the transition already happened.
+  `Engine::on_peer_ready` therefore sends `CapabilitiesChanged` to every peer that
+  can decode it, **unconditionally** — there is no sound local operand to compare
+  against, because the snapshot the peer was actually given is a clone nobody kept,
+  and comparing against the peer's own advertised set instead silently matches on
+  two identically configured machines and skips the correction exactly when it is
+  needed.
+
+The rule that follows for anything new: **do not gate a feature on a peer's
+handshake capability set**, and do not gate one on this machine's either. Ask at
+the moment the feature is used, when the answer is current. The clipboard's QUIC
+stream is built that way — opened on demand rather than during session setup — for
+this reason as much as for compatibility with a build that predates it.
 
 ## The UI workspace does not build until the agent sidecar exists
 

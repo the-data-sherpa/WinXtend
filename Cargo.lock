@@ -2267,6 +2267,7 @@ dependencies = [
  "wx-net",
  "wx-platform",
  "wx-proto",
+ "zstd",
 ]
 
 [[package]]

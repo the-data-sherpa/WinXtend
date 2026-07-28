@@ -22,11 +22,11 @@ layout editor.
 >
 > - **Windows is the only complete backend, and it is out of alpha scope.**
 >   Capture, injection, displays, and the clipboard platform layer all work there.
->   Clipboard *sync*, though, does not work end to end on Windows any more than
->   anywhere else, because the agent does not act on clipboard messages yet — they
->   fall into the catch-all arm in `crates/wx-agent/src/engine.rs` that logs
->   "ignoring a message this build does not handle". It is kept, tested, and
->   accurately described below — but it is not what the alpha is aimed at.
+>   Clipboard *sync* is now wired into the agent, and the wiring is platform
+>   independent — but it has only been exercised live on Wayland, so on Windows
+>   read it as "implemented and unit-tested", not "watched working". It is kept,
+>   tested, and accurately described below — but it is not what the alpha is aimed
+>   at.
 > - **Linux/Wayland is the alpha target, and it is being built now.** Display
 >   enumeration works: a `wl_output`/`xdg_output` client enumerates monitors, and
 >   `capabilities()` advertises `HAS_DISPLAYS` only when enumeration actually found
@@ -46,16 +46,21 @@ layout editor.
 >   without a focused surface. It rides the `RemoteDesktop` session rather than
 >   opening one of its own, and is granted by its own toggle in the same dialog, so
 >   a user can allow input and refuse the clipboard and be advertised as exactly
->   that. Clipboard *sync* still does not work end to end, for the same reason it
->   does not on Windows: the agent does not act on clipboard messages yet.
+>   that. Clipboard *sync* is now wired on top of it, for text, HTML and PNG
+>   images, and has been exercised between two agents with genuinely separate
+>   clipboards over real QUIC — though never yet between two physical machines.
 >   Two `xdg-desktop-portal` consent dialogs appear per launch, one per portal;
 >   only the `RemoteDesktop` half has a restore token to suppress its own.
 >   macOS, X11, and evdev are further back than Wayland now is: compiling
 >   skeletons, documented down to the exact syscall sequences and implemented no
 >   further. On those platforms the agent starts and does nothing.
-> - **It has never moved a cursor between two physical machines.** Every test runs
->   in a single process. The QUIC handshake and session tests are real, but they
->   are loopback.
+> - **It has never moved a cursor — or a clipboard — between two physical
+>   machines.** Every test runs in a single process. The QUIC handshake and session
+>   tests are real, but they are loopback. Clipboard sync is the best-covered of
+>   these: its end-to-end tests drive two agents with genuinely separate clipboards
+>   across two real QUIC endpoints, so the exchange is proven without the
+>   single-host confound — but still on loopback. The live desktop run was two
+>   agents sharing one physical clipboard. Issue #11 is the two-machine test.
 > - **Screen streaming is not connected.** `wx-video` compiles and its tests
 >   pass, but nothing depends on it and the agent hardcodes a refusal in the
 >   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
@@ -152,7 +157,7 @@ flowchart TD
         BN[wx-net<br/>QUIC session] --> BI[wx-platform<br/>inject]
         BV["wx-video<br/>capture + encode<br/>(parked: not wired in)"] -.-> BN
     end
-    AN -->|"datagrams: pointer motion<br/>streams: keys, clipboard, control"| BN
+    AN -->|"datagrams: pointer motion<br/>streams: keys and control<br/>clipboard: a stream of its own"| BN
     AN -.->|local IPC| UI[Tauri UI<br/>discovery, layout editor, status]
 ```
 
@@ -206,11 +211,11 @@ for what the next release is about.
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
 | Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit and the registration is tested against a scratch config root, but no systemd user manager has yet started it at a real login |
-| Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
+| Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and the clipboard platform layer have landed; two-machine validation and a clean-machine first run are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
+| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and clipboard sync have landed; two-machine validation and a clean-machine first run are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
 
 ## Installing on Ubuntu
 
@@ -401,6 +406,32 @@ Configuration lives in `config.toml` in the per-user OS config directory
 alongside the identity key and trust store. The QUIC listener defaults to port
 **24800**.
 
+### Sharing the clipboard
+
+Copying on one machine makes the content pasteable on the others, for plain text,
+HTML and PNG images. A file list is never sent: the paths would name files that
+are not on the receiving machine, and moving them needs the file transfer this
+build does not implement. Anything larger than the protocol's 32 MiB frame is
+refused with a message rather than dropping the session.
+
+It is on for every paired machine and needs no configuration. Each side also has
+to advertise the matching capability — on Wayland that means the clipboard toggle
+in the `xdg-desktop-portal` consent dialog, which can be refused while input is
+allowed — and a machine that has not advertised it is named in a warning rather
+than quietly skipped.
+
+To turn it off for one peer, add its full hex node ID to `config.toml`.
+`wx-agent --status` prints only the first eight characters; the whole ID is a key
+in `trusted-peers.toml`, beside it in the same directory.
+
+```toml
+[peer.3f7a9c2b1d4e...]   # the peer's full 64-character hex node ID
+clipboard = false
+```
+
+That switch is config-file only for now; there is no UI or CLI control for it
+yet.
+
 ### Default hotkeys
 
 | Chord | Action |
@@ -505,16 +536,19 @@ The alpha is Linux/Wayland. Roughly in order of value:
 
 1. **Validate between two physical Linux machines** over a real network. Nothing
    here is trustworthy until a cursor actually crosses one; every test today runs
-   in a single process. Display enumeration, input injection, input capture and
-   the clipboard all work on Wayland now, so a Linux machine can be either end of
-   a mesh. Wayland input is the standing gap in every tool in this space, and it
-   is the strongest reason to prefer this one.
-2. **Wire clipboard sync into the agent.** The platform side works on Windows and
-   on Wayland; nothing above the platform traits acts on it yet.
-3. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
+   in a single process, and two agents on one desktop share one physical clipboard,
+   so "it arrived on the *other* machine" is not separable on one host. Display
+   enumeration, input injection, input capture and clipboard sync all work on
+   Wayland now, so a Linux machine can be either end of a mesh. Wayland input is
+   the standing gap in every tool in this space, and it is the strongest reason to
+   prefer this one.
+2. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
    toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu). What
    is left is the first-run walkthrough on a clean machine, which needs two of
    them.
+3. **A UI control for the per-peer clipboard switch.** The setting is honoured
+   today but only reachable by editing `config.toml` — see
+   [Sharing the clipboard](#sharing-the-clipboard).
 4. **The macOS backend.**
 5. **Screen streaming, once there is a backend to stream from.** This is the one
    place WinXtend would reach past a classic software KVM: a machine with no
@@ -527,7 +561,7 @@ The alpha is Linux/Wayland. Roughly in order of value:
    also means a real codec behind the existing `Encoder` seam; the current
    lossless passthrough is LAN-only. Even finished, it needs the agent running, so
    it would never be a bare-metal rescue tool.
-7. A relay for machines on different networks or across a VPN.
+6. A relay for machines on different networks or across a VPN.
 
 ## Prior art
 

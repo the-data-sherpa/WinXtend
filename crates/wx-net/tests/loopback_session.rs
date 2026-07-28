@@ -27,7 +27,14 @@ fn node_info(id: NodeId, name: &str) -> NodeInfo {
         name: name.into(),
         platform: Platform::Windows,
         display_server: DisplayServer::Windows,
-        capabilities: Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT,
+        // The clipboard bits are here because several of these tests move
+        // clipboard payloads: a fixture that advertised only input would describe a
+        // machine that never syncs the clipboard, and the tests below would then be
+        // exercising a session no agent would ever put clipboard traffic on.
+        capabilities: Capabilities::CAPTURE_INPUT
+            | Capabilities::INJECT_INPUT
+            | Capabilities::CLIPBOARD_TEXT
+            | Capabilities::CLIPBOARD_IMAGE,
         monitors: Vec::new(),
         agent_version: "0.1.0".into(),
     }
@@ -351,6 +358,127 @@ async fn both_sides_derive_the_same_pairing_proof_over_a_real_connection() {
     // And a different PIN on one machine must not pair.
     let wrong = PairingSession::new(server.established(), Pin::parse("482914").unwrap());
     assert!(!wrong.accepts(&client_side.confirm()).unwrap());
+}
+
+#[tokio::test]
+async fn a_large_clipboard_payload_round_trips_on_its_own_stream() {
+    // Twenty megabytes: the size the clipboard stream exists for, and far more than
+    // one QUIC flow-control window, so this only passes if the writer and the
+    // reader agree about which stream the bytes are on.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (client, _ce) = client.expect("client handshake");
+    let (_server, mut server_events) = server.expect("server handshake");
+
+    let msg = clipboard_payload(20 * 1024 * 1024);
+    client.send_clipboard(&msg).await.unwrap();
+    match next_event(&mut server_events).await {
+        SessionEvent::Control(got) => assert_eq!(got, msg),
+        other => panic!("expected the clipboard payload, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_clipboard_stream_answers_in_both_directions() {
+    // The responder writes its half of the same bidirectional stream. If only the
+    // initiator's direction were wired, a peer could send the clipboard but never
+    // serve a request for it.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (_client, mut client_events) = client.expect("client handshake");
+    let (server, _se) = server.expect("server handshake");
+
+    let msg = ControlMsg::ClipboardStale { serial: 77 };
+    server.send_clipboard(&msg).await.unwrap();
+    match next_event(&mut client_events).await {
+        SessionEvent::Control(got) => assert_eq!(got, msg),
+        other => panic!("expected the stale reply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_clipboard_transfer_does_not_hold_up_the_cursor() {
+    // The whole reason the clipboard has a stream of its own. Sharing the control
+    // stream would park this `TakeControl` behind twenty megabytes of image — and a
+    // handoff that arrives after the transfer is a cursor frozen for its duration
+    // on a link that is otherwise perfectly healthy.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (client, _ce) = client.expect("client handshake");
+    let (_server, mut server_events) = server.expect("server handshake");
+
+    let bulk = clipboard_payload(20 * 1024 * 1024);
+    let sender = client.clone();
+    let writing = tokio::spawn(async move { sender.send_clipboard(&bulk).await });
+    // Let the transfer get as far as its first blocked write before the handoff is
+    // offered; without this the race is untested rather than won.
+    tokio::task::yield_now().await;
+
+    let handoff = ControlMsg::TakeControl {
+        target: MonitorId(0),
+        entry: NormPos::new(0.0, 0.5),
+        via: wx_proto::Edge::Left,
+    };
+    client.send_control(&handoff).await.unwrap();
+
+    match next_event(&mut server_events).await {
+        SessionEvent::Control(got) => assert_eq!(
+            got, handoff,
+            "the clipboard transfer overtook the handoff, so they share a stream"
+        ),
+        other => panic!("expected the handoff first, got {other:?}"),
+    }
+    writing.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_session_works_before_either_end_has_opened_a_clipboard_stream() {
+    // The clipboard lane is opened on demand, so a peer that never syncs anything
+    // — an older build, or a machine nobody has copied on — never opens one, and
+    // must still get a session that comes up and carries input. Waiting for that
+    // stream during setup is what wedged the responder against exactly such a peer.
+    //
+    // Then the same session grows the lane mid-flight, which is the Wayland case:
+    // the portal grant lands after the handshake, and a clipboard gated on what was
+    // advertised then would never arrive.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (client, _ce) = client.expect("client handshake");
+    let (_server, mut server_events) = server.expect("server handshake");
+
+    let key = InputFrame::new(
+        client.next_seq(),
+        MonitorId(0),
+        InputEvent::Key(KeyEvent::text("a", KeyAction::Press, Modifiers::NONE)),
+    );
+    client.send_input(&key).await.unwrap();
+    match next_event(&mut server_events).await {
+        SessionEvent::Input(got) => assert_eq!(got, key),
+        other => panic!("expected the keystroke, got {other:?}"),
+    }
+
+    let msg = ControlMsg::ClipboardStale { serial: 3 };
+    client.send_clipboard(&msg).await.unwrap();
+    match next_event(&mut server_events).await {
+        SessionEvent::Control(got) => assert_eq!(got, msg),
+        other => panic!("expected the clipboard message, got {other:?}"),
+    }
+}
+
+/// A `ClipboardData` message of a given payload size.
+fn clipboard_payload(bytes: usize) -> ControlMsg {
+    ControlMsg::ClipboardData {
+        format: wx_proto::ClipboardFormat::Png,
+        serial: 9,
+        compression: wx_proto::Compression::None,
+        // Not all one byte: a run of zeroes would be compressed away by any
+        // transport that decided to try, and this has to measure the real thing.
+        data: (0..bytes).map(|i| (i % 251) as u8).collect(),
+    }
 }
 
 #[tokio::test]
