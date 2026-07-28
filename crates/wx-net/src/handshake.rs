@@ -454,13 +454,6 @@ impl Handshake {
     pub fn peer(&self) -> Option<&NodeInfo> {
         self.peer.as_ref()
     }
-
-    /// Wire version agreed with the peer, available at the same point as
-    /// [`Handshake::peer`] — so a connection that is refused after the version
-    /// step can still say what it had settled on.
-    pub fn negotiated_protocol(&self) -> Option<u16> {
-        self.negotiated.map(|(effective, _)| effective)
-    }
 }
 
 /// Message name for error messages. Only the handshake-relevant variants need
@@ -1104,8 +1097,8 @@ mod tests {
     #[test]
     fn a_newer_peer_is_still_screened_by_every_other_admission_check() {
         // Tolerating a newer version must not turn into tolerating anything else:
-        // a peer that is unpaired, blocked, or reflecting our own identity is
-        // refused exactly as before, and before any signature goes out.
+        // an unpaired peer is still refused for not being paired, and without a
+        // signature going out first.
         let alice = Identity::generate().unwrap();
         let bob = Identity::generate().unwrap();
         let empty = TrustStore::new();
