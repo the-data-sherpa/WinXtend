@@ -187,7 +187,7 @@ for what the next release is about.
 | Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⚠️ | ✅ libei via the InputCapture portal | ⚠️ |
 | Input injection | ✅ | ⚠️ | ⚠️ | ✅ libei via the RemoteDesktop portal | ⚠️ |
-| Clipboard | ✅ text/HTML/PNG | ⚠️ | ⚠️ | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
+| Clipboard | ✅ text/HTML/PNG/files | ⚠️ | ⚠️ | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
 | Screen capture | ✅ GDI | ⚠️ | ⚠️ | ⚠️ | n/a |
 
 ✅ implemented · ⚠️ compiling skeleton, requirements documented, no implementation

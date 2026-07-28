@@ -75,12 +75,15 @@
 //!
 //! # What a live session advertises
 //!
-//! [`Capabilities::INJECT_INPUT`] from the `RemoteDesktop` session and
-//! [`Capabilities::CAPTURE_INPUT`] from the `InputCapture` one, each only while its
-//! own session is live and each dropped the moment it is revoked. A capability bit
-//! is a promise about what this backend can *do*, so neither is claimed on the
-//! strength of the other: a user who grants injection and refuses capture has a
+//! [`Capabilities::INJECT_INPUT`] and the clipboard bits from the `RemoteDesktop`
+//! session, [`Capabilities::CAPTURE_INPUT`] from the `InputCapture` one, each only
+//! while its own session is live and each dropped the moment it is revoked. A
+//! capability bit is a promise about what this backend can *do*, so none is claimed
+//! on the strength of another: a user who grants injection and refuses capture has a
 //! machine that can be driven and cannot drive, and peers are told exactly that.
+//! The `RemoteDesktop` session publishes two halves rather than one because its
+//! dialog carries two toggles — see [`clipboard`] and
+//! [`session::CLIPBOARD_CAPABILITIES`].
 //!
 //! Capture is probed at runtime rather than assumed. GNOME before 50 ships no
 //! `InputCapture` implementation at all, and a desktop without one reports
