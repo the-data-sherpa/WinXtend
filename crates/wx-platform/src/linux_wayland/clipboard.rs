@@ -48,30 +48,17 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use wx_proto::codec::MAX_FRAME_LEN;
 use wx_proto::ClipboardFormat;
 
 use crate::error::{PlatformError, Result};
 
-/// What the message carrying a payload costs on top of the payload itself.
-///
-/// [`MAX_FRAME_LEN`] bounds the *encoded* frame, and the bytes travel inside
-/// `ControlMsg::ClipboardData`, which spells a variant tag, a format tag, a serial
-/// varint, a compression tag and the payload's own length varint around them —
-/// under twenty bytes as postcard writes them today. Rounded far up rather than
-/// counted to the byte, so that a field added to that message later cannot quietly
-/// put the boundary back.
-const FRAME_OVERHEAD_BYTES: usize = 64;
-
 /// The most any one clipboard payload may be.
 ///
-/// [`MAX_FRAME_LEN`] is what the protocol codec will carry, so anything larger is
-/// rejected here — with a message naming the size — rather than handed upwards to
-/// tear a session down at the frame writer. Less [`FRAME_OVERHEAD_BYTES`], because
-/// the codec weighs the encoded message and not the payload: a limit set to the
-/// frame length exactly would pass every check here and still be refused there,
-/// which is the outcome this constant exists to prevent.
-pub const MAX_CLIPBOARD_BYTES: usize = MAX_FRAME_LEN as usize - FRAME_OVERHEAD_BYTES;
+/// Re-exported rather than restated: the agent bounds what it will accept from a
+/// peer against the same number, and two copies of a limit derived from the frame
+/// size are two chances to disagree about where the boundary is. The reasoning
+/// lives with the frame limit itself, in [`wx_proto::codec`].
+pub use wx_proto::codec::MAX_CLIPBOARD_BYTES;
 
 /// The MIME type each format is read and written as.
 ///
@@ -1143,25 +1130,6 @@ mod tests {
         state.selection_changed(vec![MIME_TEXT.into()], None);
         assert!(!state.selection_is_ours());
         assert_eq!(&*state.staged_for(MIME_TEXT).unwrap(), b"mine");
-    }
-
-    #[test]
-    fn the_size_limit_leaves_room_for_the_message_that_carries_it() {
-        // `check_size` guards the payload and the codec guards the encoded frame,
-        // so a limit set to the frame length exactly would pass every check in this
-        // file and still be refused at the writer.
-        assert!(MAX_CLIPBOARD_BYTES + FRAME_OVERHEAD_BYTES <= MAX_FRAME_LEN as usize);
-        let framed = wx_proto::encode_frame(&wx_proto::ControlMsg::ClipboardData {
-            format: ClipboardFormat::Png,
-            serial: u64::MAX,
-            compression: wx_proto::Compression::None,
-            data: Vec::new(),
-        })
-        .unwrap();
-        assert!(
-            framed.len() - wx_proto::codec::LEN_PREFIX <= FRAME_OVERHEAD_BYTES,
-            "the reserved allowance must cover what the message itself costs"
-        );
     }
 
     #[test]

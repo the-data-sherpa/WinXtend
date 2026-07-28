@@ -24,6 +24,33 @@ pub const MAX_FRAME_LEN: u32 = 32 * 1024 * 1024;
 /// Bytes of length prefix ahead of each stream frame.
 pub const LEN_PREFIX: usize = 4;
 
+/// What the message carrying a clipboard payload costs on top of the payload
+/// itself.
+///
+/// [`MAX_FRAME_LEN`] bounds the *encoded* frame, and the bytes travel inside
+/// [`crate::ControlMsg::ClipboardData`], which spells a variant tag, a format tag,
+/// a serial varint, a compression tag and the payload's own length varint around
+/// them — under twenty bytes as postcard writes them today. Rounded far up rather
+/// than counted to the byte, so that a field added to that message later cannot
+/// quietly put the boundary back.
+const CLIPBOARD_FRAME_OVERHEAD: usize = 64;
+
+/// The most any one clipboard payload may be.
+///
+/// [`MAX_FRAME_LEN`] is what this codec will carry, so anything larger is rejected
+/// where it is first seen — with a message naming the size — rather than handed
+/// onwards to tear a session down at the frame writer. Less
+/// [`CLIPBOARD_FRAME_OVERHEAD`], because the codec weighs the encoded message and
+/// not the payload: a limit set to the frame length exactly would pass every check
+/// upstream and still be refused here, which is the outcome this constant exists
+/// to prevent.
+///
+/// Lives beside the frame limit rather than in a platform backend or in the agent
+/// because all three need the same number and two of them would otherwise be
+/// guessing at it: the platform backends bound what they will lift off the OS
+/// clipboard, and the agent bounds what it will accept from a peer.
+pub const MAX_CLIPBOARD_BYTES: usize = MAX_FRAME_LEN as usize - CLIPBOARD_FRAME_OVERHEAD;
+
 /// Practical upper bound for a datagram payload.
 ///
 /// QUIC datagrams must fit the path MTU or they are dropped outright rather than
@@ -308,5 +335,24 @@ mod tests {
             bytes.len()
         );
         assert_eq!(decode::<InputFrame>(&bytes).unwrap(), frame);
+    }
+
+    #[test]
+    fn the_clipboard_limit_leaves_room_for_the_message_that_carries_it() {
+        // The payload limit is checked where the bytes are first seen and the frame
+        // limit at the writer, so a payload limit set to the frame length exactly
+        // would pass every upstream check and still be refused here.
+        assert!(MAX_CLIPBOARD_BYTES + CLIPBOARD_FRAME_OVERHEAD <= MAX_FRAME_LEN as usize);
+        let framed = encode_frame(&ControlMsg::ClipboardData {
+            format: crate::control::ClipboardFormat::Png,
+            serial: u64::MAX,
+            compression: crate::control::Compression::None,
+            data: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            framed.len() - LEN_PREFIX <= CLIPBOARD_FRAME_OVERHEAD,
+            "the reserved allowance must cover what the message itself costs"
+        );
     }
 }

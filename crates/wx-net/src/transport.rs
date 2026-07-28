@@ -13,11 +13,14 @@
 //! |---|---|---|
 //! | control (bidirectional) | initiator, first | handshake, then [`ControlMsg`] |
 //! | input (bidirectional) | initiator, second | [`InputFrame`]s that must not be lost |
+//! | clipboard (bidirectional) | initiator, third | the bulk [`ControlMsg`] variants |
 //! | (datagrams) | either | [`InputFrame`]s that may be dropped |
 //!
 //! Reliable input has its own stream rather than sharing the control stream on
 //! purpose: a 20MB clipboard image on the control stream would otherwise sit in
 //! front of a key-release frame, and a delayed key release is a stuck modifier.
+//! The clipboard has its own for the mirror-image reason — see
+//! [`STREAM_TAG_CLIPBOARD`].
 //!
 //! # Peer authentication
 //!
@@ -60,6 +63,27 @@ const CHANNEL_BINDING_LABEL: &[u8] = b"winxtend-channel-binding-v1";
 /// Identifies what a stream is for, so that file transfer and video can open
 /// their own streams later without the receiver having to guess from content.
 const STREAM_TAG_INPUT: u8 = 1;
+
+/// First byte written on the clipboard stream.
+///
+/// # Why the clipboard gets a stream of its own
+///
+/// A clipboard payload is up to [`wx_proto::codec::MAX_CLIPBOARD_BYTES`], and the
+/// control stream carries the handoff messages that decide which machine the
+/// user's keyboard is talking to. QUIC flow control is *per stream*: a peer whose
+/// receive window is shut stalls the writer for that stream and no other. Sharing
+/// one stream would mean a 20MB image parked in front of the `TakeControl` behind
+/// it, and the send lock held for the whole of the write — so the cursor would
+/// hang for as long as the transfer took, on a link that was otherwise healthy.
+///
+/// Chunking on the shared stream was the alternative and does not solve it:
+/// smaller writes still queue behind each other on one stream, still take the same
+/// lock, and a closed window blocks the first chunk exactly as it blocks the
+/// whole. The isolation has to come from QUIC, which means a second stream.
+///
+/// Both directions ride this one bidirectional stream, exactly as input does: the
+/// initiator opens it, and each end writes its own half.
+const STREAM_TAG_CLIPBOARD: u8 = 2;
 
 /// How deep the per-session event queue is before backpressure applies.
 ///
@@ -232,26 +256,15 @@ async fn establish(
     let established =
         run_handshake(&conn, role, setup, nonce, &mut control_tx, &mut control_rx).await?;
 
-    // The initiator opens the input stream and writes its tag immediately: an
-    // opened QUIC stream is invisible to the peer until something is written, so
-    // without the tag the responder's `accept_bi` would never return.
-    let (input_tx, input_rx) = match role {
-        Role::Initiator => {
-            let (mut tx, rx) = conn.open_bi().await?;
-            tx.write_all(&[STREAM_TAG_INPUT]).await?;
-            (tx, rx)
-        }
-        Role::Responder => {
-            let (tx, mut rx) = conn.accept_bi().await?;
-            let mut tag = [0u8; 1];
-            rx.read_exact(&mut tag)
-                .await
-                .map_err(|_| TransportError::HandshakeAbandoned)?;
-            if tag[0] != STREAM_TAG_INPUT {
-                return Err(TransportError::UnknownStreamTag(tag[0]));
-            }
-            (tx, rx)
-        }
+    // The initiator opens each stream and writes its tag immediately: an opened
+    // QUIC stream is invisible to the peer until something is written, so without
+    // the tag the responder's `accept_bi` would never return.
+    let ((input_tx, input_rx), (clipboard_tx, clipboard_rx)) = match role {
+        Role::Initiator => (
+            open_tagged(&conn, STREAM_TAG_INPUT).await?,
+            open_tagged(&conn, STREAM_TAG_CLIPBOARD).await?,
+        ),
+        Role::Responder => accept_tagged_streams(&conn).await?,
     };
 
     let inner = Arc::new(SessionInner {
@@ -259,16 +272,70 @@ async fn establish(
         established,
         control_tx: Mutex::new(control_tx),
         input_tx: Mutex::new(input_tx),
+        clipboard_tx: Mutex::new(clipboard_tx),
         seq: AtomicU64::new(1),
         dropped_datagrams: AtomicU64::new(0),
     });
 
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_DEPTH);
     tokio::spawn(read_control(control_rx, tx.clone()));
+    // The clipboard stream carries `ControlMsg` and is read by the same code: what
+    // differs between the two is only which writer can block the other, and that is
+    // settled by the time a message arrives.
+    tokio::spawn(read_control(clipboard_rx, tx.clone()));
     tokio::spawn(read_reliable_input(input_rx, tx.clone()));
     tokio::spawn(read_datagrams(conn, tx, Arc::clone(&inner)));
 
     Ok((Session { inner }, Events { rx }))
+}
+
+/// Open a stream and say what it is for.
+async fn open_tagged(
+    conn: &quinn::Connection,
+    tag: u8,
+) -> Result<(quinn::SendStream, quinn::RecvStream), TransportError> {
+    let (mut tx, rx) = conn.open_bi().await?;
+    tx.write_all(&[tag]).await?;
+    Ok((tx, rx))
+}
+
+/// Accept the streams the initiator opens, sorted by their tags.
+///
+/// By tag rather than by arrival order. QUIC delivers streams in the order they
+/// were opened today, but nothing in the protocol requires an implementation to,
+/// and a mis-sorted pair would put input frames into the clipboard reader — which
+/// decodes them as `ControlMsg` and tears the session down on the first one. The
+/// tag exists precisely so the receiver does not have to guess.
+type TaggedPair = (
+    (quinn::SendStream, quinn::RecvStream),
+    (quinn::SendStream, quinn::RecvStream),
+);
+
+async fn accept_tagged_streams(conn: &quinn::Connection) -> Result<TaggedPair, TransportError> {
+    let mut input = None;
+    let mut clipboard = None;
+    while input.is_none() || clipboard.is_none() {
+        let (tx, mut rx) = conn.accept_bi().await?;
+        let mut tag = [0u8; 1];
+        rx.read_exact(&mut tag)
+            .await
+            .map_err(|_| TransportError::HandshakeAbandoned)?;
+        let slot = match tag[0] {
+            STREAM_TAG_INPUT => &mut input,
+            STREAM_TAG_CLIPBOARD => &mut clipboard,
+            other => return Err(TransportError::UnknownStreamTag(other)),
+        };
+        if slot.is_some() {
+            // A second stream claiming a tag that is already filled. Refusing beats
+            // replacing: the first stream is the one the handshake is bound to.
+            return Err(TransportError::UnknownStreamTag(tag[0]));
+        }
+        *slot = Some((tx, rx));
+    }
+    Ok((
+        input.expect("the loop only exits once both are filled"),
+        clipboard.expect("the loop only exits once both are filled"),
+    ))
 }
 
 /// Keying material that identifies this TLS session and no other.
@@ -340,6 +407,7 @@ struct SessionInner {
     established: Established,
     control_tx: Mutex<quinn::SendStream>,
     input_tx: Mutex<quinn::SendStream>,
+    clipboard_tx: Mutex<quinn::SendStream>,
     seq: AtomicU64,
     dropped_datagrams: AtomicU64,
 }
@@ -424,6 +492,20 @@ impl Session {
         // One lock around encode-then-write would be redundant; encoding is pure.
         // The lock only has to keep two messages from interleaving on the stream.
         let mut stream = self.inner.control_tx.lock().await;
+        stream.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    /// Send a clipboard message on the stream reserved for them.
+    ///
+    /// Same message type as [`Session::send_control`] and a different stream, for
+    /// the reason in [`STREAM_TAG_CLIPBOARD`]: a payload of tens of megabytes must
+    /// not be able to hold up the messages that decide where the cursor is. The
+    /// caller chooses — nothing here inspects the variant — because only the caller
+    /// knows whether a given message is part of a bulk transfer.
+    pub async fn send_clipboard(&self, msg: &ControlMsg) -> Result<(), TransportError> {
+        let bytes = encode_frame(msg)?;
+        let mut stream = self.inner.clipboard_tx.lock().await;
         stream.write_all(&bytes).await?;
         Ok(())
     }

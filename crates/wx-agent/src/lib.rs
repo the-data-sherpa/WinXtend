@@ -24,6 +24,8 @@
 //!   the cursor is.
 //! * [`autolayout`] invents a layout so a freshly paired mesh works before anyone
 //!   opens the editor.
+//! * [`clipboard`] is the offer/request state machine, including the one rule that
+//!   keeps two machines from offering each other the same content forever.
 //! * [`engine`] is the run loop.
 //! * [`ipc`] is the contract the UI codes against.
 //! * [`autostart`] registers the agent to start with the session.
@@ -36,6 +38,7 @@
 
 pub mod autolayout;
 pub mod autostart;
+pub mod clipboard;
 pub mod config;
 pub mod engine;
 pub mod firewall;

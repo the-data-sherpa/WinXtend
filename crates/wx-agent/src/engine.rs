@@ -49,12 +49,14 @@ use wx_net::{
     Pin, Session, SessionEvent, SessionSetup, TrustStore,
 };
 use wx_platform::{CapturedEvent, PlatformBackend, PlatformError};
+use wx_proto::codec::MAX_CLIPBOARD_BYTES;
 use wx_proto::{
-    Capabilities, ControlMsg, GlobalMonitorId, InputEvent, InputFrame, KeyAction, KeyPayload,
-    Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos, Point, PointerEvent, RejectReason,
-    Reliability, SequenceGate,
+    Capabilities, ClipboardFormat, Compression, ControlMsg, GlobalMonitorId, InputEvent,
+    InputFrame, KeyAction, KeyPayload, Layout, Monitor, MonitorId, NodeId, NodeInfo, NormPos,
+    Point, PointerEvent, RejectReason, Reliability, SequenceGate,
 };
 
+use crate::clipboard::{self, ClipboardSync, LocalChange, Serve};
 use crate::config::{Config, HotkeyAction};
 use crate::ipc::{self, ErrorCode, Event, IpcCommand, IpcServer, Request, Response};
 use crate::state::{AgentState, ConnStatus};
@@ -77,6 +79,20 @@ const TICK: Duration = Duration::from_secs(2);
 /// nothing at all on this machine. Every millisecond spent not noticing that the
 /// peer has died is a millisecond the user's input is silently discarded.
 const CURSOR_PROBE: Duration = Duration::from_millis(500);
+
+/// How often the local clipboard is checked for a change.
+///
+/// Faster than [`TICK`] because of what the delay is measured against: the user
+/// presses Ctrl-C on one machine and Ctrl-V on the other, and anything they can
+/// feel between the two reads as the feature not working. Two seconds is easily
+/// long enough to lose that race.
+///
+/// Affordable at this rate only because
+/// [`ClipboardAccess::change_serial`](wx_platform::traits::ClipboardAccess::change_serial)
+/// exists: it is an atomic load on Wayland and one Win32 call on Windows. Polling
+/// `read` and hashing instead would pull the clipboard's whole contents across a
+/// process boundary twice a second to learn that nothing happened.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(400);
 
 /// How long the machine holding the cursor may go silent before it is written off.
 ///
@@ -194,6 +210,24 @@ const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 /// rather than a minute of stale keystrokes replayed at the user.
 const OUTBOUND_QUEUE_DEPTH: usize = 256;
 
+/// How many clipboard messages may be waiting for one peer.
+///
+/// Its own queue, feeding its own task and its own QUIC stream, for the reason
+/// given at [`wx_net`]'s clipboard stream tag: a payload of tens of megabytes must
+/// not be able to hold up a handoff. The queue depth is the other half of that.
+/// Left in [`OUTBOUND_QUEUE_DEPTH`] a clipboard payload would be a message like
+/// any other, and [`Outbound::is_sheddable`] says no control message may be
+/// dropped — so 256 of them arriving during one slow transfer would return
+/// [`Queued::Unresponsive`] and **close a session that was working perfectly**.
+///
+/// Shallow because the traffic is: one offer per copy, one request and one reply
+/// per transfer. Anything past this is a peer that has stopped reading its
+/// clipboard stream, and the right answer is then to drop the clipboard message
+/// and keep the session — which is exactly the trade the input plane cannot make
+/// and this one can. Losing an offer costs one paste; losing the session costs the
+/// user their cursor.
+const CLIPBOARD_QUEUE_DEPTH: usize = 8;
+
 /// How many events arrived from one peer may wait for the engine at once.
 ///
 /// The transport caps its own queue for exactly this reason, but the pump used to
@@ -269,6 +303,8 @@ enum Wake {
     Tick,
     /// Check that the machine holding the cursor is still answering.
     Probe,
+    /// Check whether anything was copied on this machine.
+    ClipboardPoll,
     /// Ctrl-C, a service stop, or an IPC shutdown request.
     Shutdown,
 }
@@ -294,8 +330,13 @@ impl Outbound {
     ///
     /// Only absolute pointer positions are: a later one supersedes it, so the
     /// cursor self-corrects. Everything else latches state — key and button
-    /// transitions, relative motion, handoff, clipboard — and dropping one is
-    /// a stuck modifier or a lost keystroke.
+    /// transitions, relative motion, handoff — and dropping one is a stuck
+    /// modifier or a lost keystroke.
+    ///
+    /// Clipboard messages are not on this queue at all, and that is deliberate:
+    /// they are the one kind of traffic large enough to fill it, and the only kind
+    /// whose loss is survivable. They go through [`CLIPBOARD_QUEUE_DEPTH`] instead,
+    /// where being dropped is an option.
     fn is_sheddable(&self) -> bool {
         match self {
             Outbound::Input(frame) => frame.event.reliability() == Reliability::BestEffort,
@@ -342,6 +383,8 @@ fn enqueue(out: &mpsc::Sender<Outbound>, msg: Outbound) -> Queued {
 struct PeerLink {
     session: Session,
     out: mpsc::Sender<Outbound>,
+    /// The clipboard's own queue. See [`CLIPBOARD_QUEUE_DEPTH`].
+    clipboard: mpsc::Sender<ControlMsg>,
     /// Which connection this is. See [`teardown_is_current`].
     generation: u64,
 }
@@ -675,6 +718,8 @@ pub struct Engine {
     swallow_release: Option<KeyPayload>,
     /// The peer currently driving this machine, if any. See [`DrivenBy`].
     driven_by: DrivenBy,
+    /// Clipboard offer/request state. See [`crate::clipboard`].
+    clipboard: ClipboardSync,
     last_owner: NodeId,
     /// Host firewall warning, decided once at startup and then reported for the
     /// life of the run. Held rather than recomputed per status request because
@@ -733,6 +778,19 @@ pub async fn run(opts: EngineOptions) -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 if wake.send(Wake::Probe).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    {
+        let wake = wake_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CLIPBOARD_POLL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if wake.send(Wake::ClipboardPoll).is_err() {
                     return;
                 }
             }
@@ -887,6 +945,7 @@ impl Engine {
             suppressed: false,
             swallow_release: None,
             driven_by: DrivenBy::default(),
+            clipboard: ClipboardSync::new(),
             last_owner: local,
             // Against the port actually bound, not the configured one: the two
             // differ when the config asks for port 0, and advice naming a port
@@ -1119,6 +1178,7 @@ impl Engine {
             }
             Wake::Tick => self.on_tick().await,
             Wake::Probe => self.probe_cursor_owner().await,
+            Wake::ClipboardPoll => self.poll_clipboard(),
             Wake::Shutdown => self.shutting_down = true,
         }
     }
@@ -1374,11 +1434,13 @@ impl Engine {
         }
 
         let out = spawn_sender(session.clone());
+        let clipboard = spawn_clipboard_sender(session.clone());
         self.sessions.insert(
             node,
             PeerLink {
                 session,
                 out,
+                clipboard,
                 generation,
             },
         );
@@ -1694,12 +1756,27 @@ impl Engine {
                     "ignoring a file transfer: this build never advertised the capability it needs"
                 );
             }
-            ControlMsg::ClipboardOffer { .. }
-            | ControlMsg::ClipboardRequest { .. }
-            | ControlMsg::ClipboardData { .. }
-            | ControlMsg::ClipboardStale { .. }
-            | ControlMsg::VideoStop { .. }
-            | ControlMsg::VideoUnavailable { .. } => {
+            ControlMsg::ClipboardOffer { formats, serial } => {
+                self.on_clipboard_offer(node, formats, serial)
+            }
+            ControlMsg::ClipboardRequest { format, serial } => {
+                self.on_clipboard_request(node, format, serial)
+            }
+            ControlMsg::ClipboardData {
+                format,
+                serial,
+                compression,
+                data,
+            } => self.on_clipboard_data(node, format, serial, compression, data),
+            ControlMsg::ClipboardStale { serial } => {
+                // The content moved on before the request landed. Nothing to do
+                // but stop waiting for it: the peer's next copy produces a fresh
+                // offer, and asking again for a serial it has already declared gone
+                // would loop.
+                tracing::debug!(peer = %node, serial, "a peer's clipboard content was already superseded");
+                self.clipboard.settled(node);
+            }
+            ControlMsg::VideoStop { .. } | ControlMsg::VideoUnavailable { .. } => {
                 tracing::debug!(peer = %node, "ignoring a message this build does not handle");
             }
             ControlMsg::Hello { .. }
@@ -2806,6 +2883,347 @@ impl Engine {
         }
     }
 
+    // -- clipboard --------------------------------------------------------
+
+    /// Hand one clipboard message to a peer's clipboard queue.
+    ///
+    /// The one thing this must never do is what [`Engine::send_to`] does when the
+    /// main queue fills: report the peer unresponsive and close the session. A
+    /// clipboard transfer is the largest thing this agent sends and the only thing
+    /// it can afford to lose, so a full queue drops the message and says so.
+    fn send_clipboard_to(&mut self, node: NodeId, msg: ControlMsg) -> bool {
+        let Some(link) = self.sessions.get(&node) else {
+            tracing::debug!(peer = %node, "no session; dropping a clipboard message");
+            return false;
+        };
+        match link.clipboard.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Named at warn: a clipboard that silently stops working is the
+                // failure this whole slice is most likely to present as.
+                tracing::warn!(
+                    peer = %node,
+                    machine = %self.peer_label(node),
+                    "the clipboard queue for this peer is full; dropping the message rather than the session"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(peer = %node, "dropping a clipboard message for a closed session");
+                false
+            }
+        }
+    }
+
+    /// Whether this machine will exchange clipboard content with a peer at all.
+    ///
+    /// Three gates, and each closes a different hole:
+    ///
+    /// * **Reachable.** [`AgentState::is_reachable`] is false for a peer that is
+    ///   only mid-pairing, so an untrusted session can neither be offered content
+    ///   nor have any written. [`is_permitted_while_unpaired`] refuses the messages
+    ///   on the way in; this refuses them on the way out.
+    /// * **Enabled for this peer.** The per-peer `clipboard` flag in
+    ///   [`crate::config::PeerConfig`], which the Devices screen writes.
+    /// * **A session.** Nothing to send it on otherwise.
+    fn clipboard_shared_with(&self, node: NodeId) -> bool {
+        clipboard_sharing_permitted(
+            self.sessions.contains_key(&node),
+            self.state.is_reachable(node),
+            self.config.peer(&node).clipboard,
+        )
+    }
+
+    /// Notice that something was copied on this machine, and tell peers about it.
+    ///
+    /// Called on [`CLIPBOARD_POLL`]. The overwhelmingly common outcome is that the
+    /// serial has not moved and nothing else happens.
+    fn poll_clipboard(&mut self) {
+        if self.sessions.is_empty() {
+            // Nobody to tell, so a machine sitting alone never touches its own
+            // clipboard at all. The serial is not sampled either, which means the
+            // first poll once a peer appears is a `FirstSighting` — whatever was
+            // copied while there was nobody to tell is not pushed at the peer the
+            // moment it connects.
+            return;
+        }
+        let serial = match self.platform.clipboard.change_serial() {
+            Ok(serial) => serial,
+            Err(e) => {
+                // Ordinary on a Wayland session whose clipboard grant was refused.
+                tracing::trace!(error = %e, "the clipboard cannot be polled");
+                return;
+            }
+        };
+        if self.clipboard.serial() == Some(serial) {
+            return;
+        }
+
+        let formats = self
+            .platform
+            .clipboard
+            .available_formats()
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "could not list clipboard formats");
+                Vec::new()
+            });
+
+        // Disjoint field borrows: the state machine is asked for a decision while
+        // holding a way to read the clipboard, and it only reads when telling this
+        // machine's own write-back from a real copy needs the bytes.
+        let sync = &mut self.clipboard;
+        let access = &self.platform.clipboard;
+        let change = sync.observe(serial, &formats, |format| {
+            access.read(format).ok().map(|b| clipboard::fingerprint(&b))
+        });
+
+        match change {
+            LocalChange::Unchanged => {}
+            LocalChange::FirstSighting => {
+                tracing::debug!(
+                    serial,
+                    "first look at the local clipboard; nothing to attribute it to"
+                );
+            }
+            LocalChange::Echo => {
+                tracing::debug!(
+                    serial,
+                    "the clipboard changed because this machine wrote what a peer sent"
+                );
+            }
+            LocalChange::NothingToOffer => {
+                tracing::debug!(serial, "the clipboard changed to nothing this build syncs");
+            }
+            LocalChange::Offer { serial, formats } => self.offer_clipboard(serial, &formats),
+        }
+    }
+
+    /// Announce new local content to every peer that could use it.
+    ///
+    /// Only what each peer can actually take: the formats are filtered per peer, so
+    /// a machine advertising only `CLIPBOARD_TEXT` is never offered the PNG. That
+    /// is the capability seam doing its job — a peer told about a format it cannot
+    /// accept would either ask for it and fail, or ignore it silently, and neither
+    /// leaves anything to attribute the missing paste to.
+    fn offer_clipboard(&mut self, serial: u64, formats: &[ClipboardFormat]) {
+        let local = self.advertised_by(self.local);
+        let peers: Vec<NodeId> = self.sessions.keys().copied().collect();
+        for node in peers {
+            if !self.clipboard_shared_with(node) {
+                continue;
+            }
+            let theirs = self.advertised_by(node);
+            let offered: Vec<ClipboardFormat> = formats
+                .iter()
+                .copied()
+                .filter(|f| {
+                    clipboard::supported_by(local, *f) && clipboard::supported_by(theirs, *f)
+                })
+                .collect();
+            if offered.is_empty() {
+                // Through the shared seam so the log line reads the same as every
+                // other refused optional feature, and names both the capability and
+                // the machine.
+                let needed = formats
+                    .first()
+                    .and_then(|f| clipboard::capability_for(*f))
+                    .unwrap_or(Capabilities::CLIPBOARD_TEXT);
+                permit_optional(
+                    theirs,
+                    needed,
+                    node,
+                    &self.peer_label(node),
+                    "offer the clipboard",
+                );
+                continue;
+            }
+            tracing::debug!(peer = %node, serial, count = offered.len(), "offering the clipboard");
+            self.send_clipboard_to(
+                node,
+                ControlMsg::ClipboardOffer {
+                    formats: offered,
+                    serial,
+                },
+            );
+        }
+    }
+
+    /// A peer says it has new content.
+    fn on_clipboard_offer(&mut self, node: NodeId, formats: Vec<ClipboardFormat>, serial: u64) {
+        if !self.clipboard_shared_with(node) {
+            tracing::debug!(peer = %node, "ignoring a clipboard offer: not sharing with this machine");
+            return;
+        }
+        let local = self.advertised_by(self.local);
+        let theirs = self.advertised_by(node);
+        let Some(format) = ClipboardSync::choose(&formats, local, theirs) else {
+            tracing::debug!(
+                peer = %node,
+                serial,
+                "a peer offered the clipboard in no format this machine can take"
+            );
+            return;
+        };
+        if !self.clipboard.ask(node, serial, format) {
+            // The same offer again: a re-advertisement, or a session replaced under
+            // us. Asking twice would move the payload twice.
+            return;
+        }
+        tracing::debug!(peer = %node, serial, ?format, "asking a peer for its clipboard");
+        if !self.send_clipboard_to(node, ControlMsg::ClipboardRequest { format, serial }) {
+            // The request never left, so nothing will answer it. Forgetting it here
+            // means a re-offer of the same serial is asked about again instead of
+            // being deduplicated against a request that does not exist.
+            self.clipboard.settled(node);
+        }
+    }
+
+    /// A peer wants the content this machine offered.
+    fn on_clipboard_request(&mut self, node: NodeId, format: ClipboardFormat, serial: u64) {
+        // Refused rather than ignored, in every branch below. A request that is
+        // dropped on the floor leaves the peer waiting for an answer that never
+        // comes, which is the failure `ClipboardStale` exists to make impossible.
+        if !self.clipboard_shared_with(node) {
+            tracing::info!(
+                peer = %node,
+                machine = %self.peer_label(node),
+                "refusing a clipboard request: sharing is off for this machine"
+            );
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        }
+        let theirs = self.advertised_by(node);
+        if !clipboard::supported_by(theirs, format) {
+            let needed = clipboard::capability_for(format).unwrap_or(Capabilities::CLIPBOARD_TEXT);
+            permit_optional(
+                theirs,
+                needed,
+                node,
+                &self.peer_label(node),
+                "serve the clipboard",
+            );
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        }
+
+        if self.clipboard.serve(serial, format) == Serve::Stale {
+            tracing::debug!(peer = %node, serial, "a clipboard request names content that is gone");
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        }
+
+        let data = match self.platform.clipboard.read(format) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(peer = %node, error = %e, ?format, "could not read the clipboard for a peer");
+                let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+                return;
+            }
+        };
+
+        // Re-checked after the read, not only before it. The read is not atomic
+        // with the check that authorised it, and content that changed underneath
+        // would otherwise be sent as an answer to a request for something else —
+        // the peer pasting content it was never offered.
+        if self.clipboard.serial() != Some(serial) {
+            tracing::debug!(peer = %node, serial, "the clipboard changed while it was being read");
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        }
+
+        if data.len() > MAX_CLIPBOARD_BYTES {
+            // The frame writer would refuse this and, on the shared control stream,
+            // take the session with it. Said out loud and answered honestly instead.
+            tracing::warn!(
+                peer = %node,
+                bytes = data.len(),
+                limit = MAX_CLIPBOARD_BYTES,
+                ?format,
+                "the clipboard holds more than the protocol carries; refusing to send it"
+            );
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        }
+
+        let (compression, payload) = clipboard::compress(format, &data);
+        tracing::debug!(
+            peer = %node,
+            serial,
+            ?format,
+            bytes = data.len(),
+            sent = payload.len(),
+            "serving the clipboard"
+        );
+        let _ = self.send_clipboard_to(
+            node,
+            ControlMsg::ClipboardData {
+                format,
+                serial,
+                compression,
+                data: payload,
+            },
+        );
+    }
+
+    /// Content arrived from a peer. Write it, and remember that we did.
+    fn on_clipboard_data(
+        &mut self,
+        node: NodeId,
+        format: ClipboardFormat,
+        serial: u64,
+        compression: Compression,
+        data: Vec<u8>,
+    ) {
+        if !self.clipboard.answers(node, serial, format) {
+            // Unsolicited. A paired machine may say what it has copied; it may not
+            // reach over and set this machine's clipboard unasked.
+            tracing::warn!(
+                peer = %node,
+                serial,
+                ?format,
+                "ignoring clipboard content this machine never asked for"
+            );
+            return;
+        }
+        self.clipboard.settled(node);
+        if !self.clipboard_shared_with(node) {
+            // The flag can be turned off, or the peer unpaired, between the request
+            // and the answer.
+            tracing::info!(peer = %node, "discarding clipboard content: sharing is off for this machine");
+            return;
+        }
+        if !clipboard::supported_by(self.advertised_by(self.local), format) {
+            tracing::warn!(peer = %node, ?format, "a peer sent a clipboard format this machine does not advertise");
+            return;
+        }
+
+        let payload = match clipboard::decompress(compression, &data) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(peer = %node, error = %e, "discarding a clipboard payload");
+                return;
+            }
+        };
+
+        // Armed before the write, so no ordering of the write and the backend's own
+        // change notification can slip an offer of this content back at the peer
+        // that sent it. See [`crate::clipboard`].
+        self.clipboard
+            .writing(format, clipboard::fingerprint(&payload));
+        match self.platform.clipboard.write(format, &payload) {
+            Ok(()) => {
+                tracing::info!(peer = %node, ?format, bytes = payload.len(), "took the clipboard from a peer");
+                if let Ok(serial) = self.platform.clipboard.change_serial() {
+                    self.clipboard.wrote(serial);
+                }
+            }
+            Err(e) => {
+                self.clipboard.write_failed();
+                tracing::warn!(peer = %node, error = %e, ?format, "could not write the clipboard");
+            }
+        }
+    }
+
     /// The `NodeInfo` a peer sent at its handshake, ready to be amended.
     ///
     /// `None` until the peer has actually introduced itself: a control message from
@@ -3134,6 +3552,54 @@ fn spawn_sender(session: Session) -> mpsc::Sender<Outbound> {
     tx
 }
 
+/// Whether clipboard content may cross to a machine at all.
+///
+/// Pulled out of [`Engine::clipboard_shared_with`] so that the rule can be stated
+/// once and tested, because two of the three conditions are security properties
+/// rather than preferences and the cost of getting either wrong is a clipboard
+/// served to a machine nobody approved.
+///
+/// `reachable` is the pairing gate: [`AgentState::is_reachable`] is false for a
+/// session that has been admitted for pairing but not yet approved by a human, and
+/// false for a peer the user disabled. It is the same condition
+/// [`is_permitted_while_unpaired`] enforces on the inbound side, applied to what
+/// this machine sends.
+fn clipboard_sharing_permitted(has_session: bool, reachable: bool, enabled_for_peer: bool) -> bool {
+    has_session && reachable && enabled_for_peer
+}
+
+/// Serialise one peer's clipboard traffic through a task of its own.
+///
+/// Separate from [`spawn_sender`] so that the two cannot block each other. That
+/// task awaits `write_all` on the control stream; this one awaits it on the
+/// clipboard stream, and QUIC flow-controls the two independently — so a peer that
+/// has stopped reading twenty megabytes of image stalls this task and leaves the
+/// cursor moving.
+///
+/// A framing failure is logged and skipped rather than ending the task: the size
+/// checks upstream make it unreachable, and if one ever were reachable, silently
+/// disabling the clipboard for the rest of the session is not the way to find out.
+fn spawn_clipboard_sender(session: Session) -> mpsc::Sender<ControlMsg> {
+    let (tx, mut rx) = mpsc::channel::<ControlMsg>(CLIPBOARD_QUEUE_DEPTH);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match session.send_clipboard(&msg).await {
+                Ok(()) => {}
+                Err(wx_net::TransportError::Codec(e)) => {
+                    tracing::warn!(error = %e, "a clipboard message would not encode; dropping it");
+                }
+                Err(e) => {
+                    // The session is finished; the pump task reports the death, so
+                    // this only needs to stop trying.
+                    tracing::debug!(error = %e, "clipboard send failed; closing the peer queue");
+                    return;
+                }
+            }
+        }
+    });
+    tx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3445,6 +3911,17 @@ mod tests {
                 format: wx_proto::ClipboardFormat::Utf8Text,
                 serial: 1,
             },
+            ControlMsg::ClipboardOffer {
+                formats: vec![wx_proto::ClipboardFormat::Utf8Text],
+                serial: 1,
+            },
+            ControlMsg::ClipboardData {
+                format: wx_proto::ClipboardFormat::Utf8Text,
+                serial: 1,
+                compression: Compression::None,
+                data: b"secret".to_vec(),
+            },
+            ControlMsg::ClipboardStale { serial: 1 },
             ControlMsg::LockSession,
             ControlMsg::MonitorsChanged { monitors: vec![] },
             ControlMsg::VideoStart {
@@ -3650,6 +4127,28 @@ mod tests {
             logs.contains("workshop-mac") && logs.contains(&node(2).short()),
             "the machine was not named: {logs}"
         );
+    }
+
+    #[test]
+    fn the_clipboard_is_never_shared_with_a_machine_no_human_has_approved() {
+        // The gate that matters most in this slice. A session admitted for pairing
+        // has proved possession of a key and nothing else, and `is_reachable` is
+        // what says a human has since approved it.
+        assert!(clipboard_sharing_permitted(true, true, true));
+        assert!(
+            !clipboard_sharing_permitted(true, false, true),
+            "an unpaired or mid-pairing machine was offered the clipboard"
+        );
+    }
+
+    #[test]
+    fn the_per_peer_clipboard_switch_is_honoured_in_both_directions() {
+        // `PeerConfig::clipboard`, which the Devices screen writes. The same
+        // predicate guards offering, serving and accepting, so switching it off
+        // stops content in both directions rather than only outbound.
+        assert!(!clipboard_sharing_permitted(true, true, false));
+        // And with no session there is nothing to share over.
+        assert!(!clipboard_sharing_permitted(false, true, true));
     }
 
     #[test]
@@ -4113,6 +4612,47 @@ mod tests {
         assert_eq!(
             enqueue(&tx, Outbound::Control(ControlMsg::LayoutRequest)),
             Queued::Unresponsive
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_clipboard_queue_costs_a_paste_and_not_the_session() {
+        // The other half of the policy above, and the reason the clipboard is not on
+        // that queue at all. `Outbound::is_sheddable` is false for every control
+        // message, so a clipboard payload that filled the main queue would return
+        // `Queued::Unresponsive` and close a session that was working — a 20MB image
+        // costing the user their cursor.
+        let payload = || ControlMsg::ClipboardData {
+            format: ClipboardFormat::Png,
+            serial: 1,
+            compression: Compression::None,
+            data: vec![0u8; 64],
+        };
+
+        let (clipboard, _held) = mpsc::channel::<ControlMsg>(CLIPBOARD_QUEUE_DEPTH);
+        for _ in 0..CLIPBOARD_QUEUE_DEPTH {
+            clipboard.try_send(payload()).expect("queue should accept");
+        }
+        // Refused, and refusal on this path is `send_clipboard_to` dropping the
+        // message with a warning. There is no route from here to a teardown.
+        assert!(matches!(
+            clipboard.try_send(payload()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        // And this is what the same payload does on the main queue, which is what
+        // the separate one exists to avoid.
+        let (main, _main_held) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE_DEPTH);
+        for _ in 0..OUTBOUND_QUEUE_DEPTH {
+            assert_eq!(
+                enqueue(&main, Outbound::Control(ControlMsg::Ping { nonce: 0 })),
+                Queued::Sent
+            );
+        }
+        assert_eq!(
+            enqueue(&main, Outbound::Control(payload())),
+            Queued::Unresponsive,
+            "this is the teardown the clipboard's own queue exists to prevent"
         );
     }
 
