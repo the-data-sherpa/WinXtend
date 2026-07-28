@@ -133,24 +133,6 @@ real compositor on one box, with no extra packages:
   loop. Between two real machines the second agent's clipboard never moves and the
   exchange terminates. Issue #11 is the honest test here too.
 
-A peer's `NodeInfo` can predate a portal grant, and routinely does. The accept loop
-snapshots `local_info` at the top of each iteration — before it awaits the next
-connection — so what a peer learns at the handshake may be minutes old, and on
-Wayland the consent dialog is usually answered after the process starts and around
-when peers connect. `sync_capabilities` does not close that gap, because it only
-speaks on a transition and the transition already happened. `Engine::on_peer_ready`
-therefore sends `CapabilitiesChanged` to every peer that can decode it,
-**unconditionally** — there is no sound local operand to compare against, because
-the snapshot the peer was actually given is a clone nobody kept, and comparing
-against the peer's own advertised set instead silently matches on two identically
-configured machines and skips the correction exactly when it is needed.
-
-The rule that follows for anything new: **do not gate a feature on a peer's
-handshake capability set**, and do not gate one on this machine's either. Ask at
-the moment the feature is used, when the answer is current. The clipboard's QUIC
-stream is built that way — opened on demand rather than during session setup — for
-this reason as much as for compatibility with a build that predates it.
-
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
 
@@ -253,6 +235,24 @@ anything touching the real registry, clipboard, or desktop still needs a Windows
 - **`ControlMsg::MonitorsChanged` carries monitors and not capabilities.** Both sides
   therefore derive `HAS_DISPLAYS` from the monitor list, through `with_displays` in
   `engine.rs`. Keep it as one rule in one place.
+- **A peer's handshake `NodeInfo` can predate a portal grant, and routinely does.**
+  The accept loop snapshots `local_info` at the top of each iteration — before it
+  awaits the next connection — so what a peer learns at the handshake may be minutes
+  old, and on Wayland the consent dialog is usually answered after the process
+  starts and around when peers connect. `sync_capabilities` does not close that gap,
+  because it only speaks on a transition and the transition already happened.
+  `Engine::on_peer_ready` therefore sends `CapabilitiesChanged` to every peer that
+  can decode it, **unconditionally** — there is no sound local operand to compare
+  against, because the snapshot the peer was actually given is a clone nobody kept,
+  and comparing against the peer's own advertised set instead silently matches on
+  two identically configured machines and skips the correction exactly when it is
+  needed.
+
+The rule that follows for anything new: **do not gate a feature on a peer's
+handshake capability set**, and do not gate one on this machine's either. Ask at
+the moment the feature is used, when the answer is current. The clipboard's QUIC
+stream is built that way — opened on demand rather than during session setup — for
+this reason as much as for compatibility with a build that predates it.
 
 ## The UI workspace does not build until the agent sidecar exists
 

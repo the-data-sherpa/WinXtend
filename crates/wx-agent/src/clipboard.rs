@@ -87,10 +87,10 @@ pub fn supported_by(caps: Capabilities, format: ClipboardFormat) -> bool {
 
 /// How much of a payload [`fingerprint`] actually reads, from each end.
 ///
-/// Bounded rather than whole because this runs on the engine loop, which is also
-/// the loop carrying the user's keystrokes: hashing 32MiB there would be a visible
-/// stall on every clipboard change, and the question being asked does not need a
-/// cryptographic answer.
+/// Bounded rather than whole because this runs on the single clipboard worker
+/// thread in [`crate::engine`], which every poll, every peer's request and every
+/// write queue behind: hashing 32MiB there delays all of them on every clipboard
+/// change, and the question being asked does not need a cryptographic answer.
 const FINGERPRINT_SAMPLE: usize = 64 * 1024;
 
 /// A cheap identity for a clipboard payload.

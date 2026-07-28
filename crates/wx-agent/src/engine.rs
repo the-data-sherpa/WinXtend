@@ -5584,6 +5584,650 @@ mod tests {
         );
     }
 
+    // -- two machines, one wire -------------------------------------------
+
+    /// What a machine that syncs everything this build syncs advertises.
+    ///
+    /// `CAPABILITY_UPDATES` because [`capabilities_for`] adds it to every set this
+    /// build produces: it describes the binary, not a permission.
+    fn full_clipboard() -> Capabilities {
+        Capabilities::CLIPBOARD_TEXT
+            | Capabilities::CLIPBOARD_IMAGE
+            | Capabilities::CAPABILITY_UPDATES
+    }
+
+    /// One machine's half of clipboard sync, with a clipboard of its own.
+    ///
+    /// This is the assertion a single desktop cannot make. Two agents in one
+    /// session share one physical selection — the confound recorded in
+    /// `AGENTS.md` — so "the content arrived on the *other* machine" is exactly
+    /// what a live run on one host cannot separate from the writer seeing its own
+    /// copy. Here each machine owns its own [`DoubleBumpClipboard`] and the bytes
+    /// cross a real `wx-net` session, on the clipboard stream, between two QUIC
+    /// endpoints on loopback.
+    ///
+    /// Everything that decides anything is the shipping code: the worker
+    /// functions the clipboard thread calls ([`sample_clipboard`],
+    /// [`serve_clipboard`], [`accept_clipboard`]), the loop's half of the handoff
+    /// ([`settle_clipboard_report`]), the state machine in [`crate::clipboard`],
+    /// and the format filter offers go through. What is restated is the dispatch
+    /// in `Engine::on_clipboard_*`, because reaching it needs an `Engine` and that
+    /// needs a platform backend — which on this target means a portal consent
+    /// dialog. Each arm below names the method it mirrors.
+    struct Machine {
+        name: &'static str,
+        /// Who this machine is talking to, which is the key every request is
+        /// remembered under.
+        peer: NodeId,
+        caps: Capabilities,
+        peer_caps: Capabilities,
+        /// The per-peer `clipboard` flag in [`crate::config::PeerConfig`].
+        shares_with_peer: bool,
+        access: DoubleBumpClipboard,
+        sync: ClipboardSync,
+        traffic: ClipboardTraffic,
+        session: Session,
+        events: Events,
+    }
+
+    impl Machine {
+        /// One turn of [`Engine::poll_clipboard`], as far as the offer that goes on
+        /// the wire.
+        async fn poll(&mut self) -> Option<LocalChange> {
+            let change = poll_once(&self.access, &mut self.sync, &mut self.traffic)?;
+            if let LocalChange::Offer { serial, formats } = &change {
+                // `Engine::offer_clipboard`: only what both machines advertise.
+                let offered: Vec<ClipboardFormat> = formats
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        clipboard::supported_by(self.caps, *f)
+                            && clipboard::supported_by(self.peer_caps, *f)
+                    })
+                    .collect();
+                if self.shares_with_peer && !offered.is_empty() {
+                    self.send(ControlMsg::ClipboardOffer {
+                        formats: offered,
+                        serial: *serial,
+                    })
+                    .await;
+                }
+            }
+            Some(change)
+        }
+
+        async fn send(&self, msg: ControlMsg) {
+            self.session
+                .send_clipboard(&msg)
+                .await
+                .expect("the clipboard stream carries this");
+        }
+
+        async fn next_message(&mut self) -> ControlMsg {
+            match tokio::time::timeout(Duration::from_secs(30), self.events.next()).await {
+                Ok(Some(Ok(SessionEvent::Control(msg)))) => msg,
+                other => panic!("{} expected a clipboard message, got {other:?}", self.name),
+            }
+        }
+
+        /// Nothing more from this peer.
+        ///
+        /// A short wait rather than a look, because what it rules out — the payload
+        /// being offered straight back the way it came — is a message that would
+        /// already be on the wire.
+        async fn heard_nothing_more(&mut self) -> bool {
+            tokio::time::timeout(Duration::from_millis(250), self.events.next())
+                .await
+                .is_err()
+        }
+
+        /// Handle one message from the peer, and return the reply that went back.
+        async fn handle(&mut self, msg: ControlMsg) -> Option<ControlMsg> {
+            match msg {
+                // `Engine::on_clipboard_offer`.
+                ControlMsg::ClipboardOffer { formats, serial } => {
+                    if !self.shares_with_peer {
+                        return None;
+                    }
+                    let format = ClipboardSync::choose(&formats, self.caps, self.peer_caps)?;
+                    if !self.sync.ask(self.peer, serial, format) {
+                        return None;
+                    }
+                    let reply = ControlMsg::ClipboardRequest { format, serial };
+                    self.send(reply.clone()).await;
+                    Some(reply)
+                }
+                // `Engine::on_clipboard_request`, then `Engine::on_clipboard_served`.
+                ControlMsg::ClipboardRequest { format, serial } => {
+                    let stale = ControlMsg::ClipboardStale { serial };
+                    let reply = if !self.shares_with_peer
+                        || !clipboard::supported_by(self.peer_caps, format)
+                        || self.sync.serve(serial, format) == Serve::Stale
+                    {
+                        stale
+                    } else {
+                        let done = serve_clipboard(&self.access, self.peer, format, serial);
+                        settle_clipboard_report(&mut self.sync, &mut self.traffic, &done);
+                        match done {
+                            // The serial is re-checked after the read as well as
+                            // before it; the read is not atomic with the check that
+                            // authorised it.
+                            ClipboardDone::Served {
+                                packed: Some(packed),
+                                ..
+                            } if self.sync.serial() == Some(serial) => ControlMsg::ClipboardData {
+                                format,
+                                serial,
+                                compression: packed.compression,
+                                data: packed.payload,
+                            },
+                            _ => stale,
+                        }
+                    };
+                    self.send(reply.clone()).await;
+                    Some(reply)
+                }
+                // `Engine::on_clipboard_data`, and the write the worker does for it.
+                ControlMsg::ClipboardData {
+                    format,
+                    serial,
+                    compression,
+                    data,
+                } => {
+                    if !self.sync.answers(self.peer, serial, format) {
+                        println!(
+                            "  {}: refusing clipboard content it never asked for",
+                            self.name
+                        );
+                        return None;
+                    }
+                    self.sync.settled(self.peer);
+                    self.traffic.dispatched(ClipboardJobKind::Accept);
+                    let reports = std::cell::RefCell::new(Vec::new());
+                    accept_clipboard(
+                        &self.access,
+                        self.peer,
+                        format,
+                        compression,
+                        &data,
+                        &|done| {
+                            reports.borrow_mut().push(done);
+                            true
+                        },
+                    );
+                    for done in reports.borrow().iter() {
+                        settle_clipboard_report(&mut self.sync, &mut self.traffic, done);
+                    }
+                    None
+                }
+                ControlMsg::ClipboardStale { .. } => {
+                    self.sync.settled(self.peer);
+                    None
+                }
+                // `Engine::on_control`: the peer's own account of what it can do,
+                // replacing whatever the handshake snapshot said.
+                ControlMsg::CapabilitiesChanged { capabilities } => {
+                    self.peer_caps = capabilities;
+                    None
+                }
+                other => panic!("nothing else belongs on the clipboard stream: {other:?}"),
+            }
+        }
+
+        /// What a user pressing Ctrl-V on this machine would get.
+        fn pasted(&self) -> Option<(ClipboardFormat, Vec<u8>)> {
+            self.access.held.borrow().clone()
+        }
+    }
+
+    /// A line of transcript for one message, for the record this test leaves.
+    fn describe(msg: &ControlMsg) -> String {
+        match msg {
+            ControlMsg::ClipboardOffer { formats, serial } => {
+                format!("ClipboardOffer  serial {serial}, formats {formats:?}")
+            }
+            ControlMsg::ClipboardRequest { format, serial } => {
+                format!("ClipboardRequest serial {serial}, {format:?}")
+            }
+            ControlMsg::ClipboardData {
+                format,
+                serial,
+                compression,
+                data,
+            } => format!(
+                "ClipboardData   serial {serial}, {format:?}, {} bytes on the wire ({compression:?})",
+                data.len()
+            ),
+            ControlMsg::ClipboardStale { serial } => {
+                format!("ClipboardStale  serial {serial} — refused, nothing sent")
+            }
+            ControlMsg::CapabilitiesChanged { capabilities } => {
+                format!("CapabilitiesChanged  {}", capabilities.describe())
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Two paired machines on two real QUIC endpoints.
+    ///
+    /// The endpoints come back with them and must be kept: dropping a
+    /// `quinn::Endpoint` closes its socket under the session.
+    async fn two_clipboards(
+        alpha_caps: Capabilities,
+        bravo_caps: Capabilities,
+    ) -> (Machine, Machine, (Endpoint, Endpoint)) {
+        fn info(id: NodeId, name: &str, capabilities: Capabilities) -> NodeInfo {
+            NodeInfo {
+                id,
+                name: name.into(),
+                platform: wx_proto::Platform::Linux,
+                display_server: wx_proto::DisplayServer::Wayland,
+                capabilities,
+                monitors: Vec::new(),
+                agent_version: AGENT_VERSION.into(),
+            }
+        }
+
+        let alpha_id = Identity::generate().unwrap();
+        let bravo_id = Identity::generate().unwrap();
+        let mut alpha_trust = TrustStore::new();
+        alpha_trust.trust(bravo_id.node_id(), "bravo");
+        let mut bravo_trust = TrustStore::new();
+        bravo_trust.trust(alpha_id.node_id(), "alpha");
+
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bravo_endpoint = Endpoint::bind(loopback).unwrap();
+        let alpha_endpoint = Endpoint::bind(loopback).unwrap();
+        let bravo_addr = bravo_endpoint.local_addr().unwrap();
+
+        let alpha_setup = SessionSetup {
+            identity: &alpha_id,
+            trust: &alpha_trust,
+            local_info: info(alpha_id.node_id(), "alpha", alpha_caps),
+            pairing_mode: false,
+        };
+        let bravo_setup = SessionSetup {
+            identity: &bravo_id,
+            trust: &bravo_trust,
+            local_info: info(bravo_id.node_id(), "bravo", bravo_caps),
+            pairing_mode: false,
+        };
+        // Both sides at once: each blocks on the other.
+        let (accepted, connected) = tokio::join!(
+            async { bravo_endpoint.accept(&bravo_setup).await.expect("closed") },
+            alpha_endpoint.connect(bravo_addr, &alpha_setup),
+        );
+        let (alpha_session, alpha_events) = connected.expect("alpha handshake");
+        let (bravo_session, bravo_events) = accepted.expect("bravo handshake");
+
+        let machine = |name, peer, caps, peer_caps, session, events| Machine {
+            name,
+            peer,
+            caps,
+            peer_caps,
+            shares_with_peer: true,
+            access: DoubleBumpClipboard::new(),
+            sync: ClipboardSync::new(),
+            traffic: ClipboardTraffic::default(),
+            session,
+            events,
+        };
+        (
+            machine(
+                "alpha",
+                bravo_id.node_id(),
+                alpha_caps,
+                bravo_caps,
+                alpha_session,
+                alpha_events,
+            ),
+            machine(
+                "bravo",
+                alpha_id.node_id(),
+                bravo_caps,
+                alpha_caps,
+                bravo_session,
+                bravo_events,
+            ),
+            (alpha_endpoint, bravo_endpoint),
+        )
+    }
+
+    /// Carry the exchange `from` has just started until neither side answers, and
+    /// return every message that crossed.
+    async fn carry_the_exchange(from: &mut Machine, to: &mut Machine) -> Vec<ControlMsg> {
+        let (mut from, mut to) = (from, to);
+        let mut transcript = Vec::new();
+        loop {
+            let msg = to.next_message().await;
+            println!("  {} → {}:  {}", from.name, to.name, describe(&msg));
+            transcript.push(msg.clone());
+            match to.handle(msg).await {
+                Some(_) => std::mem::swap(&mut from, &mut to),
+                None => return transcript,
+            }
+        }
+    }
+
+    /// Whatever was on a clipboard before the agent existed stays where it is.
+    async fn settle_first_sighting(machine: &mut Machine) {
+        assert_eq!(machine.poll().await, Some(LocalChange::FirstSighting));
+    }
+
+    #[tokio::test]
+    async fn a_copy_on_one_machine_is_pasteable_on_the_other() {
+        let (mut alpha, mut bravo, _endpoints) =
+            two_clipboards(full_clipboard(), full_clipboard()).await;
+
+        alpha.access.copied_by_hand(
+            ClipboardFormat::Utf8Text,
+            b"from before either agent started",
+        );
+        settle_first_sighting(&mut alpha).await;
+        settle_first_sighting(&mut bravo).await;
+
+        // The user copies something on alpha.
+        let copied = "Ship it — 22:04, and the kettle is on ☕";
+        println!("alpha: the user copies {copied:?}");
+        alpha
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, copied.as_bytes());
+        assert!(matches!(
+            alpha.poll().await,
+            Some(LocalChange::Offer { .. })
+        ));
+        carry_the_exchange(&mut alpha, &mut bravo).await;
+
+        let (format, pasted) = bravo.pasted().expect("bravo's clipboard is empty");
+        println!(
+            "bravo: the user presses Ctrl-V and gets {:?} ({format:?})",
+            String::from_utf8_lossy(&pasted)
+        );
+        assert_eq!(format, ClipboardFormat::Utf8Text);
+        assert_eq!(pasted, copied.as_bytes());
+
+        // And it stops there. Bravo's own poll sees the change its write made —
+        // twice over, because the portal echoes it — and absorbs both.
+        assert_eq!(bravo.poll().await, Some(LocalChange::Echo));
+        bravo.access.portal_echo();
+        assert_eq!(bravo.poll().await, Some(LocalChange::Echo));
+        assert!(
+            alpha.heard_nothing_more().await,
+            "bravo offered alpha its own payload back"
+        );
+        // Nothing for alpha either: its own clipboard has not moved, which the
+        // worker answers with `NothingNew` and the loop with nothing at all.
+        assert_eq!(alpha.poll().await, None);
+        println!("bravo: its own write-back is absorbed; nothing goes back to alpha");
+
+        // The other direction, in the richer format, on the same session.
+        let html = b"<p>and <em>this</em> came back the other way</p>";
+        println!("bravo: the user copies HTML");
+        bravo.access.copied_by_hand(ClipboardFormat::Html, html);
+        assert!(matches!(
+            bravo.poll().await,
+            Some(LocalChange::Offer { .. })
+        ));
+        carry_the_exchange(&mut bravo, &mut alpha).await;
+        assert_eq!(
+            alpha.pasted(),
+            Some((ClipboardFormat::Html, html.to_vec())),
+            "alpha did not end up with bravo's HTML"
+        );
+        println!(
+            "alpha: pastes {:?}",
+            String::from_utf8_lossy(&alpha.pasted().unwrap().1)
+        );
+
+        // Text large enough to be worth compressing, which the short strings above
+        // are not: what crosses is zstd, and what is pasted is the original.
+        let log: String =
+            "2026-07-28T09:14:02Z  wx-agent  peer bravo is reachable\n".repeat(16_384);
+        println!("alpha: the user copies {} KiB of log", log.len() / 1024);
+        alpha
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, log.as_bytes());
+        alpha.poll().await;
+        let transcript = carry_the_exchange(&mut alpha, &mut bravo).await;
+        assert!(
+            transcript.iter().any(|m| matches!(
+                m,
+                ControlMsg::ClipboardData {
+                    compression: Compression::Zstd,
+                    ..
+                }
+            )),
+            "text this repetitive should not have crossed uncompressed"
+        );
+        assert_eq!(
+            bravo.pasted(),
+            Some((ClipboardFormat::Utf8Text, log.into_bytes())),
+            "the compressed payload did not come back out the way it went in"
+        );
+        println!(
+            "bravo: pastes {} KiB, byte-exact, after decompressing",
+            bravo.pasted().unwrap().1.len() / 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_crosses_byte_exact_and_one_too_large_costs_only_the_paste() {
+        let (mut alpha, mut bravo, _endpoints) =
+            two_clipboards(full_clipboard(), full_clipboard()).await;
+        settle_first_sighting(&mut alpha).await;
+        settle_first_sighting(&mut bravo).await;
+
+        // A screenshot-sized PNG: past every QUIC flow-control window, and the size
+        // the clipboard's own stream exists for.
+        let png = png_of(22 * 1024 * 1024);
+        println!(
+            "alpha: the user copies a {} MiB PNG",
+            png.len() / 1024 / 1024
+        );
+        alpha.access.copied_by_hand(ClipboardFormat::Png, &png);
+        alpha.poll().await;
+        let transcript = carry_the_exchange(&mut alpha, &mut bravo).await;
+
+        let (format, pasted) = bravo.pasted().expect("bravo's clipboard is empty");
+        assert_eq!(format, ClipboardFormat::Png);
+        assert_eq!(pasted, png, "the image did not arrive byte for byte");
+        println!(
+            "bravo: pastes {} bytes of PNG, byte-exact ({}…)",
+            pasted.len(),
+            pasted[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            transcript.iter().any(|m| matches!(
+                m,
+                ControlMsg::ClipboardData {
+                    compression: Compression::None,
+                    ..
+                }
+            )),
+            "a PNG must not be handed to zstd"
+        );
+
+        // Now more than the protocol carries. The offer is made — nothing has read
+        // the clipboard yet — and the request is answered honestly.
+        let too_big = png_of(50 * 1024 * 1024);
+        println!(
+            "alpha: the user copies a {} MiB PNG, past what the protocol carries",
+            too_big.len() / 1024 / 1024
+        );
+        alpha.access.copied_by_hand(ClipboardFormat::Png, &too_big);
+        alpha.poll().await;
+        let transcript = carry_the_exchange(&mut alpha, &mut bravo).await;
+        assert!(
+            matches!(transcript.last(), Some(ControlMsg::ClipboardStale { .. })),
+            "an oversized payload must be refused, not sent"
+        );
+        assert_eq!(
+            bravo.pasted().map(|(f, d)| (f, d.len())),
+            Some((ClipboardFormat::Png, png.len())),
+            "bravo's clipboard must still hold what it had"
+        );
+
+        // And the session is still there, which is the half of this that matters:
+        // the refusal costs one paste and not the link.
+        let after = "still here, still working";
+        println!("alpha: the user copies {after:?} on the same session");
+        alpha
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, after.as_bytes());
+        alpha.poll().await;
+        carry_the_exchange(&mut alpha, &mut bravo).await;
+        assert_eq!(
+            bravo.pasted(),
+            Some((ClipboardFormat::Utf8Text, after.as_bytes().to_vec())),
+            "the oversized refusal took the session with it"
+        );
+        println!(
+            "bravo: pastes {:?} — the refusal cost a paste, not the session",
+            String::from_utf8_lossy(&bravo.pasted().unwrap().1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_may_say_what_it_copied_and_may_not_set_this_machines_clipboard() {
+        let (alpha, mut bravo, _endpoints) =
+            two_clipboards(full_clipboard(), full_clipboard()).await;
+        bravo
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, b"what bravo's user copied");
+        settle_first_sighting(&mut bravo).await;
+
+        // No offer, no request: a payload pushed at a machine that never asked.
+        println!("alpha: sends ClipboardData that bravo never asked for");
+        alpha
+            .send(ControlMsg::ClipboardData {
+                format: ClipboardFormat::Utf8Text,
+                serial: 1,
+                compression: Compression::None,
+                data: b"alpha decided what you have copied".to_vec(),
+            })
+            .await;
+        let msg = bravo.next_message().await;
+        bravo.handle(msg).await;
+
+        assert_eq!(
+            bravo.pasted(),
+            Some((
+                ClipboardFormat::Utf8Text,
+                b"what bravo's user copied".to_vec()
+            )),
+            "a paired peer must not be able to set this machine's clipboard unasked"
+        );
+        println!("bravo: still pastes its own content — unsolicited content is refused");
+    }
+
+    #[tokio::test]
+    async fn a_machine_the_user_switched_off_and_a_format_it_cannot_take_are_not_offered() {
+        // Both refusals happen before anything is sent, so what proves them is the
+        // wire staying silent.
+        let (mut alpha, mut bravo, _endpoints) =
+            two_clipboards(full_clipboard(), Capabilities::CLIPBOARD_TEXT).await;
+        settle_first_sighting(&mut alpha).await;
+
+        println!("alpha: the user copies a PNG; bravo advertises text only");
+        alpha
+            .access
+            .copied_by_hand(ClipboardFormat::Png, &png_of(4 * 1024));
+        assert!(matches!(
+            alpha.poll().await,
+            Some(LocalChange::Offer { .. })
+        ));
+        assert!(
+            bravo.heard_nothing_more().await,
+            "a format the peer cannot take must not be offered to it"
+        );
+        println!("bravo: hears nothing — the capability gate held");
+
+        alpha.shares_with_peer = false;
+        println!("alpha: the user turns the clipboard off for bravo, then copies text");
+        alpha
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, b"not for bravo");
+        assert!(matches!(
+            alpha.poll().await,
+            Some(LocalChange::Offer { .. })
+        ));
+        assert!(
+            bravo.heard_nothing_more().await,
+            "the per-peer clipboard flag was not honoured"
+        );
+        println!("bravo: hears nothing — the per-peer switch held");
+    }
+
+    #[tokio::test]
+    async fn a_portal_grant_that_landed_after_the_handshake_still_reaches_a_peer() {
+        // The bug the second half of this change fixes, as the user meets it. The
+        // accept loop clones `local_info` before it awaits the next connection, so
+        // on Wayland the `NodeInfo` a peer receives routinely predates the consent
+        // dialog — and a peer holding that snapshot refuses to offer this machine
+        // anything for the rest of the session.
+        let (mut alpha, mut bravo, _endpoints) =
+            two_clipboards(full_clipboard(), full_clipboard()).await;
+        // What bravo was actually handed at the handshake: alpha before its grant.
+        bravo.peer_caps = Capabilities::CAPTURE_INPUT | Capabilities::CAPABILITY_UPDATES;
+        settle_first_sighting(&mut bravo).await;
+
+        println!("bravo: the user copies text, holding a pre-grant snapshot of alpha");
+        bravo
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, b"copied before the correction");
+        assert!(matches!(
+            bravo.poll().await,
+            Some(LocalChange::Offer { .. })
+        ));
+        assert!(
+            alpha.heard_nothing_more().await,
+            "the stale snapshot is what this test is about"
+        );
+        println!("alpha: hears nothing — this is the failure, measured live on a real desktop");
+
+        // `Engine::on_peer_ready`, which now says what this machine can do *now*.
+        let correction = capability_correction(alpha.peer_caps, alpha.caps)
+            .expect("bravo advertises CAPABILITY_UPDATES");
+        println!("alpha → bravo:  {}", describe(&correction));
+        alpha.session.send_control(&correction).await.unwrap();
+        let msg = bravo.next_message().await;
+        bravo.handle(msg).await;
+
+        println!("bravo: the user copies again");
+        bravo
+            .access
+            .copied_by_hand(ClipboardFormat::Utf8Text, b"copied after the correction");
+        bravo.poll().await;
+        carry_the_exchange(&mut bravo, &mut alpha).await;
+        assert_eq!(
+            alpha.pasted(),
+            Some((
+                ClipboardFormat::Utf8Text,
+                b"copied after the correction".to_vec()
+            )),
+            "the correction did not unblock the clipboard"
+        );
+        println!(
+            "alpha: pastes {:?}",
+            String::from_utf8_lossy(&alpha.pasted().unwrap().1)
+        );
+    }
+
+    /// A PNG-shaped payload of a given size.
+    ///
+    /// Real magic bytes and a non-repeating body: a run of one byte would compress
+    /// away to nothing and measure the wrong thing.
+    fn png_of(bytes: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(bytes);
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend((data.len()..bytes).map(|i| (i % 251) as u8));
+        data
+    }
+
     #[tokio::test]
     async fn a_dead_send_queue_is_reported_rather_than_treated_as_a_stall() {
         // A closed queue means the session is already finished and its pump is about
