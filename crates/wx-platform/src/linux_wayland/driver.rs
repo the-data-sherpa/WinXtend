@@ -328,16 +328,22 @@ async fn run(
     if live.clipboard.is_some() {
         clipboard.attach(clipboard_portal::transport(command_tx.clone()));
     }
-    shared.activate(live.granted);
+    // What the grant is worth *now*, which is not yet all of it: the seat and its
+    // devices arrive on the `ei` stream that `pump` has not started reading, so
+    // injection is still a promise this machine could not keep. `pump` publishes
+    // the rest the moment the devices show up. See `serviceable`.
+    shared.activate(serviceable(live.granted, transport));
 
     let reason = pump(
         Running {
             session: Arc::clone(&live.session),
+            granted: live.granted,
             connection,
             events,
             clipboard: live.clipboard,
             commands: command_rx,
         },
+        shared,
         clipboard_proxy.as_ref(),
         transport,
         clipboard,
@@ -519,6 +525,9 @@ struct Wired {
 /// with no `clipboard` was granted the other way round.
 struct Running<'a> {
     session: Arc<Session<RemoteDesktop>>,
+    /// Everything the portal granted — the ceiling on what may ever be published
+    /// for this session, which `serviceable` narrows to what works at any moment.
+    granted: Capabilities,
     connection: Option<reis::event::Connection>,
     events: Option<reis::tokio::EiConvertEventStream>,
     clipboard: Option<clipboard_portal::Portal<'a>>,
@@ -832,6 +841,38 @@ fn accept_granted(devices: BitFlags<DeviceType>, clipboard: bool) -> Result<Capa
     Ok(granted)
 }
 
+/// Which of a grant's capabilities this machine can actually serve at this moment.
+///
+/// A grant is a permission and a capability is a promise that something *works*, and
+/// on this backend the two are apart for a window at the start of every session. The
+/// portal answers `Start`, `ConnectToEIS` hands over a socket, and the handshake
+/// returns — and none of that is a device. The seat arrives as `SeatAdded` on the
+/// `ei` stream, its capabilities have to be bound, the compositor then creates the
+/// devices and sends `DeviceAdded`, and only `DeviceResumed` licenses anything to be
+/// sent on them. All of that lands *after* the session is granted.
+///
+/// Publishing `INJECT_INPUT` on the strength of the grant alone means a peer can be
+/// told this machine accepts input during that window, and a peer that acts on it
+/// gets "the portal session offered no device for the keyboard" — the first keypress
+/// after connecting silently doing nothing. The window is short and clears itself,
+/// which is exactly why it will not turn up in casual testing and will turn up on
+/// somebody else's two-machine setup.
+///
+/// So the injection bit is held back until the devices are there, and dropped again
+/// if they go away — a compositor that pauses or removes them mid-session is the
+/// same claim becoming false, and peers have to be told that too.
+///
+/// The clipboard bits are deliberately untouched. The clipboard rides this session
+/// but not its libei transport: it is D-Bus calls on the session object, which work
+/// the instant `Start` answers. Withholding them until an unrelated device turned up
+/// would be the same dishonesty in the other direction.
+fn serviceable(granted: Capabilities, transport: &Transport) -> Capabilities {
+    if granted.contains(INJECT_CAPABILITIES) && !transport.can_inject() {
+        return Capabilities(granted.0 & !INJECT_CAPABILITIES.0);
+    }
+    granted
+}
+
 /// What [`negotiate`] produces: everything a [`Live`] needs except the session.
 struct Negotiated<'a> {
     granted: Capabilities,
@@ -850,6 +891,7 @@ struct Negotiated<'a> {
 /// `Disconnected` on the `ei` stream.
 async fn pump(
     running: Running<'_>,
+    shared: &SharedSession,
     proxy: Option<&Arc<Clipboard>>,
     transport: &Transport,
     clipboard: &ClipboardState,
@@ -857,6 +899,7 @@ async fn pump(
 ) -> Ended {
     let Running {
         session,
+        granted,
         connection,
         events,
         clipboard: portal,
@@ -923,6 +966,12 @@ async fn pump(
                             return ended;
                         }
                     }
+                    // Every device event can move the answer in either direction —
+                    // a resume is what makes injection real, a pause or a removal
+                    // takes it away again — so it is asked after each one rather
+                    // than at the arrivals only. `regrant` publishes what changed
+                    // and nothing else.
+                    shared.regrant(serviceable(granted, transport));
                 }
                 Some(Err(e)) => {
                     return Ended::Broken(format!("the libei transport failed: {e}"));

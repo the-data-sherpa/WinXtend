@@ -204,6 +204,34 @@ impl SharedSession {
         }
     }
 
+    /// Republish what a session that is *already* live can serve now.
+    ///
+    /// [`SharedSession::activate`] answers "what did the portal grant", which is
+    /// settled once and does not change. This answers a different question — "what
+    /// of that grant can be served this instant" — and the two are not the same
+    /// while the transport underneath is still assembling itself, or after the
+    /// compositor has taken part of it away again. A grant is a permission; a
+    /// capability is a promise that something works, and only the second is what
+    /// peers are told.
+    ///
+    /// Does nothing unless the session is live: a state that has not reached
+    /// [`SessionState::Active`] has nothing to republish, and a terminal one has
+    /// already dropped everything it owned and must not have any of it put back.
+    /// `granted` is masked by [`SharedSession::publish`] like any other, so this
+    /// cannot widen a grant — only report less of one.
+    pub fn regrant(&self, granted: Capabilities) {
+        let status = self.lock();
+        if status.state != SessionState::Active {
+            return;
+        }
+        // Held across the publish rather than dropped first as `terminate` does.
+        // Ordering here is the same non-problem it is there — the driver thread is
+        // the only writer, so nothing can land between the check and the publish —
+        // but this one runs on every device event rather than once at the end, and
+        // the guard costs nothing.
+        self.publish(granted);
+    }
+
     /// The user refused, or the portal took the session away.
     pub fn denied(&self, detail: impl Into<String>) {
         self.terminate(SessionState::Denied, detail.into());
@@ -697,6 +725,72 @@ mod tests {
         ] {
             assert!(!state.is_terminal(), "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_live_session_can_stop_advertising_half_its_grant_and_start_again() {
+        // What the portal granted and what the machine can do this instant are two
+        // questions, and only the second is what peers are told. The devices behind
+        // injection arrive after the grant and can be taken away during it, so the
+        // bit has to be able to move in both directions without the session ending
+        // — and without disturbing the clipboard, which rides the same grant over
+        // D-Bus and is real from the moment `Start` answers.
+        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+        s.starting();
+        s.activate(CLIPBOARD_CAPABILITIES);
+        assert!(!live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(live.get().contains(Capabilities::CLIPBOARD_TEXT));
+
+        s.regrant(REMOTE_DESKTOP_CAPABILITIES);
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+
+        s.regrant(CLIPBOARD_CAPABILITIES);
+        assert!(!live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(live.get().contains(Capabilities::CLIPBOARD_TEXT));
+        assert!(live.get().contains(Capabilities::HAS_DISPLAYS));
+        assert_eq!(
+            s.state(),
+            SessionState::Active,
+            "nothing here ends a session"
+        );
+        assert!(s.error().is_none());
+    }
+
+    #[test]
+    fn nothing_can_be_republished_onto_a_session_that_is_not_live() {
+        // The rule that keeps this from being a way back into a session that has
+        // ended. A device event racing a revocation must not put a capability back
+        // after the revocation dropped it, and a session that was never granted has
+        // nothing to republish in the first place.
+        let (idle, live) = session();
+        idle.regrant(REMOTE_DESKTOP_CAPABILITIES);
+        assert!(live.get().is_empty(), "an idle session grants nothing");
+
+        let (revoked, live) = session();
+        revoked.starting();
+        revoked.activate(REMOTE_DESKTOP_CAPABILITIES);
+        revoked.denied("the desktop portal revoked the session");
+        revoked.regrant(REMOTE_DESKTOP_CAPABILITIES);
+        assert!(
+            live.get().is_empty(),
+            "a revoked session advertises nothing"
+        );
+        assert_eq!(revoked.state(), SessionState::Denied);
+    }
+
+    #[test]
+    fn republishing_cannot_claim_more_than_the_session_owns() {
+        // `regrant` is masked like every other publish, so the narrowing path
+        // cannot be turned into a widening one by a caller that passes the wrong
+        // set: the capture session's bit is not this session's to hand out.
+        let (inject, capture, live) = both(Capabilities::NONE);
+        inject.starting();
+        inject.activate(REMOTE_DESKTOP_CAPABILITIES);
+        capture.starting();
+
+        inject.regrant(REMOTE_DESKTOP_CAPABILITIES.union(Capabilities::CAPTURE_INPUT));
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(!live.get().contains(Capabilities::CAPTURE_INPUT));
     }
 
     #[test]

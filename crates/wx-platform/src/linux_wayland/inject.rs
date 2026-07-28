@@ -80,14 +80,21 @@ struct Wired {
     pointer: Option<Device>,
     /// Absolute motion, and the device buttons and scrolling are sent on.
     absolute: Option<Device>,
-    /// Devices the compositor has paused.
+    /// Devices that are known but may not be sent on.
     ///
-    /// A pause is temporary and routine — mutter pauses the devices around
-    /// session suspension — so a paused device keeps its slot and only loses the
-    /// right to be sent on, which is what the accessors below enforce. Dropping
-    /// it instead would be unrecoverable: the keymap arrives exactly once, on a
-    /// file descriptor, and the layout group and locked modifiers reported since
-    /// are state no later event repeats.
+    /// Two things land here and they are the same state as far as the protocol is
+    /// concerned. A device the compositor **paused** is temporary and routine —
+    /// mutter pauses the devices around session suspension — so it keeps its slot
+    /// and only loses the right to be sent on, which is what the accessors below
+    /// enforce. Dropping it instead would be unrecoverable: the keymap arrives
+    /// exactly once, on a file descriptor, and the layout group and locked
+    /// modifiers reported since are state no later event repeats.
+    ///
+    /// A device that has merely been **added** is in that same condition and for
+    /// the same reason: a libei device arrives paused and `DeviceResumed` is what
+    /// makes it usable, so everything queued before it is discarded. Treating an
+    /// added device as usable is how injection becomes a silent no-op — the events
+    /// go out, the compositor drops them, and nothing anywhere reports a problem.
     paused: Vec<Device>,
     /// Incremented for each `start_emulating`, as the protocol asks.
     sequence: u32,
@@ -154,10 +161,18 @@ impl Transport {
     }
 
     /// Take note of a device the compositor has offered.
+    ///
+    /// Offered is not the same as usable. A libei device is created paused, and
+    /// only `DeviceResumed` licenses anything to be sent on it — so it takes its
+    /// slot here and is held back from being sent on until that arrives. See
+    /// [`Wired::paused`].
     pub fn device_added(&self, device: &Device) {
         let mut guard = self.lock();
         let Some(wired) = guard.as_mut() else { return };
         wired.register(device);
+        if !wired.is_paused(device) {
+            wired.paused.push(device.clone());
+        }
     }
 
     /// The device is ready to emulate. Nothing may be sent before this.
@@ -260,6 +275,28 @@ impl Transport {
     /// Whether a live transport exists at all.
     fn is_live(&self) -> bool {
         self.lock().is_some()
+    }
+
+    /// Whether this transport could inject a keystroke or a pointer event *now*.
+    ///
+    /// The question [`Capabilities::INJECT_INPUT`] is a promise about, asked of the
+    /// devices rather than of the portal. A granted session is not the same thing as
+    /// a usable one: the `ei` seat and its devices arrive after the handshake
+    /// returns, and until they do — and again whenever the compositor takes them
+    /// away — there is nothing to send on and every injection is refused with "the
+    /// portal session offered no device for …".
+    ///
+    /// A keyboard *and* a pointer, because that is the granularity the capability
+    /// has: `INJECT_INPUT` is both together or it is nothing, which is the same rule
+    /// the driver applies to the portal's device grant. Either pointer will do —
+    /// relative or absolute — because a compositor is free to offer one device that
+    /// does both.
+    ///
+    /// [`Capabilities::INJECT_INPUT`]: wx_proto::Capabilities::INJECT_INPUT
+    pub fn can_inject(&self) -> bool {
+        self.lock().as_ref().is_some_and(|wired| {
+            wired.keyboard().is_some() && (wired.pointer().is_some() || wired.absolute().is_some())
+        })
     }
 }
 
