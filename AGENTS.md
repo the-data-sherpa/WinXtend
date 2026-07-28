@@ -231,12 +231,12 @@ step runs from `beforeBuildCommand`, so `npm run package:deb` needs nothing firs
 Both of its products — `ui/src-tauri/binaries/wx-agent-<triple>` and
 `packaging/winxtend.service` — are generated and `.gitignore`d. `tauri build` also
 rewrites `ui/src-tauri/Cargo.toml`, normalising `tauri` and `tauri-build` to
-`features = []`; it is a semantic no-op, so `git checkout` it rather than committing it. Adding a runtime
-dependency or a packaged file means editing `bundle.linux.deb` in `tauri.conf.json`;
-`libwebkit2gtk-4.1-0` and `libgtk-3-0` are added by Tauri's own bundler and must not be
-listed there as well, or they appear twice in `Depends`. `.github/workflows/package.yml`
-asserts the built `.deb`'s contents and dependency list, which is the only check that
-the package is complete.
+`features = []`; it is a semantic no-op, so `git checkout` it rather than committing it.
+Adding a runtime dependency or a packaged file means editing `bundle.linux.deb` in
+`tauri.conf.json`; `libwebkit2gtk-4.1-0` and `libgtk-3-0` are added by Tauri's own
+bundler and must not be listed there as well, or they appear twice in `Depends`.
+`.github/workflows/package.yml` asserts the built `.deb`'s contents and dependency list,
+which is the only check that the package is complete.
 
 ## Autostart is per-user on every platform, and the reasoning is load-bearing
 
@@ -248,12 +248,16 @@ the session bus, and `xdg-desktop-portal`. The module doc and
 `packaging/winxtend.service.in` carry the full argument; read them before proposing a
 system service again.
 
-Two properties are easy to break and are tested: registration rewrites the recorded path
-every time (a stale one fails silently at every login), and a registration whose target
-is gone reads as *not* registered. The Linux path is testable end to end because
-`install_in`/`uninstall_in`/`is_registered_in` take a config root, so tests redirect it
-instead of touching `~/.config`; `systemctl daemon-reload` sits outside that split and is
-best-effort, because CI has no user systemd instance.
+Three properties are easy to break and are tested: registration rewrites the recorded
+path every time, a registration whose target is gone reads as *not* registered, and the
+rendered `ExecStart` is one systemd will accept — quoted for a space, `%%` for a percent,
+and refused outright for a path systemd cannot name at all (`quoted` and `representable`
+in that module carry the reasoning). All three are the same failure and it is the one
+this module is written against: a registration reported as successful that then starts
+nothing, at the next login, on the user's machine. The Linux path is testable end to end
+because `install_in`/`uninstall_in`/`is_registered_in` take a config root, so tests
+redirect it instead of touching `~/.config`; `systemctl daemon-reload` sits outside that
+split and is best-effort, because CI has no user systemd instance.
 
 `packaging/winxtend.service.in` is the single unit text: `autostart.rs` `include_str!`s
 it and `ui/scripts/bundle-agent.mjs` substitutes the same file for the packaged copy.

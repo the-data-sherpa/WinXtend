@@ -203,7 +203,7 @@ for what the next release is about.
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
-| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit and the registration is tested against a scratch config root, but no systemd user manager has yet started it at a real login |
 | Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
