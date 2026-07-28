@@ -43,11 +43,18 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], ...options });
 }
 
-/// The host target triple, as rustc reports it. Overridable so that a
-/// cross-build can name the target it is actually bundling for.
+/// The host target triple, as rustc reports it.
+///
+/// Host only, and deliberately not overridable. There was a
+/// `WINXTEND_TARGET_TRIPLE` override here, but `buildAgent` below passes no
+/// `--target` and reads `target/release/`, so setting it only renamed the *host*
+/// binary after a foreign triple: a bundle whose sidecar cannot execute on the
+/// machine it is labelled for, which the `.deb` content check would pass because
+/// it asserts a path and a size and nothing about the architecture. Cross-building
+/// needs `--target <triple>` on the cargo build and the binary read from
+/// `target/<triple>/release/`; until something in this repo does that, the
+/// affordance is worse than its absence.
 function targetTriple() {
-  const explicit = process.env.WINXTEND_TARGET_TRIPLE;
-  if (explicit) return explicit.trim();
   const line = run("rustc", ["-vV"])
     .split("\n")
     .find((l) => l.startsWith("host:"));
@@ -87,9 +94,12 @@ function placeSidecar(agent, triple) {
 // must render identically to `linux_impl::quoted` in
 // `crates/wx-agent/src/autostart.rs` — the two substituters sharing one template
 // is the whole reason there is a template — so it quotes unconditionally too,
-// escaping the backslash and the double quote systemd reads inside the quotes.
+// escaping the backslash and the double quote systemd reads inside the quotes,
+// and doubling the percent systemd resolves as a specifier whether it is quoted
+// or not. The three replacements are in the same order as the Rust ones so the
+// two can be diffed by eye.
 function quoted(path) {
-  return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
 }
 
 function generateUnit() {

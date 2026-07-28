@@ -83,17 +83,28 @@ jobs:
           echo "Depends: $control"
 
           fail=0
-          for path in ./usr/bin/wx-agent ./usr/bin/winxtend-ui \
-                      ./usr/lib/systemd/user/winxtend.service; do
-            echo "$contents" | grep -qE "[[:space:]]${path#./}\$" \
+          # Matched with the `./` optional. `dpkg-deb -c` on the package Tauri
+          # builds today lists `usr/bin/wx-agent` with no prefix, while a
+          # dpkg-built archive lists `./usr/bin/wx-agent`; this job has never run
+          # in CI, so it must not encode either writer's current behaviour as a
+          # requirement.
+          for path in usr/bin/wx-agent usr/bin/winxtend-ui \
+                      usr/lib/systemd/user/winxtend.service; do
+            echo "$contents" | grep -qE "(^|[[:space:]])[.]?/?${path}\$" \
               || { echo "::error::$path is missing from the package"; fail=1; }
           done
           # libwebkit2gtk-4.1-0 and libgtk-3-0 are added by Tauri's own bundler
           # rather than by tauri.conf.json, so they are checked here instead of
           # declared twice; the rest come from `bundle.linux.deb.depends`.
-          for dep in libwebkit2gtk-4.1-0 xdg-desktop-portal \
+          #
+          # Matched on a package-name boundary, not as a substring: plain
+          # `xdg-desktop-portal` is satisfied by a line declaring only
+          # `xdg-desktop-portal-gnome`, so dropping the base portal would pass
+          # the check that exists precisely to catch it. The `\(` arm allows a
+          # version constraint after the name.
+          for dep in libwebkit2gtk-4.1-0 libgtk-3-0 xdg-desktop-portal \
                      xdg-desktop-portal-gnome libei1; do
-            echo "$control" | grep -q "$dep" \
+            echo "$control" | grep -qE "(^|[ ,])${dep}([ ,(]|\$)" \
               || { echo "::error::$dep is not a declared dependency"; fail=1; }
           done
           # The agent must be beside the UI *and* be the agent: an empty or

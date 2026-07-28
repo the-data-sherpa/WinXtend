@@ -211,13 +211,17 @@ pub mod linux_impl {
     /// substitutes the same template for the packaged unit, and two renderings
     /// that differ only in an edge case are two renderings that will drift.
     /// Inside the quotes systemd reads `\` as an escape, so a backslash and a
-    /// double quote each need one.
+    /// double quote each need one. `%` is not covered by quoting at all —
+    /// systemd resolves its specifiers across the whole directive — so a literal
+    /// percent has to be written `%%` or the command silently becomes a
+    /// different one, or the unit refuses to load, at the next login only.
     fn quoted(path: &Path) -> String {
         let escaped = path
             .display()
             .to_string()
             .replace('\\', r"\\")
-            .replace('"', "\\\"");
+            .replace('"', "\\\"")
+            .replace('%', "%%");
         format!("\"{escaped}\"")
     }
 
@@ -879,6 +883,25 @@ mod tests {
         let unit = linux_impl::unit_text(std::path::Path::new("/opt/win xtend/wx-agent"));
         assert!(
             unit.contains("ExecStart=\"/opt/win xtend/wx-agent\""),
+            "{unit}"
+        );
+    }
+
+    /// A path with a percent in it must not be read as a systemd specifier.
+    ///
+    /// systemd resolves `%`-specifiers in `ExecStart` regardless of quoting, so
+    /// `/opt/wx%20build/wx-agent` either names a different binary — `%2` is not
+    /// a specifier, but `%h`, `%u` and friends are, and one of those is a
+    /// plausible thing to find in an unpacked directory name — or fails the unit
+    /// with "Failed to resolve specifiers". Both are the same
+    /// silent-at-every-login failure the quoting above exists to prevent, so the
+    /// literal form `%%` is the only correct rendering.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_with_a_percent_is_not_read_as_a_specifier() {
+        let unit = linux_impl::unit_text(std::path::Path::new("/opt/wx%20build/wx-agent"));
+        assert!(
+            unit.contains("ExecStart=\"/opt/wx%%20build/wx-agent\""),
             "{unit}"
         );
     }
