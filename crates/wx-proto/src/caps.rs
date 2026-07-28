@@ -241,8 +241,8 @@ pub enum VersionCheck {
 /// extra messages harmless to send: postcard identifies enum variants by index
 /// and is not self-describing, so a variant an older build has never seen is a
 /// hard decode error, not something it can skip — and a control stream that fails
-/// to decode is torn down. `codec::tests::an_unknown_variant_is_a_hard_decode_
-/// failure` pins that.
+/// to decode is torn down.
+/// `codec::tests::an_unknown_variant_is_a_hard_decode_failure` pins that.
 ///
 /// Feature differences are therefore *not* this function's job; they are
 /// [`Capabilities`]' job, which is already the policy at the top of this file and
