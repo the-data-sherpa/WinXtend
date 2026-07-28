@@ -924,8 +924,8 @@ mod tests {
             "{unit}"
         );
         // The startup race: without this ordering an autostarted agent can reach
-        // the portal before it is answerable and run the whole session with no
-        // input capability.
+        // the portal before it is answerable. The agent's own bounded retry is
+        // what closes that race; this ordering is what keeps it from being needed.
         assert!(unit.contains("After=xdg-desktop-portal.service"), "{unit}");
         // `Requires=` would let a portal failure stop an agent that is still
         // useful as a machine that receives input, and would add no ordering.

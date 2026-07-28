@@ -46,17 +46,23 @@ Documentation=https://github.com/the-data-sherpa/WinXtend
 After=graphical-session.target
 PartOf=graphical-session.target
 
-# The startup race this ordering exists to lose.
+# The startup race this ordering narrows.
 #
 # `wx_platform`'s Wayland backend asks the portal for a RemoteDesktop session
 # while the backend is being constructed. If the portal is not yet answerable
-# on the bus that call comes back Unsupported, and the agent then runs for the
-# whole session with no input capability — recoverable only by restarting it.
-# Autostart is exactly the configuration that loses that race, because
-# `xdg-desktop-portal.service` is itself `After=graphical-session.target`: with
-# no ordering of our own, systemd is free to start both at once.
+# on the bus that call comes back Unsupported. Autostart is exactly the
+# configuration that loses that race, because `xdg-desktop-portal.service` is
+# itself `After=graphical-session.target`: with no ordering of our own, systemd
+# is free to start both at once.
 #
-# `Wants=` rather than `Requires=`: `After=` is what removes the race, and
+# Ordering cannot close the race on its own — it says the portal's *unit* was
+# reached, not that the portal answers a method call — so the agent retries the
+# startup sequence itself, and that is what closes it (`STARTUP_RETRY_DELAYS` in
+# crates/wx-platform/src/linux_wayland/driver.rs). This ordering still belongs
+# here: it is what keeps the common case from needing the retry at all. Do not
+# drop it to tidy the unit.
+#
+# `Wants=` rather than `Requires=`: `After=` is what orders this, and
 # `Requires=` adds no ordering at all — it only adds a way for a portal failure
 # to stop an agent that is still perfectly useful as a machine that *receives*
 # input. A `Wants=` naming a unit that is not installed is ignored, so the
@@ -72,7 +78,8 @@ ExecStart=@EXEC_START@
 
 # Restart covers a crash. It deliberately does not cover the portal race above:
 # losing that race leaves the agent running and degraded, not dead, so systemd
-# sees nothing to restart. Ordering is the fix; this is only the safety net.
+# sees nothing to restart. Ordering and the agent's own bounded retry are what
+# address it; this is only the safety net for a crash.
 Restart=on-failure
 RestartSec=5s
 

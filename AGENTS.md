@@ -41,6 +41,13 @@ granted or withdrawn while the process runs, `PlatformBackend::current_capabilit
 is the authority, and `Engine::sync_capabilities` re-advertises to peers when it
 changes.
 
+A **grant is not a capability**, and on Wayland the two are apart for a window at the
+start of every session: the portal grants, and the libei devices that carry an
+injection arrive afterwards. Publish what can be served *now* and republish when that
+changes — `serviceable` and `SharedSession::regrant` in
+`crates/wx-platform/src/linux_wayland/` are that split. Any backend whose permission
+and transport come up separately has the same window.
+
 ## A test total that differs by platform is expected
 
 `cargo test --workspace` legitimately reports a different total on Linux, Windows and
@@ -261,10 +268,14 @@ split and is best-effort, because CI has no user systemd instance.
 
 `packaging/winxtend.service.in` is the single unit text: `autostart.rs` `include_str!`s
 it and `ui/scripts/bundle-agent.mjs` substitutes the same file for the packaged copy.
-Its `After=xdg-desktop-portal.service` exists to lose a real startup race — an
+Its `After=xdg-desktop-portal.service` exists to narrow a real startup race — an
 autostarted agent that reaches the portal before it is answerable gets `Unsupported` and
 stays without input capability for the whole run. Do not drop the ordering to tidy the
-unit.
+unit. It cannot close the race on its own, because ordering says the portal's *unit* was
+reached and not that the portal answers; the agent-side bounded retry
+(`STARTUP_RETRY_DELAYS` in `crates/wx-platform/src/linux_wayland/driver.rs`) is what
+does. Read the rules on `retry_after` before touching either: a retry that could raise a
+consent dialog is a worse bug than the one both exist to fix.
 
 ## Maintaining this file
 

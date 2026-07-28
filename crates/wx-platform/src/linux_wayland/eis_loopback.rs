@@ -34,7 +34,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,11 +46,14 @@ use reis::request::{DeviceCapability, EisRequest, EisRequestConverter};
 use reis::PendingRequestResult;
 
 use wx_proto::{
-    InputEvent, KeyAction, KeyEvent, KeyPayload, Modifiers, Monitor, MonitorId, MouseButton,
-    NormPos, PointerEvent, Rect, ScrollUnit, SpecialKey,
+    Capabilities, InputEvent, KeyAction, KeyEvent, KeyPayload, Modifiers, Monitor, MonitorId,
+    MouseButton, NormPos, PointerEvent, Rect, ScrollUnit, SpecialKey,
 };
 
+use crate::error::PlatformError;
+
 use super::super::inject::{Injector, Transport};
+use super::super::session::{CLIPBOARD_CAPABILITIES, REMOTE_DESKTOP_CAPABILITIES};
 
 /// Real keymaps, not sketches. `US` is the 36 KB text dumped straight off the alpha
 /// target's compositor — the same bytes `ei_keyboard.keymap` carries. `US_NO` is
@@ -154,6 +157,19 @@ enum Command {
     },
     /// `ei_device.paused` on every device, then `ei_device.resumed`.
     PauseAndResume,
+    /// `ei_seat.device` for all three, on a session that was started without
+    /// them — the window between a granted portal session and a usable one.
+    ///
+    /// `resume` separates the two halves of that window: a device is created
+    /// paused and `ei_device.resumed` is what licenses anything to be sent on it,
+    /// so an offer without one leaves a device that exists and cannot be used.
+    Offer {
+        resume: bool,
+    },
+    /// `ei_device.resumed` on every device offered so far.
+    Resume,
+    /// `ei_device.paused` on every device, and left there.
+    Pause,
     Stop,
 }
 
@@ -208,23 +224,50 @@ fn poll_readable<T: AsFd>(fd: &T, timeout: Duration) {
 }
 
 /// The EIS half: a compositor's side of one libei session.
+///
+/// `offer_on_bind` is what a real compositor does: the devices appear as soon as
+/// the client binds the seat's capabilities. A test that passes `false` holds them
+/// back until [`Command::Offer`], which is the only way to stand still inside the
+/// window between a session being granted and being usable.
 fn serve(
     stream: UnixStream,
     keymap: &'static str,
     recorder: Arc<Recorder>,
     cmds: Receiver<Command>,
+    offer_on_bind: bool,
 ) {
     let context = eis::Context::new(stream).expect("creating the EIS context");
     let mut handshaker = EisHandshaker::new(&context, 1);
     let mut converter: Option<EisRequestConverter> = None;
     let mut seat: Option<reis::request::Seat> = None;
     let mut devices: Option<Devices> = None;
+    // Whether the client has bound the seat, which is when devices may legally be
+    // offered. An `Offer` that arrives before that is held in `pending_offer` until
+    // it can be honoured, so a test cannot lose a race it has no way to see.
+    let mut bound = false;
+    let mut pending_offer: Option<bool> = None;
 
     loop {
         // Short timeout rather than a blocking wait: the command channel has to be
         // serviced between reads, and a test that wedges must end by deadline
         // rather than by hanging the whole run.
         poll_readable(&context, Duration::from_millis(20));
+
+        // A held-back offer, honoured as soon as the client has bound the seat.
+        // Kept here rather than in the command arm so that an `Offer` sent before
+        // the bind lands is deferred rather than dropped.
+        if bound && devices.is_none() {
+            if let Some(resume) = pending_offer.take() {
+                devices = Some(offer_devices(
+                    seat.as_ref().expect("a seat"),
+                    keymap,
+                    resume,
+                ));
+                if let Some(c) = &converter {
+                    let _ = c.handle().flush();
+                }
+            }
+        }
 
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
@@ -245,6 +288,21 @@ fn serve(
                         }
                         for device in devices.each() {
                             device.resumed();
+                        }
+                    }
+                }
+                Command::Offer { resume } => pending_offer = Some(resume),
+                Command::Resume => {
+                    if let Some(devices) = &devices {
+                        for device in devices.each() {
+                            device.resumed();
+                        }
+                    }
+                }
+                Command::Pause => {
+                    if let Some(devices) = &devices {
+                        for device in devices.each() {
+                            device.paused();
                         }
                     }
                 }
@@ -293,11 +351,15 @@ fn serve(
                             return;
                         }
                         if let EisRequest::Bind(bind) = &request {
-                            if devices.is_none()
-                                && bind.capabilities.contains(DeviceCapability::Keyboard)
-                            {
-                                devices =
-                                    Some(offer_devices(seat.as_ref().expect("a seat"), keymap));
+                            if bind.capabilities.contains(DeviceCapability::Keyboard) {
+                                bound = true;
+                                if offer_on_bind && devices.is_none() {
+                                    devices = Some(offer_devices(
+                                        seat.as_ref().expect("a seat"),
+                                        keymap,
+                                        true,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -308,8 +370,12 @@ fn serve(
     }
 }
 
-/// The three devices, offered and resumed.
-fn offer_devices(seat: &reis::request::Seat, keymap: &str) -> Devices {
+/// The three devices, offered — and resumed only if asked.
+///
+/// A device is created paused, and `resumed` is a separate event. Offering without
+/// it is not an artificial state: it is the one every real session passes through,
+/// briefly, on its way to being usable.
+fn offer_devices(seat: &reis::request::Seat, keymap: &str, resume: bool) -> Devices {
     let (file, size) = keymap_file(keymap);
     let keyboard = seat.add_device(
         Some("winxtend-keyboard"),
@@ -338,8 +404,10 @@ fn offer_devices(seat: &reis::request::Seat, keymap: &str) -> Devices {
             device.device().region(0, 0, 1920, 1080, 1.0);
         },
     );
-    for device in [&keyboard, &pointer, &absolute] {
-        device.resumed();
+    if resume {
+        for device in [&keyboard, &pointer, &absolute] {
+            device.resumed();
+        }
     }
     Devices {
         keyboard,
@@ -393,18 +461,52 @@ struct Harness {
     recorder: Arc<Recorder>,
     commands: Sender<Command>,
     monitor: Monitor,
+    /// The same transport the injector is on, so a test can ask what the driver
+    /// would ask it: whether this session can carry an injection right now.
+    transport: Arc<Transport>,
+    /// How many `DeviceAdded` events the client has finished processing.
+    ///
+    /// The barrier for the one state that has nothing to send on the wire: a
+    /// device that has been offered and not resumed. Incremented *after*
+    /// `on_ei_event` has returned, so a test that has seen the count move knows
+    /// the transport has already been told.
+    devices_added: Arc<AtomicUsize>,
 }
 
 impl Harness {
+    /// A session whose devices are there by the time this returns, which is what
+    /// every test about injecting something wants.
     fn start(keymap: &'static str) -> Self {
+        let harness = Self::start_with(keymap, true);
+        // The devices are usable once the client has answered `resumed` with
+        // `start_emulating` for all three — the point before which everything sent
+        // is discarded.
+        harness.wait_until(
+            |r| r.count(|w| matches!(w, Wire::StartEmulating { .. })) >= 3,
+            "the devices to start emulating",
+        );
+        harness
+    }
+
+    /// A session that has been granted and has no devices yet, and will not get
+    /// any until it is asked for them.
+    ///
+    /// The window every real session passes through in a millisecond or two, held
+    /// open so it can be asserted about.
+    fn start_without_devices(keymap: &'static str) -> Self {
+        Self::start_with(keymap, false)
+    }
+
+    fn start_with(keymap: &'static str, offer_on_bind: bool) -> Self {
         let (client, server) = UnixStream::pair().expect("a socketpair");
         let recorder = Arc::new(Recorder::default());
         let (commands, rx) = mpsc::channel();
 
         let served = Arc::clone(&recorder);
-        std::thread::spawn(move || serve(server, keymap, served, rx));
+        std::thread::spawn(move || serve(server, keymap, served, rx, offer_on_bind));
 
         let transport = Arc::new(Transport::new());
+        let devices_added = Arc::new(AtomicUsize::new(0));
 
         // The client half runs on its own thread because `reis`'s converter is not
         // `Send` — in the product that thread is the driver's, with a tokio runtime
@@ -417,6 +519,7 @@ impl Harness {
         // loop below is what the driver's async stream does — drain first, then
         // wait.
         let pumped = Arc::clone(&transport);
+        let counted = Arc::clone(&devices_added);
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let context = ei::Context::new(client).expect("creating the ei context");
@@ -436,8 +539,14 @@ impl Harness {
                 // `DeviceAdded`/`DeviceResumed` into a usable transport, reads the
                 // keymap off the file descriptor, and starts the devices emulating.
                 while let Some(event) = converter.next_event() {
+                    let added = matches!(event, reis::event::EiEvent::DeviceAdded(_));
                     if super::on_ei_event(&connection, &pumped, event).is_some() {
                         return;
+                    }
+                    // Counted after the handler, so a test that sees this move knows
+                    // the transport has already been told about the device.
+                    if added {
+                        counted.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 poll_readable(&context, Duration::from_millis(20));
@@ -460,8 +569,10 @@ impl Harness {
             .recv_timeout(DEADLINE)
             .expect("the libei handshake completed");
 
-        let harness = Self {
-            injector: Injector::new(transport),
+        Self {
+            injector: Injector::new(Arc::clone(&transport)),
+            transport,
+            devices_added,
             recorder,
             commands,
             monitor: Monitor {
@@ -471,21 +582,18 @@ impl Harness {
                 scale: 1.0,
                 primary: true,
             },
-        };
-        // The devices are usable once the client has answered `resumed` with
-        // `start_emulating` for all three — the point before which everything sent
-        // is discarded.
-        harness.wait_until(
-            |r| r.count(|w| matches!(w, Wire::StartEmulating { .. })) >= 3,
-            "the devices to start emulating",
-        );
-        harness
+        }
     }
 
     fn wait_until(&self, done: impl Fn(&Recorder) -> bool, what: &str) {
+        self.wait_for(|| done(&self.recorder), what);
+    }
+
+    /// The same bounded wait, for a condition the recorder cannot answer.
+    fn wait_for(&self, done: impl Fn() -> bool, what: &str) {
         let deadline = Instant::now() + DEADLINE;
         while Instant::now() < deadline {
-            if done(&self.recorder) {
+            if done() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -493,6 +601,14 @@ impl Harness {
         panic!(
             "timed out waiting for {what}; recorded {:?}",
             self.recorder.all()
+        );
+    }
+
+    /// Everything offered so far has been seen by the client.
+    fn wait_for_devices(&self, count: usize) {
+        self.wait_for(
+            || self.devices_added.load(Ordering::Relaxed) >= count,
+            "the client to take delivery of the offered devices",
         );
     }
 
@@ -570,6 +686,97 @@ const KEY_A: u32 = 30;
 const KEY_HOME: u32 = 102;
 const KEY_1: u32 = 2;
 const BTN_LEFT: u32 = 0x110;
+
+#[test]
+fn injection_is_not_advertised_until_a_device_can_carry_it() {
+    // The window between "the portal granted a session" and "this machine can be
+    // driven", walked one step at a time. It is a millisecond or two on real
+    // hardware, which is why it cannot be found by testing and is found instead by
+    // whoever connects a second machine and watches their first keypress do
+    // nothing. Here the compositor is held at each step, so nothing is raced.
+    //
+    // `serviceable` is the driver's answer, and it is asked exactly as the driver
+    // asks it: with what the portal granted and the transport as it stands.
+    let h = Harness::start_without_devices(US_KEYMAP);
+
+    // Granted, handshaken, and not a device in sight. This is the state the
+    // session used to publish INJECT_INPUT from.
+    assert!(
+        !h.transport.can_inject(),
+        "a session with no devices cannot inject anything"
+    );
+    assert_eq!(
+        super::serviceable(REMOTE_DESKTOP_CAPABILITIES, &h.transport),
+        CLIPBOARD_CAPABILITIES,
+        "the clipboard is served over D-Bus and is real from `Start`; only injection waits"
+    );
+
+    // Offered, and not resumed. The devices exist and nothing may be sent on them:
+    // everything queued before `ei_device.resumed` is discarded, so publishing here
+    // would buy a peer an injection that succeeds locally and vanishes.
+    h.tell(Command::Offer { resume: false });
+    h.wait_for_devices(3);
+    assert!(
+        !h.transport.can_inject(),
+        "a device that has not resumed cannot be sent on"
+    );
+    assert!(
+        !super::serviceable(REMOTE_DESKTOP_CAPABILITIES, &h.transport)
+            .contains(Capabilities::INJECT_INPUT)
+    );
+
+    // Resumed. Now the promise is one this machine can keep.
+    h.tell(Command::Resume);
+    h.wait_until(
+        |r| r.count(|w| matches!(w, Wire::StartEmulating { .. })) >= 3,
+        "the devices to start emulating",
+    );
+    assert!(h.transport.can_inject());
+    assert!(
+        super::serviceable(REMOTE_DESKTOP_CAPABILITIES, &h.transport)
+            .contains(Capabilities::INJECT_INPUT)
+    );
+
+    // And taken away again. A compositor pausing the devices mid-session — mutter
+    // does it around suspend — makes the same claim false, and a peer still holding
+    // it would go on sending into nothing.
+    h.tell(Command::Pause);
+    h.wait_for(
+        || !h.transport.can_inject(),
+        "the paused devices to stop being injectable",
+    );
+    assert_eq!(
+        super::serviceable(REMOTE_DESKTOP_CAPABILITIES, &h.transport),
+        CLIPBOARD_CAPABILITIES,
+        "a session whose devices went away still has its clipboard"
+    );
+}
+
+#[test]
+fn injection_during_the_window_fails_rather_than_vanishing() {
+    // The other half of the same claim, from the peer's side: what a machine that
+    // advertised too early actually did to the keystroke it was sent. The error is
+    // the one the agent must not turn into a permission prompt — nobody refused
+    // anything, there is simply no device yet.
+    let mut h = Harness::start_without_devices(US_KEYMAP);
+    h.tell(Command::Offer { resume: false });
+    h.wait_for_devices(3);
+
+    let key = KeyEvent::text("a".to_string(), KeyAction::Press, Modifiers::NONE);
+    let monitor = h.monitor.clone();
+    let err = h
+        .injector
+        .inject(&monitor, &InputEvent::Key(key))
+        .expect_err("a device that has not resumed cannot take a keystroke");
+    assert!(
+        !matches!(err, PlatformError::PermissionDenied(_)),
+        "nobody refused anything: {err}"
+    );
+    assert!(
+        err.to_string().contains("no device"),
+        "the reason has to name what is missing: {err}"
+    );
+}
 
 #[test]
 fn a_string_reaches_the_wire_as_the_keys_that_type_it() {
