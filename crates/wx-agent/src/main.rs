@@ -157,11 +157,25 @@ fn init_tracing(level: &str) {
 fn install(config: &mut Config, config_path: &std::path::Path) -> anyhow::Result<()> {
     match autostart::install() {
         Ok(exe) => {
-            println!(
-                "registered {} to start with this session as \"{}\"",
-                exe.display(),
-                autostart::ENTRY_NAME
-            );
+            match autostart::location() {
+                // Linux: naming the unit is more use than naming the entry,
+                // because it is the handle for every follow-up the user might
+                // want — `systemctl --user status winxtend`, or reading it.
+                Some(unit) => println!(
+                    "registered {} to start with this session, via {}",
+                    exe.display(),
+                    unit.display()
+                ),
+                None => println!(
+                    "registered {} to start with this session as \"{}\"",
+                    exe.display(),
+                    autostart::ENTRY_NAME
+                ),
+            }
+            // Registration takes effect at the next login on every platform. On
+            // Linux the unit is enabled but not started, and starting it now
+            // would fight the agent the user may already be running.
+            println!("it will start with the next login; nothing has been started now");
             config.node.autostart = true;
             config.save(config_path)?;
             Ok(())
@@ -170,7 +184,18 @@ fn install(config: &mut Config, config_path: &std::path::Path) -> anyhow::Result
             // Printed as well as returned, because the message is a set of
             // instructions the user is expected to follow by hand.
             eprintln!("cannot register autostart automatically:\n  {e}");
-            bail!("autostart registration is not supported on this platform");
+            // The last line anyhow prints is the one a user reads first, so it
+            // must not contradict the one above it. Only `Unsupported` means
+            // there is no mechanism here; a path systemd cannot name, or a
+            // directory that cannot be written, is a failure on a platform that
+            // supports this perfectly well, and saying otherwise sends the user
+            // looking for a missing feature instead of at the detail above.
+            match e {
+                autostart::AutostartError::Unsupported { .. } => {
+                    bail!("autostart registration is not supported on this platform")
+                }
+                _ => bail!("could not register autostart"),
+            }
         }
     }
 }
@@ -185,7 +210,12 @@ fn uninstall(config: &mut Config, config_path: &std::path::Path) -> anyhow::Resu
         }
         Err(e) => {
             eprintln!("cannot remove autostart automatically:\n  {e}");
-            bail!("autostart registration is not supported on this platform");
+            match e {
+                autostart::AutostartError::Unsupported { .. } => {
+                    bail!("autostart registration is not supported on this platform")
+                }
+                _ => bail!("could not remove the autostart registration"),
+            }
         }
     }
 }
@@ -209,6 +239,16 @@ async fn show_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
     println!("platform  {} / {}", status.platform, status.display_server);
     println!("port      {}", status.port);
     println!("uptime    {}", format_duration(status.uptime_secs));
+    // The agent's own answer, read from the OS rather than from its config file,
+    // so this and `--install` cannot disagree. See `StatusSnapshot::autostart`.
+    println!(
+        "autostart {}",
+        if status.autostart {
+            "registered"
+        } else {
+            "not registered"
+        }
+    );
     println!(
         "cursor    {}{}",
         if status.cursor.local {
@@ -243,6 +283,12 @@ async fn show_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
         "can do    {}",
         wx_proto::Capabilities(status.capabilities).describe()
     );
+
+    // Printed before the peer list, because "no peers seen yet" with a firewall
+    // up is the exact pair of facts a user needs to read together.
+    if let Some(firewall) = &status.firewall {
+        println!("\nwarning   {firewall}");
+    }
 
     if status.peers.is_empty() {
         println!("\nno peers seen yet");

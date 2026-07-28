@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:bundle",
     "frontendDist": "../dist"
   },
   "app": {
@@ -31,6 +31,15 @@
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/icon.png", "icons/icon.ico"],
     "shortDescription": "Share one keyboard and mouse across machines",
-    "longDescription": "WinXtend shares one keyboard and mouse across Mac, Windows, Linux and ARM machines by moving the cursor off the edge of a screen."
+    "longDescription": "WinXtend shares one keyboard and mouse across Mac, Windows, Linux and ARM machines by moving the cursor off the edge of a screen.",
+    "externalBin": ["binaries/wx-agent"],
+    "linux": {
+      "deb": {
+        "depends": ["xdg-desktop-portal", "xdg-desktop-portal-gnome"],
+        "files": {
+          "/usr/lib/systemd/user/winxtend.service": "../../packaging/winxtend.service"
+        }
+      }
+    }
   }
 }

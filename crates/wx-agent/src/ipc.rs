@@ -300,6 +300,17 @@ pub enum Request {
     SetNodeName {
         name: String,
     },
+    /// Register or remove the agent's start-with-the-session entry.
+    ///
+    /// The same work `--install` and `--uninstall` do, reachable from the UI.
+    /// It is a request rather than something the UI writes itself because the
+    /// registration has to name the *agent's* path, and the UI is a different
+    /// binary that may not be the one that will be started. Answered with
+    /// [`ErrorCode::Unsupported`] on a platform that has no mechanism, so the UI
+    /// can say which rather than reporting a generic failure.
+    SetAutostart {
+        enabled: bool,
+    },
     /// Begin receiving [`Event`]s on this connection.
     Subscribe,
     /// Ask the agent to exit. Answered before the process goes away.
@@ -466,7 +477,25 @@ pub struct StatusSnapshot {
     /// protocol can show a capability this build has never heard of.
     pub capabilities: u32,
     pub discovery: bool,
+    /// Whether the agent is *actually* registered to start with the session.
+    ///
+    /// Read from the OS, not from `config.node.autostart`. The config records
+    /// what this agent last did; the registration is a file on Linux and a
+    /// registry value on Windows, and anything else on the machine can remove
+    /// it — `systemctl --user disable winxtend`, a cleanup tool, an upgrade
+    /// that half-finished. Reporting the config would then tell the user the
+    /// agent starts with their session while nothing would start it, which is
+    /// the exact silent failure [`crate::autostart`] is written against.
     pub autostart: bool,
+    /// Set when a host firewall is on and could be why no peer ever appears.
+    ///
+    /// Carried in the status rather than only pushed as an [`Event::Notice`]
+    /// because the condition is permanent for the run while a notice is a
+    /// moment: a UI that connects a second after the agent started would
+    /// otherwise never learn of it. See [`crate::firewall`] for what can and
+    /// cannot be known without root.
+    #[serde(default)]
+    pub firewall: Option<String>,
     pub monitors: Vec<MonitorSpec>,
     pub cursor: CursorSnapshot,
     pub layout: LayoutSpec,
@@ -642,6 +671,8 @@ pub fn status_snapshot(
     advertised: Capabilities,
     agent_version: &str,
     uptime: Duration,
+    firewall: Option<&str>,
+    autostart: bool,
 ) -> StatusSnapshot {
     let owner = state.cursor_owner();
     let owner_name = if owner == state.local() {
@@ -669,7 +700,8 @@ pub fn status_snapshot(
         display_server: display_server_name(platform.display_server).to_string(),
         capabilities: advertised.0,
         discovery: config.network.discovery,
-        autostart: config.node.autostart,
+        autostart,
+        firewall: firewall.map(str::to_string),
         monitors: state.local_monitors().iter().map(MonitorSpec::of).collect(),
         cursor: CursorSnapshot {
             owner: owner.to_hex(),
@@ -1152,6 +1184,7 @@ mod tests {
             Request::SetNodeName {
                 name: "desk".into(),
             },
+            Request::SetAutostart { enabled: true },
             Request::Subscribe,
             Request::Shutdown,
         ] {
@@ -1324,6 +1357,8 @@ mod tests {
             granted,
             "0.1.0",
             Duration::from_secs(1),
+            None,
+            false,
         );
 
         assert_eq!(snapshot.capabilities, granted.0);
@@ -1343,6 +1378,8 @@ mod tests {
             wx_proto::Capabilities::HAS_DISPLAYS,
             "0.1.0",
             Duration::from_secs(1),
+            None,
+            false,
         );
         assert_eq!(revoked.capabilities, wx_proto::Capabilities::HAS_DISPLAYS.0);
     }
@@ -1361,6 +1398,7 @@ mod tests {
             capabilities: 7,
             discovery: true,
             autostart: false,
+            firewall: Some("ufw is enabled".into()),
             monitors: vec![MonitorSpec {
                 id: 0,
                 name: "DP-1".into(),
@@ -1425,6 +1463,81 @@ mod tests {
         }
     }
 
+    /// A firewall warning has to reach the snapshot, because that is the only
+    /// place it survives.
+    ///
+    /// It is also pushed as a notice at startup, but a notice is a moment: the UI
+    /// subscribes after the agent has already started, so the notice is gone
+    /// before anyone can see it. The status field is what makes the condition
+    /// readable at any point in the run, and it is easy to drop when the argument
+    /// list changes.
+    #[test]
+    fn a_firewall_warning_reaches_the_snapshot_rather_than_only_the_log() {
+        let info = wx_platform::PlatformInfo {
+            platform: wx_proto::Platform::Linux,
+            display_server: wx_proto::DisplayServer::Wayland,
+            capabilities: Capabilities::CAPTURE_INPUT,
+        };
+        let state = AgentState::new(NodeId([1u8; 32]), "desk".into(), std::time::Instant::now());
+        let of = |firewall| {
+            status_snapshot(
+                &state,
+                &Config::default(),
+                &Layout::default(),
+                &info,
+                info.capabilities,
+                "0.1.0",
+                Duration::from_secs(1),
+                firewall,
+                false,
+            )
+            .firewall
+        };
+        assert_eq!(
+            of(Some("ufw is enabled")).as_deref(),
+            Some("ufw is enabled")
+        );
+        // And a machine with nothing in the way says nothing, rather than showing
+        // an empty warning box.
+        assert_eq!(of(None), None);
+    }
+
+    /// Autostart is reported from the OS, not from the config file.
+    ///
+    /// The two disagree the moment anything else removes the registration —
+    /// `systemctl --user disable winxtend`, an upgrade, a cleanup tool — and the
+    /// config is the side that goes stale. Believing it would tell the user the
+    /// agent starts with their session while nothing would start it.
+    #[test]
+    fn autostart_is_reported_from_the_os_rather_than_from_the_config_file() {
+        let info = wx_platform::PlatformInfo {
+            platform: wx_proto::Platform::Linux,
+            display_server: wx_proto::DisplayServer::Wayland,
+            capabilities: Capabilities::CAPTURE_INPUT,
+        };
+        let state = AgentState::new(NodeId([1u8; 32]), "desk".into(), std::time::Instant::now());
+        // A config that remembers being registered, and an OS that says it is
+        // not: the snapshot has to side with the OS.
+        let mut config = Config::default();
+        config.node.autostart = true;
+
+        let snapshot = status_snapshot(
+            &state,
+            &config,
+            &Layout::default(),
+            &info,
+            info.capabilities,
+            "0.1.0",
+            Duration::from_secs(1),
+            None,
+            false,
+        );
+        assert!(
+            !snapshot.autostart,
+            "the registration is gone, whatever the config remembers"
+        );
+    }
+
     #[test]
     fn the_status_snapshot_reports_what_the_mesh_was_told() {
         // A laptop that boots with the lid shut advertises no displays and gains
@@ -1451,6 +1564,8 @@ mod tests {
             advertised,
             "0.1.0",
             Duration::from_secs(7),
+            None,
+            false,
         );
         assert_eq!(snapshot.capabilities, advertised.0);
         assert_ne!(

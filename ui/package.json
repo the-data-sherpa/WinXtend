@@ -9,7 +9,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle:agent": "node scripts/bundle-agent.mjs",
+    "build:bundle": "npm run bundle:agent && npm run build",
+    "package:deb": "npm run tauri -- build --bundles deb"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

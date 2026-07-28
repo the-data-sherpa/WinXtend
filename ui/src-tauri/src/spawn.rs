@@ -42,6 +42,11 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// can be asserted. The order matters: the binary shipped beside this one is the
 /// only one guaranteed to match this UI's protocol version, and a stale build in a
 /// development target directory must never win over it.
+///
+/// What puts a binary there is `bundle.externalBin` in `tauri.conf.json`, built by
+/// `ui/scripts/bundle-agent.mjs`. Both halves land in `/usr/bin` in the `.deb`, so
+/// the first candidate is the one that hits on an installed machine; the two
+/// development paths below only ever answer in a checkout.
 pub fn candidates(exe_dir: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(dir) = exe_dir {

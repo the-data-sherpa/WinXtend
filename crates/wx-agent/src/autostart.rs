@@ -23,15 +23,34 @@
 //! flag on this one, and [`wx_platform`] deliberately never advertises
 //! `PRIVILEGED_INJECT` for the same reason.
 //!
-//! macOS and Linux are stubs that say what to write, rather than silently doing
-//! nothing: a launch agent plist and a systemd user unit respectively. Both are
-//! per-user session services for exactly the same reason.
+//! # Linux
+//!
+//! The same argument, one layer out: a systemd **user** unit rather than a
+//! system one. A system unit has no Wayland display, no session D-Bus and no
+//! `xdg-desktop-portal`, so it would start, look healthy, and capture nothing —
+//! the identical failure the Windows service would have. The portal's consent
+//! and its restore token are per-user, and `systemctl --user enable` needs no
+//! root. The unit itself, and the reasoning inside it, is
+//! `packaging/winxtend.service.in`.
+//!
+//! Registering is a filesystem fact here, not a call into a daemon:
+//! [`install`] writes the unit and creates the same `.wants` symlink
+//! `systemctl --user enable` would, then asks systemd to reload as a courtesy.
+//! That split is what lets the whole path be tested — including on a CI runner
+//! with no systemd user instance to talk to — and it is why the reload is
+//! best-effort rather than fatal. See [`linux_impl`].
+//!
+//! macOS is still a stub that says what to write, rather than silently doing
+//! nothing: a launch agent plist, per-user for exactly the same reason.
 
 use std::path::PathBuf;
 
 /// Name of the autostart entry, and the label a user will see in Task Manager's
 /// startup list.
 pub const ENTRY_NAME: &str = "WinXtend Agent";
+
+/// File name of the systemd user unit `--install` writes on Linux.
+pub const UNIT_NAME: &str = "winxtend.service";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AutostartError {
@@ -44,6 +63,24 @@ pub enum AutostartError {
     ExePath(#[source] std::io::Error),
     #[error("{operation} failed (os error {code})")]
     Os { operation: &'static str, code: u32 },
+    #[error("{operation} {}: {source}", path.display())]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("this user has no configuration directory to write a unit into")]
+    NoConfigDir,
+    /// A path that no systemd unit can name, whatever the escaping around it.
+    ///
+    /// Reported when registering rather than written out and hoped for: systemd
+    /// refuses to load a unit whose `ExecStart` path contains one of these, and
+    /// that refusal happens at the next login where nobody is watching, while
+    /// [`is_registered`] goes on answering yes. A loud failure here is the only
+    /// version of this the user can act on.
+    #[error("{path} cannot be named in a systemd unit: {reason}")]
+    UnrepresentablePath { path: String, reason: String },
 }
 
 /// Whether the agent is registered to start with the session.
@@ -52,7 +89,11 @@ pub fn is_registered() -> Result<bool, AutostartError> {
     {
         windows_impl::is_registered()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::is_registered_in(&linux_impl::config_root()?)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Err(unsupported())
     }
@@ -68,7 +109,18 @@ pub fn install() -> Result<PathBuf, AutostartError> {
     {
         windows_impl::install()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let exe = linux_impl::install_in(&linux_impl::config_root()?)?;
+        // Best-effort, and after the files are on disk: systemd has to be told
+        // to re-read the unit directory or the new unit is invisible until the
+        // next login. It is not part of the registration, which is why its
+        // failure is not one — a CI runner and a container both have the files
+        // and no user systemd instance to reload.
+        linux_impl::daemon_reload();
+        Ok(exe)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Err(unsupported())
     }
@@ -80,13 +132,35 @@ pub fn uninstall() -> Result<(), AutostartError> {
     {
         windows_impl::uninstall()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::uninstall_in(&linux_impl::config_root()?)?;
+        linux_impl::daemon_reload();
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Err(unsupported())
     }
 }
 
-#[cfg(not(windows))]
+/// Where the registration lives, for a message that tells the user what was
+/// touched. `None` on a platform with no mechanism, and on any platform where
+/// the location cannot be determined.
+pub fn location() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::config_root()
+            .ok()
+            .map(|r| linux_impl::unit_path(&r))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn unsupported() -> AutostartError {
     #[cfg(target_os = "macos")]
     return AutostartError::Unsupported {
@@ -96,17 +170,286 @@ fn unsupported() -> AutostartError {
                It must be a LaunchAgent, not a LaunchDaemon: a daemon has no window server \
                session and cannot create an event tap",
     };
-    #[cfg(target_os = "linux")]
-    return AutostartError::Unsupported {
-        platform: "Linux",
-        hint: "write a systemd *user* unit to ~/.config/systemd/user/winxtend-agent.service \
-               with WantedBy=graphical-session.target, then `systemctl --user enable --now \
-               winxtend-agent`. A system unit has no display server access",
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     AutostartError::Unsupported {
         platform: "this platform",
         hint: "no autostart mechanism is known",
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod linux_impl {
+    use super::{AutostartError, UNIT_NAME};
+    use std::path::{Path, PathBuf};
+
+    /// The unit template, and the reasoning behind every line of it.
+    ///
+    /// `include_str!` rather than a string literal here so that there is exactly
+    /// one unit text in the tree: the packaging step substitutes the same file
+    /// to produce the copy the `.deb` ships. A build failure is the intended
+    /// outcome of moving or deleting it.
+    const UNIT_TEMPLATE: &str = include_str!("../../../packaging/winxtend.service.in");
+
+    /// Placeholder the template leaves for the agent's absolute path.
+    const EXEC_START: &str = "@EXEC_START@";
+
+    /// The target the unit is enabled into.
+    ///
+    /// `graphical-session.target` rather than `default.target`: the agent needs
+    /// a session, not a boot. See the unit template.
+    pub const WANTED_BY: &str = "graphical-session.target";
+
+    /// The unit, with `exec_start` filled in.
+    ///
+    /// Takes the path already rendered rather than a `Path` so that the one
+    /// caller that has no real binary — the packaging step's equivalent — and
+    /// the one that does agree on the rendering.
+    pub fn unit_text(exec_start: &Path) -> Result<String, AutostartError> {
+        representable(exec_start)?;
+        Ok(UNIT_TEMPLATE.replace(EXEC_START, &quoted(exec_start)))
+    }
+
+    /// Characters systemd will not accept in an `ExecStart` executable path,
+    /// whatever is written around them.
+    ///
+    /// systemd unquotes and unescapes the value first and then requires the
+    /// resulting path to be "safe": no ASCII control character, no quote of
+    /// either kind, no backslash. Escaping does not buy its way past that check,
+    /// it only reaches it: `systemd-analyze verify --user` reads the escaped
+    /// newline in `ExecStart="/opt/win\ntend/wx-agent"` back as a real newline,
+    /// exactly as intended, and then calls the unit a fatal error that will not
+    /// be started. The same for `\t`, for `\x0b`, and for a backslash or a
+    /// double quote written as `\\` or `\"`, which is why [`quoted`] does not
+    /// bother writing those.
+    ///
+    /// A space and a percent are deliberately not in this set: both are
+    /// expressible, and rendering them correctly is what [`quoted`] is for. This
+    /// is the set with no correct rendering at all.
+    fn unrepresentable(c: char) -> bool {
+        c.is_ascii_control() || matches!(c, '"' | '\'' | '\\')
+    }
+
+    /// Whether this path can be written into a unit and read back as itself.
+    ///
+    /// Two ways it cannot. It may hold a character systemd rejects outright, and
+    /// then no rendering works. Or it may not be UTF-8, and then a unit file —
+    /// which is text — can only carry a lossy transcription of it: the unit
+    /// would load happily and name a binary that does not exist, which is the
+    /// silent-at-every-login failure with the diagnosis removed.
+    fn representable(path: &Path) -> Result<(), AutostartError> {
+        let Some(rendered) = path.to_str() else {
+            return Err(AutostartError::UnrepresentablePath {
+                path: path.display().to_string(),
+                reason: "it is not valid UTF-8, and a unit file can only carry text — \
+                         systemd would read back a different path than this one"
+                    .to_owned(),
+            });
+        };
+        match rendered.chars().find(|c| unrepresentable(*c)) {
+            None => Ok(()),
+            Some(bad) => Err(AutostartError::UnrepresentablePath {
+                path: rendered.escape_debug().to_string(),
+                reason: format!(
+                    "systemd rejects '{}' in an ExecStart path however it is escaped; \
+                     move or reinstall the agent somewhere without it",
+                    bad.escape_debug()
+                ),
+            }),
+        }
+    }
+
+    /// A path as a single `ExecStart` word.
+    ///
+    /// systemd splits `ExecStart` on whitespace, so a path containing a space —
+    /// `~/Downloads/WinXtend 0.1.0/wx-agent` is an ordinary place to find one —
+    /// becomes a different command with an argument after it, and fails at every
+    /// login while the registration still reads as present. This is the Linux
+    /// twin of the quoting the Windows `command_line` does, for the same reason.
+    ///
+    /// Quoted unconditionally, even when nothing needs it: `ui/scripts/bundle-agent.mjs`
+    /// substitutes the same template for the packaged unit, and two renderings
+    /// that differ only in an edge case are two renderings that will drift.
+    ///
+    /// Two things happen here and only two. The quotes are for the space. The
+    /// doubling is for `%`, which quoting does not cover at all — systemd
+    /// resolves its specifiers across the whole directive — so a literal percent
+    /// has to be written `%%` or the command silently becomes a different one,
+    /// or the unit refuses to load, at the next login only.
+    ///
+    /// Nothing else is escaped, because nothing else can be. The characters
+    /// systemd will not take in an executable path it rejects *after*
+    /// unescaping, so writing `\\` or `\"` for them would produce exactly the
+    /// path it refuses; they are turned away by [`representable`] instead, which
+    /// [`unit_text`] calls before this. This renders; it does not decide.
+    fn quoted(path: &Path) -> String {
+        let escaped = path.display().to_string().replace('%', "%%");
+        format!("\"{escaped}\"")
+    }
+
+    /// `$XDG_CONFIG_HOME`, or `~/.config`.
+    ///
+    /// [`directories::BaseDirs`] rather than reading `HOME` directly because it
+    /// applies the XDG rule that a relative `XDG_CONFIG_HOME` is ignored rather
+    /// than joined onto the current directory, which is how a unit ends up
+    /// somewhere nothing will ever look for it.
+    pub fn config_root() -> Result<PathBuf, AutostartError> {
+        directories::BaseDirs::new()
+            .map(|dirs| dirs.config_dir().to_path_buf())
+            .ok_or(AutostartError::NoConfigDir)
+    }
+
+    /// `<root>/systemd/user`.
+    pub fn unit_dir(root: &Path) -> PathBuf {
+        root.join("systemd").join("user")
+    }
+
+    /// Where `--install` writes the unit.
+    pub fn unit_path(root: &Path) -> PathBuf {
+        unit_dir(root).join(UNIT_NAME)
+    }
+
+    /// The symlink that makes the unit start with the session.
+    ///
+    /// This is precisely what `systemctl --user enable` creates from the unit's
+    /// `[Install] WantedBy=`; creating it directly is not a shortcut around
+    /// systemd but the on-disk form of the same statement, and it is why
+    /// registering works on a machine whose user systemd instance cannot be
+    /// reached.
+    pub fn link_path(root: &Path) -> PathBuf {
+        unit_dir(root)
+            .join(format!("{WANTED_BY}.wants"))
+            .join(UNIT_NAME)
+    }
+
+    fn io(operation: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> AutostartError {
+        let path = path.to_path_buf();
+        move |source| AutostartError::Io {
+            operation,
+            path,
+            source,
+        }
+    }
+
+    /// Write the unit and enable it, under an arbitrary config root.
+    ///
+    /// Parameterised on the root for the same reason `open_existing_at` is
+    /// parameterised on the subkey in the Windows implementation: so the tests
+    /// can exercise the real code against a directory of their own instead of
+    /// the developer's actual autostart configuration. Unlike `HKCU`, this one
+    /// can be redirected completely, so the Linux tests touch nothing real.
+    pub fn install_in(root: &Path) -> Result<PathBuf, AutostartError> {
+        let exe = std::env::current_exe().map_err(AutostartError::ExePath)?;
+        // Rendered before anything is created, so that a path systemd cannot
+        // name is a refusal and not a half-built registration: no directory, no
+        // unit, no link, and an error that says which character did it.
+        let text = unit_text(&exe)?;
+        let dir = unit_dir(root);
+        std::fs::create_dir_all(&dir).map_err(io("creating", &dir))?;
+
+        // Rewritten every time, not written only when absent: a unit whose
+        // ExecStart names a binary that has moved fails at every login and says
+        // nothing, which is worse than not being registered at all.
+        let unit = unit_path(root);
+        std::fs::write(&unit, text).map_err(io("writing", &unit))?;
+
+        let link = link_path(root);
+        let wants = link.parent().expect("the link path has a parent");
+        std::fs::create_dir_all(wants).map_err(io("creating", wants))?;
+        // Removed first rather than checked: an existing link may be dangling or
+        // may point at an older location, and `symlink` will not replace either.
+        // Not-there is the state being aimed for, so its absence is not an error.
+        match std::fs::remove_file(&link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io("replacing", &link)(e)),
+        }
+        // Absolute, which is what `systemctl --user enable` writes, so that a
+        // unit enabled by hand and one enabled here are indistinguishable.
+        std::os::unix::fs::symlink(&unit, &link).map_err(io("linking", &link))?;
+        Ok(exe)
+    }
+
+    /// Remove the unit and its enablement symlink. Absent is success.
+    pub fn uninstall_in(root: &Path) -> Result<(), AutostartError> {
+        for path in [link_path(root), unit_path(root)] {
+            // `remove_file` on a symlink removes the link, never its target,
+            // which is what disabling means here.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io("removing", &path)(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the agent will start with the next session.
+    ///
+    /// The enablement symlink has to be there *and* has to resolve. A `.wants`
+    /// symlink with no unit behind it is a registration that cannot start
+    /// anything, so reporting it as registered would be the
+    /// silent-at-every-login failure in a different costume — but the unit it
+    /// resolves to need not be the one [`install_in`] wrote. `systemctl --user
+    /// enable winxtend.service` against the unit the `.deb` ships creates only
+    /// this link, pointing at `/usr/lib/systemd/user/winxtend.service`, and
+    /// writes nothing under the user's own config root; demanding a local unit
+    /// file would report that perfectly good registration as absent.
+    pub fn is_registered_in(root: &Path) -> Result<bool, AutostartError> {
+        let link = link_path(root);
+        // `metadata` follows the link, which is the whole question — is there a
+        // unit at the other end. It answers no for a link with nothing behind it
+        // and no for no link at all, which are the two ways of not being
+        // registered; an `lstat` alongside it would add nothing, because a path
+        // `stat` succeeds on is a path `lstat` cannot fail on.
+        Ok(std::fs::metadata(&link).is_ok())
+    }
+
+    /// How long to wait for the reload before giving up on it.
+    ///
+    /// A reload of a healthy user instance takes tens of milliseconds. A wedged
+    /// one can sit on the D-Bus method call for its full ~25s timeout, and the
+    /// caller of this is a synchronous request the engine is waiting on, so an
+    /// unbounded wait is a stall of the whole agent. Seconds rather than
+    /// milliseconds because a loaded machine is slow, not broken.
+    const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Ask systemd to re-read the unit directory, if there is one listening.
+    ///
+    /// Deliberately silent about failing, and bounded. There is no user systemd
+    /// instance in a container, on a CI runner, or over a bare SSH session, and
+    /// on all three the registration itself is still perfectly valid — it takes
+    /// effect at the next login either way. Treating "no bus to talk to" as a
+    /// failed registration would make `--install` fail in exactly the
+    /// environments where it has nothing to do, and a reload that never returns
+    /// is the same non-event: the files are already on disk.
+    pub fn daemon_reload() {
+        let child = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { return };
+
+        // Polled rather than waited on: a bounded wait for a child otherwise
+        // needs either a signal handler or another crate, and this is a courtesy
+        // call with nothing to report.
+        let deadline = std::time::Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Err(_) => return,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // Killed and reaped, so a stuck `systemctl` neither holds this thread
+        // nor is left behind as a zombie for the rest of the agent's life.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -449,18 +792,56 @@ mod tests {
         }
     }
 
+    /// A private config root that cleans itself up, for the Linux tests.
+    ///
+    /// The Linux registration is a pair of files under a directory this code
+    /// chooses, so unlike `HKCU` it can be redirected wholesale — which is why
+    /// the Linux tests need no equivalent of [`RealRegistry`]: they never touch
+    /// the developer's own `~/.config/systemd/user`, so there is nothing to
+    /// serialise against and nothing to restore. Named after the test so a
+    /// leftover directory says which one died.
+    #[cfg(target_os = "linux")]
+    struct TempRoot(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("winxtend-autostart-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a temporary config root");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn a_platform_with_no_mechanism_says_what_to_do_instead() {
         // The point of the error text: an unsupported platform must tell the user
         // what to write by hand, not merely that it will not help.
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let err = install().unwrap_err();
             let text = err.to_string();
-            assert!(
-                text.contains("systemd") || text.contains("LaunchAgent"),
-                "{text}"
-            );
+            assert!(text.contains("LaunchAgent"), "{text}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Linux has a real implementation now, so the question this test
+            // asks becomes the Windows one: querying must answer rather than
+            // error when nothing is registered.
+            let root = TempRoot::new("query");
+            assert!(!linux_impl::is_registered_in(root.path()).unwrap());
         }
         #[cfg(windows)]
         {
@@ -475,7 +856,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "no autostart mechanism on this platform")]
+    #[cfg_attr(
+        not(any(windows, target_os = "linux")),
+        ignore = "no autostart mechanism on this platform"
+    )]
     fn registering_is_idempotent_and_removable() {
         // Touches the real registry, but only HKCU and only this one value.
         // `RealRegistry` serialises it against the other tests and restores
@@ -492,6 +876,249 @@ mod tests {
             // Removing twice is not an error: the desired end state is reached.
             uninstall().unwrap();
         }
+        // The same properties, against a config root of this test's own. It runs
+        // the real `install_in`/`uninstall_in`, not a rehearsal of them; only the
+        // directory they are pointed at is the test's. The `systemctl` reload
+        // `install()` adds on top is skipped deliberately — a CI runner has no
+        // user systemd instance, and reloading is not part of the registration.
+        #[cfg(target_os = "linux")]
+        {
+            let root = TempRoot::new("idempotent");
+            let root = root.path();
+
+            linux_impl::install_in(root).unwrap();
+            assert!(linux_impl::is_registered_in(root).unwrap());
+            linux_impl::install_in(root).unwrap();
+            assert!(linux_impl::is_registered_in(root).unwrap());
+
+            linux_impl::uninstall_in(root).unwrap();
+            assert!(!linux_impl::is_registered_in(root).unwrap());
+            // Removing twice is not an error: the desired end state is reached.
+            linux_impl::uninstall_in(root).unwrap();
+        }
+    }
+
+    /// The unit `--install` writes has to say the things it exists to say.
+    ///
+    /// Asserted against the rendered text rather than trusted from the template,
+    /// because the template is substituted by two different callers and a
+    /// placeholder left in place produces a unit systemd refuses to load — with
+    /// an error nobody sees until the next login.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_unit_is_a_session_service_ordered_after_the_portal() {
+        let unit = linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")).unwrap();
+
+        assert!(
+            unit.contains("ExecStart=\"/usr/bin/wx-agent\""),
+            "the binary path is substituted:\n{unit}"
+        );
+        assert!(
+            !unit.contains("@EXEC_START@"),
+            "no placeholder survives substitution:\n{unit}"
+        );
+        // A user unit that starts with the session, not at boot. Anything else
+        // and the agent has no display, no portal and no session bus.
+        assert!(
+            unit.contains(&format!("WantedBy={}", linux_impl::WANTED_BY)),
+            "{unit}"
+        );
+        // The startup race: without this ordering an autostarted agent can reach
+        // the portal before it is answerable and run the whole session with no
+        // input capability.
+        assert!(unit.contains("After=xdg-desktop-portal.service"), "{unit}");
+        // `Requires=` would let a portal failure stop an agent that is still
+        // useful as a machine that receives input, and would add no ordering.
+        assert!(
+            !unit.contains("Requires=xdg-desktop-portal"),
+            "the portal is wanted, not required:\n{unit}"
+        );
+    }
+
+    /// A path with a space in it must reach systemd as one argument.
+    ///
+    /// systemd splits `ExecStart` on whitespace, so an unquoted
+    /// `/opt/win xtend/wx-agent` becomes the command `/opt/win` with
+    /// `xtend/wx-agent` as its argument: it fails at every login, silently, while
+    /// the registration still reads as present. The packaged agent at
+    /// `/usr/bin/wx-agent` never sees it, but `--install` is reachable from the
+    /// UI on any machine, and `~/Downloads/WinXtend 0.1.0/wx-agent` is an
+    /// ordinary place to have unpacked one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_with_a_space_stays_one_argument() {
+        let unit = linux_impl::unit_text(std::path::Path::new("/opt/win xtend/wx-agent")).unwrap();
+        assert!(
+            unit.contains("ExecStart=\"/opt/win xtend/wx-agent\""),
+            "{unit}"
+        );
+    }
+
+    /// A path with a percent in it must not be read as a systemd specifier.
+    ///
+    /// systemd resolves `%`-specifiers in `ExecStart` regardless of quoting, so
+    /// `/opt/wx%20build/wx-agent` either names a different binary — `%2` is not
+    /// a specifier, but `%h`, `%u` and friends are, and one of those is a
+    /// plausible thing to find in an unpacked directory name — or fails the unit
+    /// with "Failed to resolve specifiers". Both are the same
+    /// silent-at-every-login failure the quoting above exists to prevent, so the
+    /// literal form `%%` is the only correct rendering.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_with_a_percent_is_not_read_as_a_specifier() {
+        let unit = linux_impl::unit_text(std::path::Path::new("/opt/wx%20build/wx-agent")).unwrap();
+        assert!(
+            unit.contains("ExecStart=\"/opt/wx%%20build/wx-agent\""),
+            "{unit}"
+        );
+    }
+
+    /// A path systemd cannot name is refused, not written out and hoped for.
+    ///
+    /// The escaping route was tried against real systemd first, because it would
+    /// have been the better answer. It does not exist. `systemd-analyze verify
+    /// --user` on a unit rendering `ExecStart="/opt/win\ntend/wx-agent"` reads
+    /// the escape back correctly — it prints the path with a real newline in it
+    /// — and then says `Executable path contains special characters` and
+    /// `Unit configuration has fatal error, unit will not be started`. The
+    /// unescaped form fails differently and just as fatally, with
+    /// `Unbalanced quoting` and then `Service has no ExecStart=`. systemd
+    /// unescapes and *then* demands a "safe" path, so there is no rendering that
+    /// makes one of these work.
+    ///
+    /// Which leaves two options, and only one of them is honest: write a unit
+    /// that cannot load while `is_registered_in` reports the agent registered —
+    /// the exact silent-at-every-login failure this module is written against —
+    /// or refuse at `--install` time with an error naming the character. Hence
+    /// this.
+    ///
+    /// The same verification found three more characters in the same position,
+    /// which is why the check is a set rather than a newline: systemd rejects
+    /// `"`, `'` and `\` in an executable path too, and `/home/o'brien/wx-agent`
+    /// is a great deal more likely to exist than a path with a newline in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_systemd_cannot_express_is_refused_at_install_time() {
+        for bad in [
+            "/opt/win\ntend/wx-agent",
+            "/opt/win\ttend/wx-agent",
+            "/opt/win\x0btend/wx-agent",
+            "/home/o'brien/wx-agent",
+            "/opt/win\"tend/wx-agent",
+            "/opt/win\\tend/wx-agent",
+        ] {
+            let err = linux_impl::unit_text(std::path::Path::new(bad))
+                .expect_err("systemd will not load a unit naming this path");
+            assert!(
+                matches!(err, AutostartError::UnrepresentablePath { .. }),
+                "{bad:?}: {err}"
+            );
+            // The message has to be actionable: a user reading it must be able
+            // to tell which path was refused without re-running anything.
+            let text = err.to_string();
+            assert!(text.contains("wx-agent"), "{bad:?}: {text}");
+            assert!(text.contains("systemd unit"), "{bad:?}: {text}");
+        }
+    }
+
+    /// Enabling means the symlink `systemctl --user enable` would have made, in
+    /// the directory it would have made it in.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enabling_writes_the_wants_symlink_systemd_looks_for() {
+        let root = TempRoot::new("wants");
+        let root = root.path();
+        linux_impl::install_in(root).unwrap();
+
+        let link = linux_impl::link_path(root);
+        assert!(
+            link.ends_with(format!("{}.wants/{UNIT_NAME}", linux_impl::WANTED_BY)),
+            "{}",
+            link.display()
+        );
+        let target = std::fs::read_link(&link).expect("the enablement entry is a symlink");
+        assert_eq!(
+            target,
+            linux_impl::unit_path(root),
+            "the link points at the unit, by absolute path"
+        );
+    }
+
+    /// A `.wants` link with no unit behind it is not a registration.
+    ///
+    /// This is the state an interrupted upgrade leaves, and reporting it as
+    /// registered would mean the UI says the agent starts with the session while
+    /// systemd has nothing to start — the silent failure the whole module is
+    /// written against.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dangling_enablement_link_does_not_count_as_registered() {
+        let root = TempRoot::new("dangling");
+        let root = root.path();
+        linux_impl::install_in(root).unwrap();
+        std::fs::remove_file(linux_impl::unit_path(root)).unwrap();
+
+        assert!(
+            !linux_impl::is_registered_in(root).unwrap(),
+            "a link with no unit cannot start anything"
+        );
+        // And installing again must repair it rather than trip over the link
+        // that is already there.
+        linux_impl::install_in(root).unwrap();
+        assert!(linux_impl::is_registered_in(root).unwrap());
+    }
+
+    /// Enabling the unit the `.deb` ships counts as registered.
+    ///
+    /// `systemctl --user enable winxtend.service` against
+    /// `/usr/lib/systemd/user/winxtend.service` creates the `.wants` link and
+    /// nothing else — no unit is written under the user's own config root. A
+    /// check that demanded one there reported that as "not registered" while
+    /// systemd would in fact start the agent at the next login, which is the
+    /// stale-config failure this module exists to prevent, inverted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enabling_the_packaged_unit_counts_as_registered() {
+        let root = TempRoot::new("packaged");
+        let root = root.path();
+
+        // Standing in for `/usr/lib/systemd/user/winxtend.service`: outside the
+        // config root, which is the whole point, but inside the temporary
+        // directory so the test writes nothing the machine keeps.
+        let packaged = root.join("usr-lib-winxtend.service");
+        std::fs::write(
+            &packaged,
+            linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")).unwrap(),
+        )
+        .unwrap();
+
+        let link = linux_impl::link_path(root);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&packaged, &link).unwrap();
+
+        assert!(
+            !linux_impl::unit_path(root).exists(),
+            "enabling the packaged unit writes nothing under the config root"
+        );
+        assert!(
+            linux_impl::is_registered_in(root).unwrap(),
+            "a link resolving to the packaged unit will start the agent"
+        );
+    }
+
+    /// Registering must work on a user who has never had a systemd user
+    /// directory — the Linux twin of the absent-`Run`-key case that broke CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registering_creates_the_directories_it_needs() {
+        let root = TempRoot::new("mkdir");
+        let root = root.path();
+        assert!(
+            !linux_impl::unit_dir(root).exists(),
+            "the test starts from a root with no systemd directory"
+        );
+        linux_impl::install_in(root).unwrap();
+        assert!(linux_impl::is_registered_in(root).unwrap());
     }
 
     /// With no autostart *value* registered, the answer is a plain no — and
@@ -523,7 +1150,20 @@ mod tests {
             install().unwrap();
             assert!(is_registered().unwrap());
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            // A root with nothing in it is the state a fresh install is asked
+            // about, and it must be an answer rather than an error.
+            let root = TempRoot::new("never-registered");
+            let root = root.path();
+            assert!(
+                !linux_impl::is_registered_in(root).unwrap(),
+                "with nothing registered the answer is a plain no"
+            );
+            linux_impl::install_in(root).unwrap();
+            assert!(linux_impl::is_registered_in(root).unwrap());
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let err = is_registered().unwrap_err();
             assert!(matches!(err, AutostartError::Unsupported { .. }), "{err}");

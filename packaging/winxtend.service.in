@@ -1,0 +1,80 @@
+# WinXtend agent, as a systemd *user* unit.
+#
+# This is a template, not a unit: the placeholder on the ExecStart line below is
+# replaced with the absolute path of the agent binary, double-quoted so that a
+# path containing a space is one argument rather than a command and an argument.
+# The placeholder token is deliberately not repeated in this comment: both
+# substituters replace every occurrence in the file, so naming it here would
+# rewrite this paragraph into nonsense inside the installed unit. There are two
+# substituters and they must agree, which is why there is one template rather
+# than two unit files:
+#
+#   * `wx-agent --install` (crates/wx-agent/src/autostart.rs) `include_str!`s
+#     this file and writes the result to
+#     `~/.config/systemd/user/winxtend.service`, with the path of the binary
+#     that is doing the installing.
+#   * The packaging step (ui/scripts/bundle-agent.mjs) substitutes
+#     `/usr/bin/wx-agent` and the `.deb` ships the result as
+#     `/usr/lib/systemd/user/winxtend.service`, so the unit exists for every
+#     user on the machine without anyone having written a file.
+#
+# A unit in `~/.config/systemd/user` shadows one of the same name in
+# `/usr/lib/systemd/user`, so having both is not a conflict: after a `.deb`
+# install both name `/usr/bin/wx-agent` anyway, because that is what
+# `current_exe()` reports for the packaged agent.
+#
+# # Why a user unit and not a system one
+#
+# The agent needs the things only a graphical *session* has: the Wayland
+# display, the session D-Bus, and `xdg-desktop-portal`. A system unit runs
+# outside all three, so it would start, report healthy, and capture nothing.
+# The portal's consent and its restore token are per-user for the same reason.
+# `systemctl --user enable --now winxtend.service` also needs no root, which
+# suits an alpha.
+#
+# Lingering (`loginctl enable-linger`) is deliberately not asked for: it exists
+# to keep user units running with nobody logged in, and an agent with no
+# graphical session has nothing to capture and nothing to inject into.
+
+[Unit]
+Description=WinXtend agent: share one keyboard and mouse across machines
+Documentation=https://github.com/the-data-sherpa/WinXtend
+
+# Bound to the graphical session rather than to boot: `PartOf` stops the agent
+# when the session goes away, and the `WantedBy` below starts it when one
+# arrives.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# The startup race this ordering exists to lose.
+#
+# `wx_platform`'s Wayland backend asks the portal for a RemoteDesktop session
+# while the backend is being constructed. If the portal is not yet answerable
+# on the bus that call comes back Unsupported, and the agent then runs for the
+# whole session with no input capability — recoverable only by restarting it.
+# Autostart is exactly the configuration that loses that race, because
+# `xdg-desktop-portal.service` is itself `After=graphical-session.target`: with
+# no ordering of our own, systemd is free to start both at once.
+#
+# `Wants=` rather than `Requires=`: `After=` is what removes the race, and
+# `Requires=` adds no ordering at all — it only adds a way for a portal failure
+# to stop an agent that is still perfectly useful as a machine that *receives*
+# input. A `Wants=` naming a unit that is not installed is ignored, so the
+# GNOME backend line costs nothing on a desktop that uses a different one.
+Wants=xdg-desktop-portal.service
+After=xdg-desktop-portal.service
+Wants=xdg-desktop-portal-gnome.service
+After=xdg-desktop-portal-gnome.service
+
+[Service]
+Type=simple
+ExecStart=@EXEC_START@
+
+# Restart covers a crash. It deliberately does not cover the portal race above:
+# losing that race leaves the agent running and degraded, not dead, so systemd
+# sees nothing to restart. Ordering is the fix; this is only the safety net.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

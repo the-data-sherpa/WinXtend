@@ -58,7 +58,7 @@ use wx_proto::{
 use crate::config::{Config, HotkeyAction};
 use crate::ipc::{self, ErrorCode, Event, IpcCommand, IpcServer, Request, Response};
 use crate::state::{AgentState, ConnStatus};
-use crate::{autolayout, state};
+use crate::{autolayout, autostart, state};
 
 /// Version reported to peers and to the UI.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -676,6 +676,10 @@ pub struct Engine {
     /// The peer currently driving this machine, if any. See [`DrivenBy`].
     driven_by: DrivenBy,
     last_owner: NodeId,
+    /// Host firewall warning, decided once at startup and then reported for the
+    /// life of the run. Held rather than recomputed per status request because
+    /// changing it means the user ran `ufw` since, at which point they know.
+    firewall: Option<String>,
     shutting_down: bool,
 }
 
@@ -690,6 +694,33 @@ pub async fn run(opts: EngineOptions) -> anyhow::Result<()> {
         let wake = wake_tx.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = wake.send(Wake::Shutdown);
+            }
+        });
+    }
+    // SIGTERM as well as SIGINT, because a supervisor sends the former and a
+    // terminal the latter. Without this, `systemctl --user stop winxtend` — and
+    // every logout, which stops the unit via `PartOf=graphical-session.target` —
+    // kills the process outright: peers are never told goodbye, held modifiers
+    // are never released on the machines they are held down on, and the endpoint
+    // file is left behind so the next `--status` tries to reach a port nothing is
+    // listening on. See `shutdown`, which is the whole reason a signal is turned
+    // into an ordinary wake rather than an exit.
+    #[cfg(unix)]
+    {
+        let wake = wake_tx.clone();
+        tokio::spawn(async move {
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(term) => term,
+                    // Nothing to be done about it, and it must not stop the
+                    // agent starting: Ctrl-C still works.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot listen for SIGTERM");
+                        return;
+                    }
+                };
+            if term.recv().await.is_some() {
                 let _ = wake.send(Wake::Shutdown);
             }
         });
@@ -857,6 +888,10 @@ impl Engine {
             swallow_release: None,
             driven_by: DrivenBy::default(),
             last_owner: local,
+            // Against the port actually bound, not the configured one: the two
+            // differ when the config asks for port 0, and advice naming a port
+            // nothing is listening on is worse than none.
+            firewall: crate::firewall::warning(port),
             shutting_down: false,
         };
         engine.pairing_open.store(
@@ -887,6 +922,14 @@ impl Engine {
         engine.spawn_accept_loop();
         if engine.config.network.discovery {
             engine.spawn_discovery(port);
+            // Said once, at the point where it becomes relevant: a firewall only
+            // matters if this machine is trying to be found. Both a log line and
+            // a notice, matching `start_capture` — and unlike that one it is also
+            // in the status snapshot, so a UI that connects later still sees it.
+            if let Some(warning) = engine.firewall.clone() {
+                tracing::warn!("{warning}");
+                engine.notice(ipc::NoticeLevel::Warning, warning);
+            }
         }
         engine.start_capture();
         engine.seed_static_peers();
@@ -2303,6 +2346,8 @@ impl Engine {
                     self.advertised_by(self.local),
                     AGENT_VERSION,
                     self.state.uptime(Instant::now()),
+                    self.firewall.as_deref(),
+                    self.autostart_registered(),
                 )),
             },
             Request::ListPeers => Response::Peers {
@@ -2464,6 +2509,7 @@ impl Engine {
                 self.save_config();
                 Response::Ok
             }
+            Request::SetAutostart { enabled } => self.set_autostart(enabled).await,
             // Handled by the IPC server itself; reaching the engine means the
             // server's own fast path changed and this is a safe answer.
             Request::Subscribe => Response::Ok,
@@ -2793,6 +2839,80 @@ impl Engine {
     fn save_config(&self) {
         if let Err(e) = self.config.save(&self.config_path) {
             tracing::error!(error = %e, path = %self.config_path.display(), "could not save the configuration");
+        }
+    }
+
+    /// Whether the OS says the agent starts with the session.
+    ///
+    /// Asked of the OS on every status request rather than cached, because the
+    /// registration is a file or a registry value that anything else on the
+    /// machine can remove while this process runs. It is two `stat` calls on
+    /// Linux and one registry read on Windows, against a request the UI already
+    /// makes at human speed.
+    ///
+    /// Where the platform cannot answer at all — macOS, which has no mechanism
+    /// yet — the config's record is the best available answer, and the honest
+    /// one: on such a platform the flag only ever means "the user asked".
+    fn autostart_registered(&self) -> bool {
+        autostart::is_registered().unwrap_or(self.config.node.autostart)
+    }
+
+    /// Register or remove the start-with-the-session entry.
+    ///
+    /// The config flag is written only after the platform work succeeded, and it
+    /// records what the OS was actually told rather than what was asked for. A
+    /// `autostart = true` in the config file with no registration behind it is
+    /// the same silent-at-every-login failure [`crate::autostart::install`]
+    /// exists to avoid, arrived at from the other direction: the UI would report
+    /// that the agent starts with the session, and it would not.
+    async fn set_autostart(&mut self, enabled: bool) -> Response {
+        // On the blocking pool, because registering writes files and then runs
+        // `systemctl --user daemon-reload`, which re-reads every unit on the
+        // machine — synchronous work that would otherwise occupy a runtime
+        // worker thread and stall every other task scheduled on it.
+        //
+        // It does not make this free. The wake loop is serialized and awaits
+        // this call, so a toggle does briefly delay input routing for the peer
+        // being driven; `spawn_blocking` moves where the waiting happens, not
+        // whether it happens. What keeps that delay bounded is
+        // [`crate::autostart::linux_impl::daemon_reload`] giving up on a wedged
+        // `systemctl` after a few seconds rather than waiting on it forever.
+        let outcome = tokio::task::spawn_blocking(move || {
+            if enabled {
+                autostart::install().map(|exe| {
+                    tracing::info!(path = %exe.display(), "registered to start with this session");
+                })
+            } else {
+                autostart::uninstall().inspect(|()| {
+                    tracing::info!("removed the autostart registration");
+                })
+            }
+        })
+        .await;
+        // A panic in there is this build's bug, not something the user can act
+        // on, so it is reported as internal rather than as an autostart error.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(error = %e, "the autostart task did not finish");
+                return Response::error(ErrorCode::Internal, "changing autostart failed");
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                self.config.node.autostart = enabled;
+                self.save_config();
+                Response::Ok
+            }
+            // `Unsupported` is its own code so the UI can say "not on this
+            // platform" rather than showing a failure the user could try to fix.
+            Err(e @ autostart::AutostartError::Unsupported { .. }) => {
+                Response::error(ErrorCode::Unsupported, e.to_string())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, enabled, "could not change the autostart registration");
+                Response::error(ErrorCode::Internal, e.to_string())
+            }
         }
     }
 

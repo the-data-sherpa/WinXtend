@@ -27,6 +27,8 @@
 //! * [`engine`] is the run loop.
 //! * [`ipc`] is the contract the UI codes against.
 //! * [`autostart`] registers the agent to start with the session.
+//! * [`firewall`] names the one local cause of "nobody can see this machine"
+//!   that the agent can detect and the user can fix.
 //!
 //! Exposed as a library as well as a binary so that the UI process can share the
 //! IPC types rather than restating them, and so the pure logic — layout guessing,
@@ -36,6 +38,7 @@ pub mod autolayout;
 pub mod autostart;
 pub mod config;
 pub mod engine;
+pub mod firewall;
 pub mod ipc;
 pub mod state;
 
