@@ -90,6 +90,28 @@
 //! [`SessionState::Unsupported`] and advertises nothing — it does not put a dialog
 //! on screen and it does not retry.
 //!
+//! # The one thing that is retried, and why only that
+//!
+//! An agent autostarted at login can reach the portal before `xdg-desktop-portal`
+//! will answer, and a first attempt that failed for that reason used to be the whole
+//! run: terminally [`SessionState::Unsupported`], with no input capability and
+//! nothing on screen to click. The `RemoteDesktop` session therefore retries — a
+//! handful of attempts over half a minute, then it stops and says so.
+//!
+//! Three things keep that from being the far worse bug it could be. A refusal is
+//! never retried; nothing that failed at or after the consent dialog is retried at
+//! all, so the retry can only ever repeat a request the user was never asked about;
+//! and it happens only while a restore token is on disk, which is what makes it
+//! silent. Without a token the next attempt would raise a dialog seconds after
+//! login with no user action behind it, so there is no next attempt.
+//!
+//! The `InputCapture` session does **not** retry, and that follows from the same
+//! rule rather than being an omission: version 1 of that portal has no restore
+//! token — `CreateSession2` arrived in version 2, which the alpha target does not
+//! have — so every attempt of its is a dialog, and a retry loop of dialogs is
+//! exactly what must not exist. When the target moves to a portal with a token, this
+//! becomes worth revisiting.
+//!
 //! # Suppression
 //!
 //! There is no global grab on Wayland, so [`InputCapture::set_suppress_local`]

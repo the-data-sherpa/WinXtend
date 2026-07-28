@@ -99,6 +99,17 @@
 //! close-from-our-own-connection was exercised — it produces `DeviceRemoved`,
 //! `SeatRemoved`, then `Disconnected` on the `ei` stream. The two-machine validation
 //! issue covers the rest on real hardware.
+//!
+//! Also not proven on hardware: the startup retry ([`STARTUP_RETRY_DELAYS`]). It
+//! exists for an agent that reaches the portal before `xdg-desktop-portal` will
+//! answer, which is a race at login on a machine that boots — not something a
+//! developer session can be made to lose on demand, and not something worth
+//! *winning* by hand-waving either. The failure is injected instead: the decision is
+//! a pure function of a portal error and the loop is driven with a schedule of
+//! zero-length waits, so the rules that matter — a refusal is never retried, nothing
+//! past the dialog is retried, and no retry happens without a restore token to make
+//! it silent — are proven rather than observed. What a real late portal does is for
+//! the two-machine validation issue.
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -137,6 +148,37 @@ const EI_CLIENT_NAME: &str = "WinXtend";
 fn wanted_devices() -> BitFlags<DeviceType> {
     DeviceType::Keyboard | DeviceType::Pointer
 }
+
+/// How long to wait before each further attempt at the startup sequence — and, by
+/// having a fixed length, how many further attempts there are at all.
+///
+/// # Why there is a retry here at all
+///
+/// The agent is autostarted as a systemd **user** unit, which puts it in a race with
+/// `xdg-desktop-portal` that the unit file cannot win on its own: `After=` orders it
+/// against the portal's *unit*, and a unit that has been reached is not the same
+/// thing as a portal that will answer a method call. Losing that race used to be
+/// permanent — the sequence failed once, the session went terminally
+/// [`super::SessionState::Unsupported`], and the machine had no input capability for
+/// the rest of the run with nothing on screen to click. That is the whole failure
+/// this schedule exists to close, and it is only visible on a machine that starts at
+/// login, which is every machine the alpha is meant to be used on.
+///
+/// # Why it is this small, and bounded
+///
+/// Five attempts over thirty seconds. Finite because an unanswerable portal is
+/// either late or absent, and thirty seconds is long enough to cover the first and
+/// short enough that the second is reported honestly rather than hidden behind a
+/// loop that never ends. What it must *not* become is a general reconnect: the rules
+/// on [`retry_after`] are what keep it from ever putting a consent dialog on screen,
+/// and they matter far more than the numbers here.
+const STARTUP_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+];
 
 /// How long teardown may take before the thread gives up and exits anyway.
 ///
@@ -209,8 +251,10 @@ impl Drop for Driver {
     ///
     /// Joining rather than detaching is the difference between "clean teardown" and
     /// an orphan thread holding a portal session open past the agent's exit. It is
-    /// safe to wait for because every path inside [`run`] is bounded by
-    /// [`TEARDOWN_TIMEOUT`].
+    /// safe to wait for because no path inside [`run`] waits on anything without
+    /// also watching for this: the portal calls are bounded by [`TEARDOWN_TIMEOUT`],
+    /// and the startup retry's wait — the one deliberately long thing in there — is
+    /// a `select!` branch against the same signal rather than a sleep.
     fn drop(&mut self) {
         // A closed channel is how the thread learns to stop; the receiver sees the
         // sender drop even if this send finds nobody listening.
@@ -233,41 +277,24 @@ async fn run(
     mut stop: oneshot::Receiver<()>,
 ) {
     let store = RestoreTokenStore::in_dir(config_dir);
-    let had_token = store.load().is_some();
     // Built here, before anything else, because the clipboard's signal streams
     // borrow it and have to outlive every step below. It asks the user for
     // nothing and costs one D-Bus introspection.
     let clipboard_proxy = clipboard_portal::proxy().await;
 
-    // Shutdown has to be able to interrupt the sequence, not just the event loop that
-    // follows it. `Start` blocks until the user answers the consent dialog, and there
-    // is no upper bound on that — a dialog behind a full-screen window can sit there
-    // for hours. Without this branch, `Driver::drop` would join a thread waiting on it
-    // and the agent would never exit.
-    let established = tokio::select! {
-        biased;
-        _ = &mut stop => {
-            tracing::debug!("shutting down before the portal session was granted");
-            shared.stopped();
-            return;
-        }
-        established = establish(&store, clipboard_proxy.as_deref()) => established,
-    };
-
-    let live = match established {
-        Ok(live) => live,
-        Err(Aborted { failure, session }) => {
-            forget_rejected_token(&store, had_token, &failure);
-            failure.report(shared);
-            // A session the portal already granted outlives this thread — nothing
-            // drops it and ashpd keeps the bus connection process-wide — so the
-            // compositor would go on showing this machine as remotely controlled by
-            // something that will never use the session.
-            if let Some(session) = session {
-                close_session(&session).await;
-            }
-            return;
-        }
+    let live = match attempt_establish(
+        shared,
+        &store,
+        &mut stop,
+        &STARTUP_RETRY_DELAYS,
+        async || establish(&store, clipboard_proxy.as_deref()).await,
+    )
+    .await
+    {
+        Some(live) => live,
+        // Every terminal state and every message a user reads was set inside; there
+        // is nothing left for this thread to do.
+        None => return,
     };
 
     tracing::info!(
@@ -322,6 +349,130 @@ async fn run(
     transport.detach();
     clipboard.detach();
     teardown(shared, &live.session, reason).await;
+}
+
+/// Run the startup sequence, retrying it on the schedule for the failures — and only
+/// the failures — that a retry can honestly fix.
+///
+/// Returns `None` when there is nothing more to do: either the agent is shutting
+/// down, or the sequence has failed for the last time and the failure has already
+/// been reported through `shared`. Every terminal state this backend can reach at
+/// startup is set here.
+///
+/// Generic over what the attempt produces so that the loop — which is the part with
+/// the shutdown interrupt, the bound, and the token check in it — can be tested
+/// without a desktop. The real caller passes [`establish`].
+async fn attempt_establish<T>(
+    shared: &SharedSession,
+    store: &RestoreTokenStore,
+    stop: &mut oneshot::Receiver<()>,
+    delays: &[Duration],
+    mut attempt: impl AsyncFnMut() -> Result<T, Aborted>,
+) -> Option<T> {
+    for n in 0.. {
+        // Read per attempt rather than once: an attempt that threw a rejected token
+        // away has changed the answer, and the next one must not be given credit for
+        // a token that is no longer there.
+        let had_token = store.load().is_some();
+
+        // Shutdown has to be able to interrupt the sequence, not just the event loop
+        // that follows it. `Start` blocks until the user answers the consent dialog,
+        // and there is no upper bound on that — a dialog behind a full-screen window
+        // can sit there for hours. Without this branch, `Driver::drop` would join a
+        // thread waiting on it and the agent would never exit.
+        let established = tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                tracing::debug!("shutting down before the portal session was granted");
+                shared.stopped();
+                return None;
+            }
+            established = attempt() => established,
+        };
+
+        let Aborted { failure, session } = match established {
+            Ok(live) => return Some(live),
+            Err(aborted) => aborted,
+        };
+        forget_rejected_token(store, had_token, &failure);
+        // A session the portal already granted outlives this thread — nothing drops
+        // it and ashpd keeps the bus connection process-wide — so the compositor
+        // would go on showing this machine as remotely controlled by something that
+        // will never use the session. Done before the decision below, so a retry
+        // never leaves the one before it behind.
+        if let Some(session) = session {
+            close_session(&session).await;
+        }
+
+        let Some(delay) = retry_after(&failure, store.load().is_some(), n, delays) else {
+            failure.report(shared);
+            return None;
+        };
+        tracing::info!(
+            attempt = n + 1,
+            of = delays.len(),
+            retry_in_ms = delay.as_millis(),
+            reason = %failure.detail,
+            "the desktop portal was not answerable yet; retrying against the stored restore \
+             token, which is silent"
+        );
+        shared.retrying(failure.detail);
+
+        tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                shared.stopped();
+                return None;
+            }
+            () = tokio::time::sleep(delay) => {}
+        }
+        shared.starting();
+    }
+    // `0..` is only exhausted at `usize::MAX`, which `delays.len()` stops long first.
+    unreachable!()
+}
+
+/// How long to wait before trying the startup sequence again, or `None` if it must
+/// not be tried again at all.
+///
+/// Three conditions, and the first two are the design rather than a detail of it.
+///
+/// **A refusal is never retried.** A user who said no must not be asked again, and a
+/// loop that raised consent dialogs against them would be worse than the bug this
+/// retry exists to fix. [`FailureKind::Denied`] is where every refusal lands.
+///
+/// **Nothing past the dialog is retried either.** `before_consent` is true only for a
+/// request that failed before `Start` was ever called — before any consent UI could
+/// exist. That is what makes the retry provably silent rather than probably silent:
+/// combined with the token check below, a retry cannot put a dialog on screen that
+/// the first attempt would not have put there itself. A failure at or after the
+/// dialog means the user has already been asked something, and asking again is the
+/// one thing this must not do.
+///
+/// **A retry happens only with a restore token in hand.** Without one the next
+/// `Start` *would* prompt, and a consent dialog appearing by itself some seconds
+/// after login — with no user action behind it — is not a recovery, it is the
+/// product asking for permission at a moment of its own choosing. A machine that has
+/// never consented simply reports the failure and waits for a launch the user is
+/// present for.
+///
+/// The bound is `delays`, which is finite; see [`STARTUP_RETRY_DELAYS`].
+fn retry_after(
+    failure: &Failure,
+    has_token: bool,
+    attempt: usize,
+    delays: &[Duration],
+) -> Option<Duration> {
+    if matches!(failure.kind, FailureKind::Denied) {
+        return None;
+    }
+    if !failure.before_consent {
+        return None;
+    }
+    if !has_token {
+        return None;
+    }
+    delays.get(attempt).copied()
 }
 
 /// Throw away a stored restore token the portal would not accept.
@@ -967,6 +1118,15 @@ struct Failure {
     kind: FailureKind,
     /// Whether a stored restore token should be thrown away because of it.
     discards_token: bool,
+    /// Whether the request that failed ran before `Start`, and so before any consent
+    /// UI for this session could exist.
+    ///
+    /// The one thing [`retry_after`] needs that the error itself does not carry: it
+    /// is what makes "trying again cannot prompt anybody" a structural claim rather
+    /// than a hope. False unless [`Failure::from_ashpd`] was given
+    /// [`Stage::BeforeConsent`], so a failure this module raises by hand — all of
+    /// which happen at or after the grant — is never retried by accident.
+    before_consent: bool,
 }
 
 #[derive(Debug)]
@@ -1018,6 +1178,7 @@ impl Failure {
             detail: detail.into(),
             kind: FailureKind::Denied,
             discards_token: false,
+            before_consent: false,
         }
     }
 
@@ -1039,6 +1200,7 @@ impl Failure {
             detail: detail.into(),
             kind: FailureKind::Broken,
             discards_token: false,
+            before_consent: false,
         }
     }
 
@@ -1047,6 +1209,19 @@ impl Failure {
             detail: detail.into(),
             kind: FailureKind::Unsupported,
             discards_token: false,
+            before_consent: false,
+        }
+    }
+
+    /// The same failure, marked as having happened before any consent UI existed.
+    ///
+    /// Applied in one place — [`Failure::from_ashpd`], from the stage it was told —
+    /// so that "no dialog can have been shown" is read off the sequence rather than
+    /// decided again at each construction site.
+    fn before_consent(self) -> Self {
+        Self {
+            before_consent: true,
+            ..self
         }
     }
 
@@ -1076,7 +1251,7 @@ impl Failure {
         use ashpd::desktop::ResponseError;
         use ashpd::PortalError;
 
-        match e {
+        let failure = match e {
             // A request turned down before the dialog existed. Nobody refused this:
             // the desktop would not set the session up at all, which is what a
             // compositor answers with when the session is locked or not yet ready —
@@ -1143,6 +1318,16 @@ impl Failure {
                 }
             }
             other => Self::broken(format!("the desktop portal request failed: {other}")),
+        };
+        // Read off the stage rather than off any one branch above: whether a dialog
+        // could have been shown is a fact about where in the sequence the call sits,
+        // and every reading of it — including the ones that get their own branch
+        // here — has to agree with that or [`retry_after`] is deciding on something
+        // other than what happened.
+        if stage == Stage::BeforeConsent {
+            failure.before_consent()
+        } else {
+            failure
         }
     }
 
@@ -1618,6 +1803,300 @@ mod tests {
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
         assert!(!failure.discards_token);
+    }
+
+    /// The startup retry.
+    ///
+    /// The defect is a race with `xdg-desktop-portal` at login, so none of it is
+    /// provable by racing it. Everything below injects the failure instead: the
+    /// decision is a pure function of a portal error, and the loop is driven with a
+    /// schedule of zero-length waits and an attempt that fails exactly as often as
+    /// the test says. What is *not* covered here is a real portal that is late,
+    /// which needs a machine that boots — see the note at the top of this file.
+    mod startup_retry {
+        use super::*;
+
+        /// A schedule with the same shape as [`STARTUP_RETRY_DELAYS`] and none of
+        /// its waiting, so these tests take microseconds and cannot flake on a slow
+        /// box.
+        const NO_WAIT: [Duration; 3] = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
+        /// Long enough that a test which reaches it has already failed.
+        const FOREVER: [Duration; 1] = [Duration::from_secs(3600)];
+
+        const A_TOKEN: &str = "6f1a7c58-0c37-4a6b-9c8e-2a1f5d3e7b90";
+
+        fn block_on<F: std::future::Future>(f: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a test runtime")
+                .block_on(f)
+        }
+
+        /// What an agent that beat `xdg-desktop-portal` to the bus at login gets:
+        /// a failure from before any dialog could exist, that nobody decided.
+        fn not_answerable_yet() -> Aborted {
+            Aborted::before_session(ashpd::Error::Zbus(ashpd::zbus::Error::Address(
+                "no bus here yet".to_string(),
+            )))
+        }
+
+        /// The user dismissing the consent dialog, which is the one answer that must
+        /// never be asked again.
+        fn dismissed() -> Aborted {
+            Aborted {
+                failure: Failure::from_ashpd(
+                    ashpd::Error::Response(ResponseError::Cancelled),
+                    TokenSent::No,
+                    Stage::Consent,
+                ),
+                session: None,
+            }
+        }
+
+        fn store_in(dir: &TempDir, token: Option<&str>) -> RestoreTokenStore {
+            let store = RestoreTokenStore::in_dir(&dir.0);
+            if let Some(token) = token {
+                store.save(token).expect("writing the token");
+            }
+            store
+        }
+
+        #[test]
+        fn a_refusal_is_never_retried_however_early_it_arrived() {
+            // The rule the whole feature is subordinate to. Even given every other
+            // reason to try again — a token in hand, attempts left, and a failure
+            // marked as pre-consent — a refusal ends it.
+            let mut refusal = Failure::denied("the user said no").before_consent();
+            assert_eq!(retry_after(&refusal, true, 0, &NO_WAIT), None);
+            refusal = Failure::refused("the consent dialog was dismissed").before_consent();
+            assert_eq!(retry_after(&refusal, true, 0, &NO_WAIT), None);
+        }
+
+        #[test]
+        fn nothing_that_happened_at_or_after_the_dialog_is_retried() {
+            // What makes "a retry cannot prompt anybody" structural. Past `Start`
+            // the user has been asked something, and running the sequence again from
+            // the top could ask them again.
+            let after = Failure::broken("the transport went away");
+            assert!(!after.before_consent);
+            assert_eq!(retry_after(&after, true, 0, &NO_WAIT), None);
+        }
+
+        #[test]
+        fn a_machine_that_has_never_consented_is_not_retried_into_a_dialog() {
+            // Without a token the next `Start` shows a consent dialog, and one that
+            // appears by itself seconds after login — with no user action behind it
+            // — is not a recovery. That machine reports the failure and waits for a
+            // launch its user is present for.
+            let late = Failure::unsupported("no bus here yet").before_consent();
+            assert_eq!(retry_after(&late, false, 0, &NO_WAIT), None);
+            assert_eq!(
+                retry_after(&late, true, 0, &NO_WAIT),
+                Some(Duration::ZERO),
+                "the same failure with a token is exactly the case this exists for"
+            );
+        }
+
+        #[test]
+        fn the_retry_schedule_is_finite_and_short() {
+            // "Bounded" is the property, and it is bounded in both senses: a fixed
+            // number of attempts, over a window a user would not sit through twice.
+            let late = Failure::unsupported("no bus here yet").before_consent();
+            for attempt in 0..STARTUP_RETRY_DELAYS.len() {
+                assert!(
+                    retry_after(&late, true, attempt, &STARTUP_RETRY_DELAYS).is_some(),
+                    "attempt {attempt}"
+                );
+            }
+            assert_eq!(
+                retry_after(
+                    &late,
+                    true,
+                    STARTUP_RETRY_DELAYS.len(),
+                    &STARTUP_RETRY_DELAYS
+                ),
+                None,
+                "the schedule has to run out"
+            );
+            let total: Duration = STARTUP_RETRY_DELAYS.iter().sum();
+            assert!(total <= Duration::from_secs(60), "{total:?}");
+        }
+
+        #[test]
+        fn a_portal_that_is_merely_late_is_retried_until_it_answers() {
+            // The defect, closed. The first two attempts land where an autostarted
+            // agent lands at login; the third is the portal having come up, and the
+            // session must reach it rather than having been written off at the
+            // first.
+            let dir = TempDir::new("late-portal");
+            let store = store_in(&dir, Some(A_TOKEN));
+            let (shared, _live) = session();
+            shared.starting();
+            let (_stop_tx, mut stop) = oneshot::channel();
+            let attempts = std::cell::Cell::new(0usize);
+
+            let got = block_on(attempt_establish(
+                &shared,
+                &store,
+                &mut stop,
+                &NO_WAIT,
+                async || {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() < 3 {
+                        Err(not_answerable_yet())
+                    } else {
+                        Ok("the session")
+                    }
+                },
+            ));
+
+            assert_eq!(got, Some("the session"));
+            assert_eq!(attempts.get(), 3);
+            assert_eq!(
+                shared.state(),
+                SessionState::Starting,
+                "the session that is about to be published must not be left mid-retry"
+            );
+            assert!(
+                store.load().is_some(),
+                "a portal that never answered rejected nothing, so the token stands"
+            );
+        }
+
+        #[test]
+        fn a_portal_that_never_answers_is_reported_honestly_rather_than_retried_forever() {
+            // The other end of "bounded". A desktop with no portal at all reaches
+            // this too, and it has to end up saying so.
+            let dir = TempDir::new("absent-portal");
+            let store = store_in(&dir, Some(A_TOKEN));
+            let (shared, live) = session();
+            shared.starting();
+            let (_stop_tx, mut stop) = oneshot::channel();
+            let attempts = std::cell::Cell::new(0usize);
+
+            let got: Option<&str> = block_on(attempt_establish(
+                &shared,
+                &store,
+                &mut stop,
+                &NO_WAIT,
+                async || {
+                    attempts.set(attempts.get() + 1);
+                    Err(not_answerable_yet())
+                },
+            ));
+
+            assert!(got.is_none());
+            assert_eq!(
+                attempts.get(),
+                NO_WAIT.len() + 1,
+                "one attempt, then one per delay in the schedule, and no more"
+            );
+            assert_eq!(shared.state(), SessionState::Unsupported);
+            assert!(live.get().is_empty());
+        }
+
+        #[test]
+        fn the_user_dismissing_the_dialog_ends_it_at_the_first_attempt() {
+            // The end-to-end form of the rule above, through the loop that would be
+            // the thing putting dialogs back on screen if it got this wrong.
+            let dir = TempDir::new("dismissed");
+            let store = store_in(&dir, Some(A_TOKEN));
+            let (shared, _live) = session();
+            shared.starting();
+            let (_stop_tx, mut stop) = oneshot::channel();
+            let attempts = std::cell::Cell::new(0usize);
+
+            let got: Option<&str> = block_on(attempt_establish(
+                &shared,
+                &store,
+                &mut stop,
+                &NO_WAIT,
+                async || {
+                    attempts.set(attempts.get() + 1);
+                    Err(dismissed())
+                },
+            ));
+
+            assert!(got.is_none());
+            assert_eq!(attempts.get(), 1, "the user was asked once and answered");
+            assert_eq!(shared.state(), SessionState::Denied);
+        }
+
+        #[test]
+        fn a_rejected_token_stops_the_retry_because_the_next_one_would_prompt() {
+            // The two rules meeting. A token the portal threw out is forgotten, and
+            // the moment it is gone the next attempt would raise a dialog — so there
+            // must not be a next attempt, however pre-consent the failure was.
+            let dir = TempDir::new("rejected-token-retry");
+            let store = store_in(&dir, Some("not-a-uuid"));
+            let (shared, _live) = session();
+            shared.starting();
+            let (_stop_tx, mut stop) = oneshot::channel();
+            let attempts = std::cell::Cell::new(0usize);
+
+            let got: Option<&str> = block_on(attempt_establish(
+                &shared,
+                &store,
+                &mut stop,
+                &NO_WAIT,
+                async || {
+                    attempts.set(attempts.get() + 1);
+                    Err(Aborted {
+                        failure: Failure::from_ashpd(
+                            method_error(INVALID_ARGUMENT, "Restore token is not a valid UUID"),
+                            TokenSent::Yes,
+                            Stage::BeforeConsent,
+                        ),
+                        session: None,
+                    })
+                },
+            ));
+
+            assert!(got.is_none());
+            assert_eq!(attempts.get(), 1);
+            assert!(store.load().is_none(), "the bad token is still forgotten");
+            assert_eq!(shared.state(), SessionState::Failed);
+        }
+
+        #[test]
+        fn shutting_down_while_waiting_to_retry_stops_rather_than_waiting_out_the_delay() {
+            // `Driver::drop` joins this thread, so every wait inside it has to be
+            // interruptible. A schedule of an hour proves it: a test that reached
+            // the sleep would not finish.
+            let dir = TempDir::new("stop-mid-retry");
+            let store = store_in(&dir, Some(A_TOKEN));
+            let (shared, _live) = session();
+            shared.starting();
+            let (stop_tx, mut stop) = oneshot::channel();
+            let stop_tx = std::cell::RefCell::new(Some(stop_tx));
+            let attempts = std::cell::Cell::new(0usize);
+
+            let got: Option<&str> = block_on(attempt_establish(
+                &shared,
+                &store,
+                &mut stop,
+                &FOREVER,
+                async || {
+                    attempts.set(attempts.get() + 1);
+                    // The agent is asked to shut down while this attempt is in
+                    // flight, which is exactly when a login-time retry is pending.
+                    if let Some(tx) = stop_tx.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                    Err(not_answerable_yet())
+                },
+            ));
+
+            assert!(got.is_none());
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(
+                shared.state(),
+                SessionState::Stopped,
+                "a shutdown during the retry wait is not a portal failure"
+            );
+        }
     }
 }
 

@@ -18,18 +18,28 @@ use super::BACKEND;
 ///
 /// # Why refusal is terminal
 ///
-/// There is no `Retrying` state and no way back out of [`SessionState::Denied`].
-/// Every way of losing the session — the user dismisses the dialog, the compositor
-/// revokes it, the screen locks — arrives here, and a daemon that answered any of
-/// them by starting the sequence again would put the dialog back on screen, forever,
-/// against a user who has already said no. Recovery is a new agent run, which the
-/// restore token makes silent when the user did in fact consent before.
+/// There is no way back out of [`SessionState::Denied`]. Every way of *losing* the
+/// session — the user dismisses the dialog, the compositor revokes it, the screen
+/// locks — arrives here, and a daemon that answered any of them by starting the
+/// sequence again would put the dialog back on screen, forever, against a user who
+/// has already said no. Recovery is a new agent run, which the restore token makes
+/// silent when the user did in fact consent before.
+///
+/// [`SessionState::Retrying`] is not an exception to that and must never become
+/// one. It is only ever reached from a request that failed *before any consent UI
+/// could exist* — the portal was not answerable yet — and only while a restore
+/// token on disk makes the next attempt silent. A refusal cannot reach it, and
+/// [`SharedSession::retrying`] cannot leave a terminal state any more than
+/// [`SharedSession::starting`] can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     /// Never started. What `cargo test` and any non-daemon caller sees.
     Idle,
     /// D-Bus calls are in flight; the consent dialog may be on screen.
     Starting,
+    /// The portal could not be reached and another attempt is scheduled. No dialog
+    /// is on screen and none has been: see the note above.
+    Retrying,
     /// Live: devices granted and the libei transport connected.
     Active,
     /// Permission refused or withdrawn. Terminal.
@@ -172,6 +182,21 @@ impl SharedSession {
         self.enter(SessionState::Starting, String::new());
     }
 
+    /// The attempt failed for something nobody decided, and another one is coming.
+    ///
+    /// Non-terminal on purpose, and the only state that is entered *after* a
+    /// failure rather than before one. What may put a session here is decided
+    /// entirely by [`super::driver`]; this type's part of the rule is that it is
+    /// still `enter`, so a session that has already been refused stays refused.
+    ///
+    /// Publishes nothing, for the same reason [`SharedSession::starting`] does not:
+    /// an attempt in progress is not a capability.
+    pub fn retrying(&self, detail: impl Into<String>) {
+        if self.enter(SessionState::Retrying, detail.into()) {
+            self.publish(Capabilities::NONE);
+        }
+    }
+
     /// Permission granted and the transport is up.
     pub fn activate(&self, granted: Capabilities) {
         if self.enter(SessionState::Active, String::new()) {
@@ -233,6 +258,16 @@ impl SharedSession {
             SessionState::Starting => Some(PlatformError::Other(
                 "waiting for the desktop portal consent dialog".into(),
             )),
+            // Deliberately *not* the wording above: nobody is being asked anything
+            // here, and telling a user to answer a dialog that is not on screen is
+            // the kind of advice that has them looking for a window that does not
+            // exist.
+            SessionState::Retrying => Some(PlatformError::Other(format!(
+                "the xdg-desktop-portal {} session is not answerable yet, and is being \
+                 retried: {}",
+                self.portal,
+                detail()
+            ))),
             SessionState::Failed | SessionState::Stopped => Some(PlatformError::Other(detail())),
         }
     }
@@ -657,9 +692,65 @@ mod tests {
         for state in [
             SessionState::Idle,
             SessionState::Starting,
+            SessionState::Retrying,
             SessionState::Active,
         ] {
             assert!(!state.is_terminal(), "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_session_waiting_to_be_retried_advertises_nothing_and_is_not_a_refusal() {
+        // The state a login-time retry sits in. Nothing may be advertised — the
+        // portal has not granted anything — but it must not read as a permission
+        // problem either, or the UI turns a portal that is thirty seconds late into
+        // a prompt telling the user to go and grant something.
+        let (s, live) = with_base(Capabilities::HAS_DISPLAYS);
+        s.starting();
+        s.retrying("the desktop refused to create a remote desktop session");
+        assert_eq!(s.state(), SessionState::Retrying);
+        assert!(!s.state().is_terminal(), "a retry can still succeed");
+        assert!(!live.get().contains(Capabilities::INJECT_INPUT));
+        assert!(
+            live.get().contains(Capabilities::HAS_DISPLAYS),
+            "a portal that is late does not unplug the monitors"
+        );
+        assert!(!matches!(
+            s.error(),
+            Some(PlatformError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn a_retry_can_still_reach_a_live_session() {
+        // The whole point: the state the agent is left in after a failed first
+        // attempt has to be one a later attempt can still publish from.
+        let (s, live) = session();
+        s.starting();
+        s.retrying("no D-Bus session bus");
+        s.starting();
+        s.activate(REMOTE_DESKTOP_CAPABILITIES);
+        assert_eq!(s.state(), SessionState::Active);
+        assert!(live.get().contains(Capabilities::INJECT_INPUT));
+    }
+
+    #[test]
+    fn a_refusal_can_never_be_turned_into_a_retry() {
+        // The rule the whole retry rests on. `Denied` is where every refusal and
+        // revocation lands, and nothing may move a session out of it — a retry
+        // loop that could would put the consent dialog back in front of a user who
+        // already said no, which is worse than the bug the retry exists to fix.
+        let (s, live) = session();
+        s.starting();
+        s.denied("the consent dialog was dismissed");
+
+        s.retrying("the desktop refused to create a remote desktop session");
+
+        assert_eq!(s.state(), SessionState::Denied);
+        assert!(live.get().is_empty());
+        assert!(matches!(
+            s.error(),
+            Some(PlatformError::PermissionDenied(msg)) if msg.contains("dismissed")
+        ));
     }
 }
