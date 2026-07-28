@@ -8,15 +8,24 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire format version.
+/// Newest wire format this build speaks.
 ///
 /// Bumped only for changes that older peers cannot parse. Additive changes —
 /// appending an enum variant or a capability bit — do not require a bump,
 /// because peers ignore capabilities they do not recognise and never send
 /// variants the other side did not advertise support for.
+///
+/// This is the *top* of a range, not a single value: the build speaks every
+/// version in `MIN_COMPATIBLE_VERSION..=PROTOCOL_VERSION`, and it is the number
+/// each side advertises in [`crate::ControlMsg::Hello`] and
+/// [`crate::ControlMsg::Welcome`] so that [`check_version`] can pick one.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Oldest version this build can still talk to.
+/// Oldest wire format this build still speaks.
+///
+/// The bottom of that range, and a real promise rather than a politeness: raising
+/// it says the code for every version below it is gone, so a peer down there is
+/// refused outright instead of being misparsed.
 pub const MIN_COMPATIBLE_VERSION: u16 = 1;
 
 // A build whose floor is above its own version could not talk to anything, itself
@@ -175,36 +184,102 @@ pub enum DisplayServer {
     Headless,
 }
 
-/// Result of comparing two peers' protocol versions.
+/// Outcome of negotiating a wire format with a peer.
+///
+/// There is no `PeerTooNew`: a peer advertising a version this build has never
+/// heard of is not a refusal, it is a peer to negotiate *down* with. See
+/// [`check_version`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionCheck {
-    Compatible,
-    /// Peer speaks an older version than this build supports.
-    PeerTooOld {
-        peer: u16,
-        min_supported: u16,
+    /// A wire format both ends speak was found.
+    Compatible {
+        /// The version this connection runs at.
+        ///
+        /// Both machines compute this, independently, from the same two numbers,
+        /// and arrive at the same answer — which is the whole reason negotiation
+        /// needs no extra round trip and no extra message.
+        effective: u16,
     },
-    /// Peer speaks a newer version than this build understands.
-    PeerTooNew {
-        peer: u16,
-        ours: u16,
-    },
+    /// The peer's newest version is older than anything this build still speaks.
+    PeerTooOld { peer: u16, min_supported: u16 },
 }
 
-/// Decide whether a peer's protocol version can be spoken.
+/// Pick the wire format a connection will use.
+///
+/// # Why a newer peer is not refused
+///
+/// Refusing anything above [`PROTOCOL_VERSION`] means the *first* bump severs
+/// interop: an updated machine and a not-yet-updated one could not connect at
+/// all, rather than continuing at the older feature level. For a tool whose only
+/// job is joining two machines, that is the worst available failure.
+///
+/// So a build advertises the top of a range it speaks and both ends settle on
+/// `min(ours, theirs)` — the newest format neither has to guess at.
+///
+/// # Why `min` is safe to compute unilaterally
+///
+/// Negotiation that only one end honours is worse than a clean refusal: the
+/// tolerant side would still be handed messages it cannot parse. That cannot
+/// happen here. [`crate::ControlMsg::Hello`] and [`crate::ControlMsg::Welcome`]
+/// both carry the sender's `PROTOCOL_VERSION`, so by the time either side calls
+/// this it holds *both* numbers, and `min` is commutative. Neither end has to
+/// announce the result or trust the other to have agreed — they cannot disagree.
+///
+/// # Why the floor survives
+///
+/// Only the top of each range crosses the wire, so this cannot see whether the
+/// peer's own floor admits the negotiated version. It does not need to: each side
+/// checks the result against its own [`MIN_COMPATIBLE_VERSION`], and a peer whose
+/// floor is above what we offer refuses us with
+/// [`crate::RejectReason::ProtocolTooOld`]. Every incompatible pairing still ends
+/// in exactly one clear refusal naming a version number, from whichever end can
+/// see the problem.
+///
+/// # What an "older effective version" does and does not buy you
+///
+/// It buys the wire *format* and nothing else. It does not make a newer peer's
+/// extra messages harmless to send: postcard identifies enum variants by index
+/// and is not self-describing, so a variant an older build has never seen is a
+/// hard decode error, not something it can skip — and a control stream that fails
+/// to decode is torn down. `codec::tests::an_unknown_variant_is_a_hard_decode_
+/// failure` pins that.
+///
+/// Feature differences are therefore *not* this function's job; they are
+/// [`Capabilities`]' job, which is already the policy at the top of this file and
+/// is already enforced before send by `Engine::peer_supports` in
+/// `crates/wx-agent/src/engine.rs`. [`Capabilities::CAPABILITY_UPDATES`] is the
+/// worked example: appending [`crate::ControlMsg::CapabilitiesChanged`] was made
+/// safe by a capability bit, not by a version bump.
+///
+/// The division that follows, and that a future bump must respect:
+///
+/// * **New feature, existing encoding** — add a capability bit, gate the send on
+///   it, and *do not* bump. Nothing here changes.
+/// * **Changed encoding of something already on the wire** — bump, keep the code
+///   that emits the old encoding, and choose between them on `effective`. Drop
+///   the old encoding only by raising [`MIN_COMPATIBLE_VERSION`] in the same
+///   breath, which converts silent misparsing into the refusal above.
 pub fn check_version(peer_version: u16) -> VersionCheck {
-    if peer_version < MIN_COMPATIBLE_VERSION {
+    negotiate(peer_version, PROTOCOL_VERSION, MIN_COMPATIBLE_VERSION)
+}
+
+/// [`check_version`] with this build's constants lifted into arguments.
+///
+/// Private, and it exists for one test: the claim above is that *two different
+/// builds* agree on the effective version, and a test that can only instantiate
+/// this build's constants cannot check that. Parameterising lets the test stand
+/// up both ends of a mixed-version pair for real instead of re-deriving `min`
+/// alongside the code it is meant to be checking.
+fn negotiate(peer_version: u16, ours: u16, floor: u16) -> VersionCheck {
+    if peer_version < floor {
         VersionCheck::PeerTooOld {
             peer: peer_version,
-            min_supported: MIN_COMPATIBLE_VERSION,
-        }
-    } else if peer_version > PROTOCOL_VERSION {
-        VersionCheck::PeerTooNew {
-            peer: peer_version,
-            ours: PROTOCOL_VERSION,
+            min_supported: floor,
         }
     } else {
-        VersionCheck::Compatible
+        VersionCheck::Compatible {
+            effective: peer_version.min(ours),
+        }
     }
 }
 
@@ -312,16 +387,33 @@ mod tests {
 
     #[test]
     fn same_version_is_compatible() {
-        assert_eq!(check_version(PROTOCOL_VERSION), VersionCheck::Compatible);
+        assert_eq!(
+            check_version(PROTOCOL_VERSION),
+            VersionCheck::Compatible {
+                effective: PROTOCOL_VERSION
+            }
+        );
     }
 
     #[test]
-    fn newer_peer_is_rejected_with_both_versions() {
+    fn a_newer_peer_negotiates_down_rather_than_being_refused() {
+        // The regression this whole module exists for: the first version bump must
+        // not sever interop between an updated machine and a stale one. Both a
+        // one-step and a far-future bump land on what this build can actually
+        // speak, rather than on a refusal.
+        for ahead in [1, 5, 1000] {
+            assert_eq!(
+                check_version(PROTOCOL_VERSION + ahead),
+                VersionCheck::Compatible {
+                    effective: PROTOCOL_VERSION
+                },
+                "a peer {ahead} versions ahead"
+            );
+        }
         assert_eq!(
-            check_version(PROTOCOL_VERSION + 1),
-            VersionCheck::PeerTooNew {
-                peer: PROTOCOL_VERSION + 1,
-                ours: PROTOCOL_VERSION,
+            check_version(u16::MAX),
+            VersionCheck::Compatible {
+                effective: PROTOCOL_VERSION
             }
         );
     }
@@ -335,5 +427,78 @@ mod tests {
                 min_supported: MIN_COMPATIBLE_VERSION,
             }
         );
+    }
+
+    #[test]
+    fn tolerance_for_newer_peers_did_not_remove_the_floor() {
+        // Newer-peer tolerance is one-directional on purpose. Everything below the
+        // floor is still refused, and named, however far below it sits.
+        for peer in 0..MIN_COMPATIBLE_VERSION {
+            assert_eq!(
+                check_version(peer),
+                VersionCheck::PeerTooOld {
+                    peer,
+                    min_supported: MIN_COMPATIBLE_VERSION,
+                },
+                "peer at version {peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_negotiated_version_is_one_this_build_can_actually_speak() {
+        // "Tolerant" must never mean agreeing to a format we do not implement.
+        for peer in 0..=64u16 {
+            if let VersionCheck::Compatible { effective } = check_version(peer) {
+                assert!(
+                    (MIN_COMPATIBLE_VERSION..=PROTOCOL_VERSION).contains(&effective),
+                    "negotiated {effective} with a peer at {peer}, outside \
+                     {MIN_COMPATIBLE_VERSION}..={PROTOCOL_VERSION}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_different_builds_never_disagree_about_the_effective_version() {
+        // The property the design rests on. Each side runs this check against the
+        // other's advertised version, alone, with no message announcing the
+        // result — so if the two could ever land on different answers, the
+        // tolerant end would go on to be handed messages it cannot parse, which
+        // is worse than the refusal this replaces.
+        //
+        // Every mixed pair of builds in a small grid, rather than one example:
+        // the failure would be an off-by-one at a range edge.
+        for a_max in 1..=6u16 {
+            for a_floor in 1..=a_max {
+                for b_max in 1..=6u16 {
+                    for b_floor in 1..=b_max {
+                        let a_sees = negotiate(b_max, a_max, a_floor);
+                        let b_sees = negotiate(a_max, b_max, b_floor);
+                        let pair = format!(
+                            "A {a_floor}..={a_max} vs B {b_floor}..={b_max}: \
+                             {a_sees:?} / {b_sees:?}"
+                        );
+
+                        let (
+                            VersionCheck::Compatible { effective: a },
+                            VersionCheck::Compatible { effective: b },
+                        ) = (a_sees, b_sees)
+                        else {
+                            // At least one end refuses. That is a clean outcome —
+                            // it sends a Reject naming a version — so there is
+                            // nothing to agree about.
+                            continue;
+                        };
+
+                        assert_eq!(a, b, "ends disagree: {pair}");
+                        // And the agreed version is one *both* implement, which is
+                        // what makes proceeding safe rather than merely mutual.
+                        assert!((a_floor..=a_max).contains(&a), "A cannot speak it: {pair}");
+                        assert!((b_floor..=b_max).contains(&a), "B cannot speak it: {pair}");
+                    }
+                }
+            }
+        }
     }
 }

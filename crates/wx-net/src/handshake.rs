@@ -115,6 +115,22 @@ pub struct Step {
 pub struct Established {
     pub role: Role,
     pub peer: NodeInfo,
+    /// Wire format this connection settled on: `min` of the two advertised
+    /// [`PROTOCOL_VERSION`]s, and equal to what the peer computed for itself.
+    ///
+    /// Usually just this build's own version. It differs when the peer is newer,
+    /// which is the case this field exists for — it is what a future encoding
+    /// change must branch on, and what makes a mixed-version session legible in
+    /// the log rather than something to guess at from two machines' build
+    /// numbers.
+    pub protocol: u16,
+    /// The peer's own newest version, as it advertised it.
+    ///
+    /// Kept alongside the negotiated one purely so a log line can show both.
+    /// Nothing should branch on it: `protocol` is the agreed answer, and a peer
+    /// ahead of us is precisely the case where its number is not one we can act
+    /// on.
+    pub peer_protocol: u16,
     /// Nonce this side chose. Needed after the handshake to derive the pairing
     /// proof, which binds the PIN to this specific connection.
     pub local_nonce: [u8; 32],
@@ -183,6 +199,8 @@ pub struct Handshake {
     state: State,
     peer: Option<NodeInfo>,
     peer_nonce: Option<[u8; 32]>,
+    /// Effective wire version and the peer's advertised one, once it has spoken.
+    negotiated: Option<(u16, u16)>,
     pairing_mode: bool,
 }
 
@@ -208,6 +226,7 @@ impl Handshake {
             },
             peer: None,
             peer_nonce: None,
+            negotiated: None,
             pairing_mode: false,
         }
     }
@@ -322,6 +341,9 @@ impl Handshake {
                 let peer_nonce = self
                     .peer_nonce
                     .expect("peer nonce is recorded before AwaitingProof");
+                let (protocol, peer_protocol) = self
+                    .negotiated
+                    .expect("the version is negotiated before AwaitingProof");
                 // Verified against *this* session's binding, so a signature that is
                 // genuine but was produced on another connection — the relay case —
                 // is refused here rather than establishing a session with a machine
@@ -338,6 +360,8 @@ impl Handshake {
                     outcome: Outcome::Established(Box::new(Established {
                         role: self.role,
                         peer,
+                        protocol,
+                        peer_protocol,
                         local_nonce: self.local_nonce,
                         peer_nonce,
                         peer_was_paired,
@@ -364,13 +388,20 @@ impl Handshake {
         identity: &Identity,
         trust: &TrustStore,
     ) -> Option<Step> {
+        // First, and deliberately so: an incompatible peer must not learn whether
+        // it is paired with us, and no signature is produced for one.
+        //
+        // A peer *newer* than this build is no longer refused — it negotiates down
+        // to a format both ends speak, so that the first version bump does not sever
+        // interop between an updated machine and a stale one. `check_version` carries
+        // the argument for why that is sound. [`RejectReason::ProtocolTooNew`] is
+        // consequently never sent from here any more, but stays on the wire: it is a
+        // postcard variant index, and a peer on a build that predates this change
+        // still sends it to us.
         match check_version(protocol) {
-            VersionCheck::Compatible => {}
+            VersionCheck::Compatible { effective } => self.negotiated = Some((effective, protocol)),
             VersionCheck::PeerTooOld { min_supported, .. } => {
                 return Some(self.refuse(RejectReason::ProtocolTooOld { min_supported }))
-            }
-            VersionCheck::PeerTooNew { ours, .. } => {
-                return Some(self.refuse(RejectReason::ProtocolTooNew { ours }))
             }
         }
 
@@ -422,6 +453,13 @@ impl Handshake {
     /// Peer details, available once `Hello` or `Welcome` has been accepted.
     pub fn peer(&self) -> Option<&NodeInfo> {
         self.peer.as_ref()
+    }
+
+    /// Wire version agreed with the peer, available at the same point as
+    /// [`Handshake::peer`] — so a connection that is refused after the version
+    /// step can still say what it had settled on.
+    pub fn negotiated_protocol(&self) -> Option<u16> {
+        self.negotiated.map(|(effective, _)| effective)
     }
 }
 
@@ -531,7 +569,7 @@ fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wx_proto::{Capabilities, DisplayServer, Platform};
+    use wx_proto::{Capabilities, DisplayServer, Platform, MIN_COMPATIBLE_VERSION};
 
     fn info(id: NodeId, name: &str) -> NodeInfo {
         NodeInfo {
@@ -895,32 +933,114 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_newer_protocol_version_is_refused_with_our_version() {
+    /// Drive a whole handshake against a peer that advertises `peer_protocol`.
+    ///
+    /// The peer is played by hand rather than by [`run_in_memory`], because the
+    /// point is a version this build cannot produce for itself.
+    fn handshake_with_peer_at(role: Role, peer_protocol: u16) -> (Step, Step) {
         let p = paired();
-        let mut hs = Handshake::new(
-            Role::Responder,
-            info(p.bob.node_id(), "bob"),
-            [1u8; 32],
-            same_session(),
-        );
-        let step = hs
+        let (local, local_id, remote, remote_id) = match role {
+            // `paired()` trusts each of alice and bob to the other, so either may
+            // play the local side; the roles just decide who speaks first.
+            Role::Responder => (&p.bob, p.bob.node_id(), &p.alice, p.alice.node_id()),
+            Role::Initiator => (&p.alice, p.alice.node_id(), &p.bob, p.bob.node_id()),
+        };
+        let trust = match role {
+            Role::Responder => &p.bob_trust,
+            Role::Initiator => &p.alice_trust,
+        };
+        let local_nonce = [1u8; 32];
+        let peer_nonce = [2u8; 32];
+
+        let mut hs = Handshake::new(role, info(local_id, "local"), local_nonce, same_session());
+        let greeting = match role {
+            Role::Responder => ControlMsg::Hello {
+                protocol: peer_protocol,
+                info: info(remote_id, "remote"),
+                nonce: peer_nonce,
+            },
+            Role::Initiator => ControlMsg::Welcome {
+                protocol: peer_protocol,
+                info: info(remote_id, "remote"),
+                nonce: peer_nonce,
+            },
+        };
+        let first = hs.on_message(&greeting, local, trust).unwrap();
+        if !matches!(first.outcome, Outcome::Continue) {
+            return (first.clone(), first);
+        }
+        let second = hs
             .on_message(
-                &ControlMsg::Hello {
-                    protocol: PROTOCOL_VERSION + 1,
-                    info: info(p.alice.node_id(), "alice"),
-                    nonce: [2u8; 32],
+                &ControlMsg::AuthProof {
+                    signature: remote.sign_handshake(&same_session(), &local_nonce),
                 },
-                &p.bob,
-                &p.bob_trust,
+                local,
+                trust,
             )
             .unwrap();
-        assert_eq!(
-            step.outcome,
-            Outcome::Refused(RejectReason::ProtocolTooNew {
-                ours: PROTOCOL_VERSION
-            })
-        );
+        (first, second)
+    }
+
+    #[test]
+    fn a_newer_peer_connects_at_the_older_version_instead_of_being_refused() {
+        // The regression that matters. Before newer-peer tolerance this refused
+        // outright, which meant the first `PROTOCOL_VERSION` bump would have left
+        // an updated machine unable to talk to a stale one at all — strictly worse
+        // than carrying on at the older feature level.
+        //
+        // Checked from both roles: the initiator learns the peer's version from
+        // `Welcome` and the responder from `Hello`, so they are separate paths
+        // through `admit` and only one of them being tolerant is a bug that only
+        // shows up in one dialling direction.
+        for role in [Role::Responder, Role::Initiator] {
+            for ahead in [1, 7, 1000] {
+                let (_, last) = handshake_with_peer_at(role, PROTOCOL_VERSION + ahead);
+                let Outcome::Established(e) = last.outcome else {
+                    panic!("{role:?} refused a peer {ahead} versions ahead: {last:?}");
+                };
+                // ...and at a version this build actually speaks, not the peer's.
+                assert_eq!(e.protocol, PROTOCOL_VERSION);
+                // The peer's own number survives for the log line, unclamped.
+                assert_eq!(e.peer_protocol, PROTOCOL_VERSION + ahead);
+            }
+        }
+    }
+
+    #[test]
+    fn a_matched_peer_negotiates_the_current_version() {
+        for role in [Role::Responder, Role::Initiator] {
+            let (_, last) = handshake_with_peer_at(role, PROTOCOL_VERSION);
+            let Outcome::Established(e) = last.outcome else {
+                panic!("{role:?} refused a matched peer: {last:?}");
+            };
+            assert_eq!(e.protocol, PROTOCOL_VERSION);
+        }
+    }
+
+    #[test]
+    fn a_below_floor_peer_is_still_refused_from_either_role() {
+        // Tolerance is one-directional. A peer under `MIN_COMPATIBLE_VERSION`
+        // speaks a format whose code is gone, so it is refused with the number it
+        // would have to reach — never admitted to fail confusingly later.
+        for role in [Role::Responder, Role::Initiator] {
+            let (first, _) = handshake_with_peer_at(role, 0);
+            assert_eq!(
+                first.outcome,
+                Outcome::Refused(RejectReason::ProtocolTooOld {
+                    min_supported: MIN_COMPATIBLE_VERSION
+                }),
+                "{role:?} admitted a below-floor peer"
+            );
+            assert_eq!(
+                first.send,
+                vec![ControlMsg::Reject {
+                    reason: RejectReason::ProtocolTooOld {
+                        min_supported: MIN_COMPATIBLE_VERSION
+                    }
+                }],
+                "{role:?} refused without saying so"
+            );
+        }
     }
 
     #[test]
@@ -952,7 +1072,9 @@ mod tests {
     #[test]
     fn a_version_check_happens_before_the_trust_lookup() {
         // An incompatible peer must not be told whether it is paired: that is
-        // information leaked for no protocol benefit.
+        // information leaked for no protocol benefit. Newer-peer tolerance moved
+        // which versions are incompatible, not where in `admit` the question is
+        // asked, so the below-floor case still has to answer with the version.
         let alice = Identity::generate().unwrap();
         let bob = Identity::generate().unwrap();
         let empty = TrustStore::new();
@@ -965,7 +1087,7 @@ mod tests {
         let step = hs
             .on_message(
                 &ControlMsg::Hello {
-                    protocol: PROTOCOL_VERSION + 5,
+                    protocol: MIN_COMPATIBLE_VERSION - 1,
                     info: info(alice.node_id(), "alice"),
                     nonce: [2u8; 32],
                 },
@@ -975,8 +1097,43 @@ mod tests {
             .unwrap();
         assert!(matches!(
             step.outcome,
-            Outcome::Refused(RejectReason::ProtocolTooNew { .. })
+            Outcome::Refused(RejectReason::ProtocolTooOld { .. })
         ));
+    }
+
+    #[test]
+    fn a_newer_peer_is_still_screened_by_every_other_admission_check() {
+        // Tolerating a newer version must not turn into tolerating anything else:
+        // a peer that is unpaired, blocked, or reflecting our own identity is
+        // refused exactly as before, and before any signature goes out.
+        let alice = Identity::generate().unwrap();
+        let bob = Identity::generate().unwrap();
+        let empty = TrustStore::new();
+        let mut hs = Handshake::new(
+            Role::Responder,
+            info(bob.node_id(), "bob"),
+            [1u8; 32],
+            same_session(),
+        );
+        let step = hs
+            .on_message(
+                &ControlMsg::Hello {
+                    protocol: PROTOCOL_VERSION + 3,
+                    info: info(alice.node_id(), "alice"),
+                    nonce: [2u8; 32],
+                },
+                &bob,
+                &empty,
+            )
+            .unwrap();
+        assert_eq!(step.outcome, Outcome::Refused(RejectReason::NotPaired));
+        assert!(
+            !step
+                .send
+                .iter()
+                .any(|m| matches!(m, ControlMsg::AuthProof { .. })),
+            "signed for a peer it was refusing"
+        );
     }
 
     #[test]
