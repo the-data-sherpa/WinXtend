@@ -196,7 +196,29 @@ pub mod linux_impl {
     /// caller that has no real binary — the packaging step's equivalent — and
     /// the one that does agree on the rendering.
     pub fn unit_text(exec_start: &Path) -> String {
-        UNIT_TEMPLATE.replace(EXEC_START, &exec_start.display().to_string())
+        UNIT_TEMPLATE.replace(EXEC_START, &quoted(exec_start))
+    }
+
+    /// A path as a single `ExecStart` word.
+    ///
+    /// systemd splits `ExecStart` on whitespace, so a path containing a space —
+    /// `~/Downloads/WinXtend 0.1.0/wx-agent` is an ordinary place to find one —
+    /// becomes a different command with an argument after it, and fails at every
+    /// login while the registration still reads as present. This is the Linux
+    /// twin of the quoting the Windows `command_line` does, for the same reason.
+    ///
+    /// Quoted unconditionally, even when nothing needs it: `ui/scripts/bundle-agent.mjs`
+    /// substitutes the same template for the packaged unit, and two renderings
+    /// that differ only in an edge case are two renderings that will drift.
+    /// Inside the quotes systemd reads `\` as an escape, so a backslash and a
+    /// double quote each need one.
+    fn quoted(path: &Path) -> String {
+        let escaped = path
+            .display()
+            .to_string()
+            .replace('\\', r"\\")
+            .replace('"', "\\\"");
+        format!("\"{escaped}\"")
     }
 
     /// `$XDG_CONFIG_HOME`, or `~/.config`.
@@ -294,31 +316,69 @@ pub mod linux_impl {
 
     /// Whether the agent will start with the next session.
     ///
-    /// Both files have to be there. A `.wants` symlink with no unit behind it is
-    /// a registration that cannot start anything, so reporting it as registered
-    /// would be the silent-at-every-login failure in a different costume.
+    /// The enablement symlink has to be there *and* has to resolve. A `.wants`
+    /// symlink with no unit behind it is a registration that cannot start
+    /// anything, so reporting it as registered would be the
+    /// silent-at-every-login failure in a different costume — but the unit it
+    /// resolves to need not be the one [`install_in`] wrote. `systemctl --user
+    /// enable winxtend.service` against the unit the `.deb` ships creates only
+    /// this link, pointing at `/usr/lib/systemd/user/winxtend.service`, and
+    /// writes nothing under the user's own config root; demanding a local unit
+    /// file would report that perfectly good registration as absent.
     pub fn is_registered_in(root: &Path) -> Result<bool, AutostartError> {
-        // `symlink_metadata`, so a dangling link reads as a link that is present
-        // rather than as a file that is not.
-        let linked = std::fs::symlink_metadata(link_path(root)).is_ok();
-        Ok(linked && unit_path(root).is_file())
+        let link = link_path(root);
+        // `symlink_metadata` first, so a dangling link reads as a link that is
+        // present rather than as a file that is not; `metadata` then follows it,
+        // which is the question being asked — is there a unit at the other end.
+        Ok(std::fs::symlink_metadata(&link).is_ok() && std::fs::metadata(&link).is_ok())
     }
+
+    /// How long to wait for the reload before giving up on it.
+    ///
+    /// A reload of a healthy user instance takes tens of milliseconds. A wedged
+    /// one can sit on the D-Bus method call for its full ~25s timeout, and the
+    /// caller of this is a synchronous request the engine is waiting on, so an
+    /// unbounded wait is a stall of the whole agent. Seconds rather than
+    /// milliseconds because a loaded machine is slow, not broken.
+    const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
     /// Ask systemd to re-read the unit directory, if there is one listening.
     ///
-    /// Deliberately silent about failing. There is no user systemd instance in a
-    /// container, on a CI runner, or over a bare SSH session, and on all three
-    /// the registration itself is still perfectly valid — it takes effect at the
-    /// next login either way. Treating "no bus to talk to" as a failed
-    /// registration would make `--install` fail in exactly the environments
-    /// where it has nothing to do.
+    /// Deliberately silent about failing, and bounded. There is no user systemd
+    /// instance in a container, on a CI runner, or over a bare SSH session, and
+    /// on all three the registration itself is still perfectly valid — it takes
+    /// effect at the next login either way. Treating "no bus to talk to" as a
+    /// failed registration would make `--install` fail in exactly the
+    /// environments where it has nothing to do, and a reload that never returns
+    /// is the same non-event: the files are already on disk.
     pub fn daemon_reload() {
-        let _ = std::process::Command::new("systemctl")
+        let child = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .spawn();
+        let Ok(mut child) = child else { return };
+
+        // Polled rather than waited on: a bounded wait for a child otherwise
+        // needs either a signal handler or another crate, and this is a courtesy
+        // call with nothing to report.
+        let deadline = std::time::Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Err(_) => return,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // Killed and reaped, so a stuck `systemctl` neither holds this thread
+        // nor is left behind as a zombie for the rest of the agent's life.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -779,7 +839,7 @@ mod tests {
         let unit = linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent"));
 
         assert!(
-            unit.contains("ExecStart=/usr/bin/wx-agent"),
+            unit.contains("ExecStart=\"/usr/bin/wx-agent\""),
             "the binary path is substituted:\n{unit}"
         );
         assert!(
@@ -804,19 +864,23 @@ mod tests {
         );
     }
 
-    /// A path with a space in it must survive into the unit intact.
+    /// A path with a space in it must reach systemd as one argument.
     ///
-    /// systemd splits `ExecStart` on whitespace, so an unquoted path containing
-    /// one silently becomes a different command — the Linux twin of the quoting
-    /// bug the Windows `command_line` guards against. This asserts the state of
-    /// affairs rather than a fix: the agent installed from the `.deb` lives at
-    /// `/usr/bin/wx-agent`, and a developer whose checkout has a space in its
-    /// path is the case that would need quoting.
+    /// systemd splits `ExecStart` on whitespace, so an unquoted
+    /// `/opt/win xtend/wx-agent` becomes the command `/opt/win` with
+    /// `xtend/wx-agent` as its argument: it fails at every login, silently, while
+    /// the registration still reads as present. The packaged agent at
+    /// `/usr/bin/wx-agent` never sees it, but `--install` is reachable from the
+    /// UI on any machine, and `~/Downloads/WinXtend 0.1.0/wx-agent` is an
+    /// ordinary place to have unpacked one.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_unit_records_the_exact_path_it_was_given() {
+    fn a_path_with_a_space_stays_one_argument() {
         let unit = linux_impl::unit_text(std::path::Path::new("/opt/win xtend/wx-agent"));
-        assert!(unit.contains("ExecStart=/opt/win xtend/wx-agent"), "{unit}");
+        assert!(
+            unit.contains("ExecStart=\"/opt/win xtend/wx-agent\""),
+            "{unit}"
+        );
     }
 
     /// Enabling means the symlink `systemctl --user enable` would have made, in
@@ -864,6 +928,44 @@ mod tests {
         // that is already there.
         linux_impl::install_in(root).unwrap();
         assert!(linux_impl::is_registered_in(root).unwrap());
+    }
+
+    /// Enabling the unit the `.deb` ships counts as registered.
+    ///
+    /// `systemctl --user enable winxtend.service` against
+    /// `/usr/lib/systemd/user/winxtend.service` creates the `.wants` link and
+    /// nothing else — no unit is written under the user's own config root. A
+    /// check that demanded one there reported that as "not registered" while
+    /// systemd would in fact start the agent at the next login, which is the
+    /// stale-config failure this module exists to prevent, inverted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enabling_the_packaged_unit_counts_as_registered() {
+        let root = TempRoot::new("packaged");
+        let root = root.path();
+
+        // Standing in for `/usr/lib/systemd/user/winxtend.service`: outside the
+        // config root, which is the whole point, but inside the temporary
+        // directory so the test writes nothing the machine keeps.
+        let packaged = root.join("usr-lib-winxtend.service");
+        std::fs::write(
+            &packaged,
+            linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")),
+        )
+        .unwrap();
+
+        let link = linux_impl::link_path(root);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&packaged, &link).unwrap();
+
+        assert!(
+            !linux_impl::unit_path(root).exists(),
+            "enabling the packaged unit writes nothing under the config root"
+        );
+        assert!(
+            linux_impl::is_registered_in(root).unwrap(),
+            "a link resolving to the packaged unit will start the agent"
+        );
     }
 
     /// Registering must work on a user who has never had a systemd user

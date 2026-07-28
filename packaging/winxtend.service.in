@@ -1,8 +1,10 @@
 # WinXtend agent, as a systemd *user* unit.
 #
 # This is a template, not a unit: `@EXEC_START@` is replaced with the absolute
-# path of the agent binary. There are two substituters and they must agree,
-# which is why there is one template rather than two unit files:
+# path of the agent binary, double-quoted so that a path containing a space is
+# one argument rather than a command and an argument. There are two substituters
+# and they must agree, which is why there is one template rather than two unit
+# files:
 #
 #   * `wx-agent --install` (crates/wx-agent/src/autostart.rs) `include_str!`s
 #     this file and writes the result to

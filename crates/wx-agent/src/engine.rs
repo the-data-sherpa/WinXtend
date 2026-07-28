@@ -2866,10 +2866,17 @@ impl Engine {
     /// exists to avoid, arrived at from the other direction: the UI would report
     /// that the agent starts with the session, and it would not.
     async fn set_autostart(&mut self, enabled: bool) -> Response {
-        // On the blocking pool, not here. Registering writes files and then runs
+        // On the blocking pool, because registering writes files and then runs
         // `systemctl --user daemon-reload`, which re-reads every unit on the
-        // machine; this task is the one routing keystrokes, and a peer driving
-        // this machine must not stutter because someone clicked a checkbox.
+        // machine — synchronous work that would otherwise occupy a runtime
+        // worker thread and stall every other task scheduled on it.
+        //
+        // It does not make this free. The wake loop is serialized and awaits
+        // this call, so a toggle does briefly delay input routing for the peer
+        // being driven; `spawn_blocking` moves where the waiting happens, not
+        // whether it happens. What keeps that delay bounded is
+        // [`crate::autostart::linux_impl::daemon_reload`] giving up on a wedged
+        // `systemctl` after a few seconds rather than waiting on it forever.
         let outcome = tokio::task::spawn_blocking(move || {
             if enabled {
                 autostart::install().map(|exe| {

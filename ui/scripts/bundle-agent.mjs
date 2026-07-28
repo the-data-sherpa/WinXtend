@@ -81,9 +81,20 @@ function placeSidecar(agent, triple) {
   return target;
 }
 
+// The path as a single `ExecStart` word. systemd splits that directive on
+// whitespace, so a path containing a space becomes a different command that
+// fails at every login and says nothing. `/usr/bin/wx-agent` has none, but this
+// must render identically to `linux_impl::quoted` in
+// `crates/wx-agent/src/autostart.rs` — the two substituters sharing one template
+// is the whole reason there is a template — so it quotes unconditionally too,
+// escaping the backslash and the double quote systemd reads inside the quotes.
+function quoted(path) {
+  return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
 function generateUnit() {
   const template = readFileSync(join(repo, "packaging", "winxtend.service.in"), "utf8");
-  const unit = template.replaceAll("@EXEC_START@", INSTALLED_AGENT);
+  const unit = template.replaceAll("@EXEC_START@", quoted(INSTALLED_AGENT));
   if (unit.includes("@EXEC_START@")) throw new Error("the unit template still has a placeholder in it");
   const target = join(repo, "packaging", "winxtend.service");
   writeFileSync(target, unit);
