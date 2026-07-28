@@ -165,12 +165,15 @@ pub struct NodeConfig {
     /// which is a poor label but a familiar one; the user renames it once.
     #[serde(default = "default_node_name")]
     pub name: String,
-    /// Whether the agent has been registered to start with the session.
+    /// What this agent last registered with the OS, not what the OS currently
+    /// says.
     ///
-    /// Recorded here as well as in the OS so that `--status` can report it
-    /// without needing to read the registry, and so that an OS-level uninstall
-    /// (a wiped profile, a reimaged machine) does not leave the config claiming
-    /// something untrue for long — the agent reconciles it at startup.
+    /// The registration itself is the authority — a `.wants` symlink on Linux,
+    /// an `HKCU\…\Run` value on Windows — and anything else on the machine can
+    /// remove it, so what `--status` and the UI report is read from the OS on
+    /// every request. See `ipc::StatusSnapshot::autostart`. This field is only
+    /// the fallback for a platform that has no mechanism to ask, where it can
+    /// mean nothing more than "the user asked".
     #[serde(default)]
     pub autostart: bool,
 }

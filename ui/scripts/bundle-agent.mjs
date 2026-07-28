@@ -21,8 +21,9 @@
 //     unit text in the tree; `crates/wx-agent/src/autostart.rs` `include_str!`s
 //     the same template for the copy `--install` writes.
 //
-// Run through `npm run tauri:build`, and by `beforeBuildCommand`, so that
-// `tauri build` alone cannot produce a bundle with no daemon in it.
+// Run directly as `npm run bundle:agent`, and by `beforeBuildCommand` — which is
+// `npm run build:bundle` — so that `tauri build` alone cannot produce a bundle
+// with no daemon in it.
 
 import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";

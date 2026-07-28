@@ -202,7 +202,7 @@ for what the next release is about.
 | Visual layout editor | ✅ |
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
-| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built and its contents checked in CI; not yet installed on a clean machine |
+| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
 | Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand |
 | Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
 | File transfer | ❌ not implemented, and no longer advertised |
