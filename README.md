@@ -37,7 +37,9 @@ layout editor.
 >   is active the compositor sends this agent every keystroke and local windows
 >   none of them, which was measured rather than assumed. Each capability appears
 >   only while its own portal session is granted and goes away the moment it is
->   not, and they can be refused independently. The clipboard platform layer works
+>   not, and they can be refused independently; injection is advertised more
+>   narrowly still, only once the `libei` devices that carry it have arrived and
+>   been resumed a moment after the grant. The clipboard platform layer works
 >   too, over `org.freedesktop.portal.Clipboard` — the only route to a selection on
 >   this desktop, because Mutter offers neither `wlr-data-control` nor its
 >   standardised successor and `wl_data_device` fails silently in both directions
