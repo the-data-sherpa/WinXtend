@@ -267,6 +267,17 @@ impl ClipboardSync {
         self.seen.as_ref().map(|s| s.serial)
     }
 
+    /// The write-back guard as it stands: the format written and the serial the
+    /// write produced.
+    ///
+    /// Exposed because the read [`ClipboardSync::observe`] may need is a blocking
+    /// one, and blocking is not allowed where `observe` is called from. The caller
+    /// asks this first, does the read elsewhere, and hands the answer back as the
+    /// `digest` closure — so the decision is still made here and only the I/O moved.
+    pub fn armed(&self) -> Option<(ClipboardFormat, u64)> {
+        self.write_back.map(|w| (w.format, w.serial))
+    }
+
     /// Decide what a change serial and format list mean.
     ///
     /// `digest` is called at most once, and only when telling a write-back from a

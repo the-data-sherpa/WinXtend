@@ -25,6 +25,16 @@
 //! [`wx_core::RouteAction`](wx_core::RouteAction) requires — releases, then yield,
 //! then handoff — which sending each message on its own task would not.
 //!
+//! Blocking clipboard work is the other exception, for the same reason and with a
+//! worse worst case. Reading the clipboard on Wayland is a portal round trip and a
+//! pipe transfer with a ten-second ceiling, and zstd over tens of megabytes is not
+//! free either; run here, the cost is the user's keyboard doing nothing for the
+//! duration, which on a KVM is the worst failure this program has. It runs on a
+//! thread that owns the platform backend and no engine state at all, and reports
+//! back as an ordinary [`Wake`] — so what the single-loop design actually promises
+//! is kept: every piece of engine state is owned by this task, with no lock around
+//! any of it. See [`spawn_clipboard_worker`].
+//!
 //! # The two things most likely to be got wrong
 //!
 //! * **Not injecting what the OS already delivered.** While the cursor is on this
@@ -228,6 +238,16 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// user their cursor.
 const CLIPBOARD_QUEUE_DEPTH: usize = 8;
 
+/// How many blocking clipboard jobs may be waiting for the worker thread.
+///
+/// Shallow for the same reason [`CLIPBOARD_QUEUE_DEPTH`] is, and one step further:
+/// a full queue here means the OS clipboard itself has stopped answering, and the
+/// useful response is to drop the job rather than to hold megabytes of payload
+/// waiting for a portal that may never reply. Deep enough that one peer's transfer
+/// in flight does not cost the next peer's, shallow enough that a wedged backend
+/// cannot accumulate work.
+const CLIPBOARD_JOB_DEPTH: usize = 4;
+
 /// How many events arrived from one peer may wait for the engine at once.
 ///
 /// The transport caps its own queue for exactly this reason, but the pump used to
@@ -305,8 +325,95 @@ enum Wake {
     Probe,
     /// Check whether anything was copied on this machine.
     ClipboardPoll,
+    /// Blocking clipboard work finished. See [`spawn_clipboard_worker`].
+    Clipboard(ClipboardDone),
     /// Ctrl-C, a service stop, or an IPC shutdown request.
     Shutdown,
+}
+
+/// Clipboard work that must not run on the engine loop.
+///
+/// Everything here either blocks on the OS or spends real CPU on a payload of up
+/// to [`MAX_CLIPBOARD_BYTES`]. Each job carries the decision the loop already made
+/// and nothing else — no engine state crosses to the worker, and none comes back
+/// except as a [`ClipboardDone`] the loop applies itself.
+enum ClipboardJob {
+    /// Sample the clipboard, reading the write-back format only if telling this
+    /// machine's own write from a real copy still needs the bytes.
+    Poll {
+        /// The serial the loop has already accounted for.
+        seen: Option<u64>,
+        /// The write-back guard, from [`ClipboardSync::armed`].
+        armed: Option<(ClipboardFormat, u64)>,
+    },
+    /// Read and pack the content a peer asked for.
+    Serve {
+        node: NodeId,
+        format: ClipboardFormat,
+        serial: u64,
+    },
+    /// Unpack a peer's payload and put it on this machine's clipboard.
+    Accept {
+        node: NodeId,
+        format: ClipboardFormat,
+        compression: Compression,
+        data: Vec<u8>,
+    },
+}
+
+/// A payload read from the clipboard and made ready for the wire.
+struct Packed {
+    compression: Compression,
+    payload: Vec<u8>,
+    /// Size before compression, for the log line that says what the transfer cost.
+    read: usize,
+}
+
+/// What the clipboard worker hands back to the loop.
+enum ClipboardDone {
+    /// The poll found nothing for the loop to decide: either the clipboard could
+    /// not be sampled — ordinary on a Wayland session whose clipboard grant was
+    /// refused — or the serial has not moved, which is the usual answer.
+    NothingNew,
+    Polled {
+        serial: u64,
+        formats: Vec<ClipboardFormat>,
+        /// Fingerprint of the write-back format, if it was worth reading.
+        digest: Option<u64>,
+    },
+    /// `None` for anything that could not be served — an unreadable clipboard, or
+    /// content too large for the protocol. Both are answered `ClipboardStale`.
+    Served {
+        node: NodeId,
+        format: ClipboardFormat,
+        serial: u64,
+        packed: Option<Packed>,
+    },
+    /// A peer's payload is unpacked and the write is about to start.
+    ///
+    /// Sent *before* the write rather than with its result, and that ordering is
+    /// the whole of the echo suppression: the guard has to be armed before the
+    /// change it suppresses can be observed. Both this and [`Wake::ClipboardPoll`]
+    /// arrive on the one wake queue in send order, so a poll that could see the
+    /// write is necessarily behind this message and the guard is up by the time it
+    /// is handled.
+    Writing {
+        format: ClipboardFormat,
+        digest: u64,
+    },
+    Wrote {
+        node: NodeId,
+        format: ClipboardFormat,
+        bytes: usize,
+        /// The serial the write produced, where the backend could report one.
+        serial: Option<u64>,
+    },
+    /// The payload never reached the clipboard, so there is nothing of ours on it.
+    NotWritten {
+        /// Whether [`ClipboardDone::Writing`] was already sent for this payload,
+        /// which decides whether a guard is standing that must now be cleared.
+        armed: bool,
+    },
 }
 
 struct NewSession {
@@ -720,6 +827,16 @@ pub struct Engine {
     driven_by: DrivenBy,
     /// Clipboard offer/request state. See [`crate::clipboard`].
     clipboard: ClipboardSync,
+    /// Where blocking clipboard work goes. See [`spawn_clipboard_worker`].
+    clipboard_jobs: std::sync::mpsc::SyncSender<ClipboardJob>,
+    /// Whether a poll is already with the worker, so a ticker faster than the OS
+    /// clipboard cannot stack polls up behind a transfer.
+    ///
+    /// Latched by a worker that has stopped answering at all, which is the one
+    /// thing that would silence local polling for good. Not guarded here because
+    /// the same worker also carries every serve and every write, and those are not
+    /// gated on this — a dead worker says so loudly on the next of either.
+    clipboard_polling: bool,
     last_owner: NodeId,
     /// Host firewall warning, decided once at startup and then reported for the
     /// life of the run. Held rather than recomputed per status request because
@@ -844,7 +961,10 @@ impl Engine {
         // so it is the one caller allowed to acquire OS permissions — on Wayland,
         // the portal consent dialog — and the config directory is where the backend
         // keeps what it needs between runs.
-        let platform = wx_platform::current_platform_in(&config_dir)?;
+        let mut platform = wx_platform::current_platform_in(&config_dir)?;
+        // Moved out of the backend at once, because from here on the clipboard is
+        // only ever touched by the worker thread. See [`spawn_clipboard_worker`].
+        let clipboard_jobs = spawn_clipboard_worker(platform.take_clipboard(), wake.clone())?;
         let monitors = platform.displays.monitors().unwrap_or_else(|e| {
             // Not fatal. A node with no readable displays still forwards input to
             // its peers, and taking the whole machine out of the mesh over a
@@ -946,6 +1066,8 @@ impl Engine {
             swallow_release: None,
             driven_by: DrivenBy::default(),
             clipboard: ClipboardSync::new(),
+            clipboard_jobs,
+            clipboard_polling: false,
             last_owner: local,
             // Against the port actually bound, not the configured one: the two
             // differ when the config asks for port 0, and advice naming a port
@@ -1179,6 +1301,7 @@ impl Engine {
             Wake::Tick => self.on_tick().await,
             Wake::Probe => self.probe_cursor_owner().await,
             Wake::ClipboardPoll => self.poll_clipboard(),
+            Wake::Clipboard(done) => self.on_clipboard_done(done),
             Wake::Shutdown => self.shutting_down = true,
         }
     }
@@ -1511,26 +1634,30 @@ impl Engine {
         //
         // Measured on this desktop: alpha's grant landed two seconds before bravo
         // connected, so bravo spent the whole session believing alpha could not take
-        // clipboard content, and refused to offer it any. Cheap to prevent — the
-        // receiving side's `set_peer_capabilities` is a no-op when nothing changed,
-        // so a peer whose snapshot was current pays one small message and logs
+        // clipboard content, and refused to offer it any.
+        //
+        // Sent unconditionally rather than only when it looks stale, because there
+        // is nothing here to compare it against: `info` is what the *peer* said
+        // about itself, and the snapshot this machine actually handed over is a
+        // clone the accept loop made and nobody kept. Comparing against the peer's
+        // own set is worse than not comparing at all — on two identically configured
+        // machines it matches, the correction is skipped, and the stale snapshot
+        // stands for the whole session. The cost of always sending is one small
+        // control message per session: the receiver's `set_peer_capabilities` is a
+        // no-op when nothing changed, so a peer whose snapshot was current logs
         // nothing.
-        let capabilities = self.advertised_by(self.local);
-        if needs_capability_correction(
-            info.capabilities,
-            capabilities,
-            self.peer_supports(node, Capabilities::CAPABILITY_UPDATES),
-        ) {
-            tracing::info!(
+        //
+        // Only to a peer that can decode it, which is what `CAPABILITY_UPDATES`
+        // says: a variant a build does not have is a decode error, and a decode
+        // error on the control stream closes the session.
+        let local = self.advertised_by(self.local);
+        if let Some(correction) = capability_correction(self.advertised_by(node), local) {
+            tracing::debug!(
                 peer = %node,
-                handshake = %info.capabilities.describe(),
-                now = %capabilities.describe(),
-                "this machine changed what it can do since the handshake; telling the peer"
+                local = %local.describe(),
+                "telling a peer what this machine can do now"
             );
-            self.send_to(
-                node,
-                Outbound::Control(ControlMsg::CapabilitiesChanged { capabilities }),
-            );
+            self.send_to(node, Outbound::Control(correction));
         }
 
         // A machine with a place in the layout that cannot take input is the exact
@@ -1863,6 +1990,15 @@ impl Engine {
         self.gates.remove(&node);
         self.last_heard.remove(&node);
         self.pending.remove(&node);
+        // The request outstanding with that peer dies with the session, and leaving
+        // it recorded is not merely untidy. It would let the peer's *next* session
+        // set this machine's clipboard with no offer in front of it, because a
+        // `ClipboardData` matching the remembered (serial, format) still answers a
+        // request nothing is waiting for. It also strands the reverse case: the
+        // change serial is process-local and restarts at zero, so a restarted peer
+        // re-offering the same pair would be deduplicated against a request that no
+        // longer exists and never asked about again.
+        self.clipboard.settled(node);
         // Not unconditionally: a code generated for a dial that is still in flight
         // belongs to the *next* connection, not the one that just died. See
         // [`OfferedPins`] — clearing it here broke every restarted pairing.
@@ -2983,35 +3119,33 @@ impl Engine {
             // moment it connects.
             return;
         }
-        let serial = match self.platform.clipboard.change_serial() {
-            Ok(serial) => serial,
-            Err(e) => {
-                // Ordinary on a Wayland session whose clipboard grant was refused.
-                tracing::trace!(error = %e, "the clipboard cannot be polled");
-                return;
-            }
-        };
-        if self.clipboard.serial() == Some(serial) {
+        if self.clipboard_polling {
+            // One poll in flight at a time. The ticker is faster than a portal
+            // round trip on purpose, and stacking polls behind a slow one would
+            // answer a question that has already been answered — while filling the
+            // worker's queue ahead of a transfer somebody is waiting on.
             return;
         }
+        // Both operands of the write-back decision are read here, on the loop, and
+        // travel with the job; the worker does the I/O and hands the answer back.
+        // See [`ClipboardSync::armed`].
+        let job = ClipboardJob::Poll {
+            seen: self.clipboard.serial(),
+            armed: self.clipboard.armed(),
+        };
+        self.clipboard_polling = self.dispatch_clipboard(job);
+    }
 
-        let formats = self
-            .platform
-            .clipboard
-            .available_formats()
-            .unwrap_or_else(|e| {
-                tracing::debug!(error = %e, "could not list clipboard formats");
-                Vec::new()
-            });
-
-        // Disjoint field borrows: the state machine is asked for a decision while
-        // holding a way to read the clipboard, and it only reads when telling this
-        // machine's own write-back from a real copy needs the bytes.
-        let sync = &mut self.clipboard;
-        let access = &self.platform.clipboard;
-        let change = sync.observe(serial, &formats, |format| {
-            access.read(format).ok().map(|b| clipboard::fingerprint(&b))
-        });
+    /// Apply what the worker saw on the local clipboard.
+    fn on_clipboard_polled(
+        &mut self,
+        serial: u64,
+        formats: Vec<ClipboardFormat>,
+        digest: Option<u64>,
+    ) {
+        // The fingerprint is already taken, so the closure only hands it over. The
+        // state machine still decides whether it mattered.
+        let change = self.clipboard.observe(serial, &formats, |_| digest);
 
         match change {
             LocalChange::Unchanged => {}
@@ -3031,6 +3165,70 @@ impl Engine {
                 tracing::debug!(serial, "the clipboard changed to nothing this build syncs");
             }
             LocalChange::Offer { serial, formats } => self.offer_clipboard(serial, &formats),
+        }
+    }
+
+    /// Apply the result of a blocking clipboard job.
+    ///
+    /// Every arm is a state change the worker could not make itself, because the
+    /// state is here and nowhere else. That is the trade the worker exists to make:
+    /// it does the waiting, the loop keeps the ownership.
+    fn on_clipboard_done(&mut self, done: ClipboardDone) {
+        match done {
+            ClipboardDone::NothingNew => self.clipboard_polling = false,
+            ClipboardDone::Polled {
+                serial,
+                formats,
+                digest,
+            } => {
+                self.clipboard_polling = false;
+                self.on_clipboard_polled(serial, formats, digest);
+            }
+            ClipboardDone::Served {
+                node,
+                format,
+                serial,
+                packed,
+            } => self.on_clipboard_served(node, format, serial, packed),
+            ClipboardDone::Writing { format, digest } => self.clipboard.writing(format, digest),
+            ClipboardDone::Wrote {
+                node,
+                format,
+                bytes,
+                serial,
+            } => {
+                tracing::info!(peer = %node, ?format, bytes, "took the clipboard from a peer");
+                if let Some(serial) = serial {
+                    self.clipboard.wrote(serial);
+                }
+            }
+            ClipboardDone::NotWritten { armed } => {
+                if armed {
+                    // The guard was put up for a write that never happened, so
+                    // there is nothing of this machine's on the clipboard to
+                    // suppress and leaving it standing would swallow the user's
+                    // next copy of the same content.
+                    self.clipboard.write_failed();
+                }
+            }
+        }
+    }
+
+    /// Hand a blocking clipboard job to the worker. `false` if it never left.
+    ///
+    /// Never blocks, for the reason the whole worker exists: waiting for room here
+    /// would put the stall back on the loop it was moved off.
+    fn dispatch_clipboard(&self, job: ClipboardJob) -> bool {
+        match self.clipboard_jobs.try_send(job) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::warn!("the clipboard backend is not keeping up; dropping a clipboard job");
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::debug!("the clipboard worker has stopped; dropping a clipboard job");
+                false
+            }
         }
     }
 
@@ -3152,15 +3350,26 @@ impl Engine {
             return;
         }
 
-        let data = match self.platform.clipboard.read(format) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!(peer = %node, error = %e, ?format, "could not read the clipboard for a peer");
-                let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
-                return;
-            }
-        };
+        // The read and the compression happen on the worker; what comes back is
+        // handled by `on_clipboard_served`. A job that never left is refused here
+        // rather than left unanswered, like every other branch above.
+        if !self.dispatch_clipboard(ClipboardJob::Serve {
+            node,
+            format,
+            serial,
+        }) {
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+        }
+    }
 
+    /// The worker has been to the clipboard on a peer's behalf.
+    fn on_clipboard_served(
+        &mut self,
+        node: NodeId,
+        format: ClipboardFormat,
+        serial: u64,
+        packed: Option<Packed>,
+    ) {
         // Re-checked after the read, not only before it. The read is not atomic
         // with the check that authorised it, and content that changed underneath
         // would otherwise be sent as an answer to a request for something else —
@@ -3170,28 +3379,28 @@ impl Engine {
             let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
             return;
         }
-
-        if data.len() > MAX_CLIPBOARD_BYTES {
-            // The frame writer would refuse this and, on the shared control stream,
-            // take the session with it. Said out loud and answered honestly instead.
-            tracing::warn!(
-                peer = %node,
-                bytes = data.len(),
-                limit = MAX_CLIPBOARD_BYTES,
-                ?format,
-                "the clipboard holds more than the protocol carries; refusing to send it"
-            );
+        // And re-checked for permission, because the read is not atomic with that
+        // either: the user can switch this peer's clipboard off, or unpair it,
+        // while the payload is being lifted off the OS.
+        if !self.clipboard_shared_with(node) {
+            tracing::info!(peer = %node, "not serving the clipboard: sharing is off for this machine");
             let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
             return;
         }
+        let Some(packed) = packed else {
+            // Unreadable, or larger than the protocol carries. The worker named
+            // which; what matters here is that the peer is told rather than left
+            // waiting.
+            let _ = self.send_clipboard_to(node, ControlMsg::ClipboardStale { serial });
+            return;
+        };
 
-        let (compression, payload) = clipboard::compress(format, &data);
         tracing::debug!(
             peer = %node,
             serial,
             ?format,
-            bytes = data.len(),
-            sent = payload.len(),
+            bytes = packed.read,
+            sent = packed.payload.len(),
             "serving the clipboard"
         );
         let _ = self.send_clipboard_to(
@@ -3199,8 +3408,8 @@ impl Engine {
             ControlMsg::ClipboardData {
                 format,
                 serial,
-                compression,
-                data: payload,
+                compression: packed.compression,
+                data: packed.payload,
             },
         );
     }
@@ -3237,30 +3446,19 @@ impl Engine {
             return;
         }
 
-        let payload = match clipboard::decompress(compression, &data) {
-            Ok(payload) => payload,
-            Err(e) => {
-                tracing::warn!(peer = %node, error = %e, "discarding a clipboard payload");
-                return;
-            }
-        };
-
-        // Armed before the write, so no ordering of the write and the backend's own
-        // change notification can slip an offer of this content back at the peer
-        // that sent it. See [`crate::clipboard`].
-        self.clipboard
-            .writing(format, clipboard::fingerprint(&payload));
-        match self.platform.clipboard.write(format, &payload) {
-            Ok(()) => {
-                tracing::info!(peer = %node, ?format, bytes = payload.len(), "took the clipboard from a peer");
-                if let Ok(serial) = self.platform.clipboard.change_serial() {
-                    self.clipboard.wrote(serial);
-                }
-            }
-            Err(e) => {
-                self.clipboard.write_failed();
-                tracing::warn!(peer = %node, error = %e, ?format, "could not write the clipboard");
-            }
+        // Decompression and the write itself are the worker's, and it reports the
+        // write-back guard back here *before* the write lands — see
+        // [`ClipboardDone::Writing`], which is where the ordering that makes echo
+        // suppression work is spelled out.
+        if !self.dispatch_clipboard(ClipboardJob::Accept {
+            node,
+            format,
+            compression,
+            data,
+        }) {
+            // Nothing to answer: the peer sent what it was asked for and is not
+            // waiting on a reply. The paste is lost and the session is not.
+            tracing::warn!(peer = %node, ?format, "dropping clipboard content this machine cannot write just now");
         }
     }
 
@@ -3592,19 +3790,30 @@ fn spawn_sender(session: Session) -> mpsc::Sender<Outbound> {
     tx
 }
 
-/// Whether a peer's idea of this machine, taken at the handshake, is already out of
-/// date.
+/// What to tell a peer about this machine when its session comes up.
 ///
-/// Only when the peer can be told: a build that never advertised
-/// `CAPABILITY_UPDATES` cannot decode the message, and a control message a peer
-/// cannot decode closes the session rather than informing it. See
+/// `local` is this machine's current set, and it is the only capability set this
+/// message ever carries. Stated as a rule because getting it wrong is invisible:
+/// the peer's own set is right there at the call site, it is the same shape, and
+/// sending it would look like it worked.
+///
+/// Unconditional, because there is nothing sound to make it conditional on. What
+/// the peer was told at the handshake was a clone of `local_info` the accept loop
+/// made before it awaited the connection, and nothing keeps it; the peer's own
+/// advertised set answers a different question entirely. Skipping the message when
+/// the two machines happen to agree with each other leaves the peer holding a
+/// snapshot that may predate this machine's portal grant for the rest of the
+/// session.
+///
+/// `None` only for a peer that never claimed to understand the message: a variant
+/// a build does not have is a decode error, and a decode error on the control
+/// stream closes the session rather than informing it. See
 /// [`Engine::broadcast_control_capable`].
-fn needs_capability_correction(
-    handshake: Capabilities,
-    now: Capabilities,
-    peer_understands_updates: bool,
-) -> bool {
-    peer_understands_updates && handshake != now
+fn capability_correction(peer: Capabilities, local: Capabilities) -> Option<ControlMsg> {
+    peer.contains(Capabilities::CAPABILITY_UPDATES)
+        .then_some(ControlMsg::CapabilitiesChanged {
+            capabilities: local,
+        })
 }
 
 /// Whether clipboard content may cross to a machine at all.
@@ -3621,6 +3830,185 @@ fn needs_capability_correction(
 /// this machine sends.
 fn clipboard_sharing_permitted(has_session: bool, reachable: bool, enabled_for_peer: bool) -> bool {
     has_session && reachable && enabled_for_peer
+}
+
+/// Run the blocking half of clipboard sync on a thread of its own.
+///
+/// # Why a thread, and why it owns the backend
+///
+/// [`ClipboardAccess`](wx_platform::traits::ClipboardAccess) is a blocking trait
+/// and the Wayland implementation means it: a read is a portal request with a
+/// ten-second ceiling followed by a pipe transfer of up to
+/// [`MAX_CLIPBOARD_BYTES`]. Left on the engine loop, serving one large image stops
+/// the user's keyboard, and a portal that stops answering stops it for ten
+/// seconds. That is not a slow paste; it is a dead KVM.
+///
+/// It is a thread rather than `spawn_blocking` because the trait is `Send` and not
+/// `Sync`, so somebody has to own the backend, and because one worker gives the
+/// serialisation the state machine already assumes — the OS clipboard is a single
+/// resource and two reads racing on it answer questions nobody asked.
+///
+/// # What it deliberately does not have
+///
+/// No engine state, no `Arc`, no lock. It holds the platform backend and a channel
+/// back to the loop, and every decision it makes is one the loop already made and
+/// put in the job. That is what keeps the single-owner property in this module's
+/// docs true while the bytes move somewhere else.
+fn spawn_clipboard_worker(
+    access: Box<dyn wx_platform::traits::ClipboardAccess>,
+    wake: mpsc::UnboundedSender<Wake>,
+) -> anyhow::Result<std::sync::mpsc::SyncSender<ClipboardJob>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ClipboardJob>(CLIPBOARD_JOB_DEPTH);
+    std::thread::Builder::new()
+        .name("wx-clipboard".into())
+        .spawn(move || {
+            let report = |done: ClipboardDone| wake.send(Wake::Clipboard(done)).is_ok();
+            for job in rx {
+                let carried_on = match job {
+                    ClipboardJob::Poll { seen, armed } => {
+                        report(sample_clipboard(&*access, seen, armed))
+                    }
+                    ClipboardJob::Serve {
+                        node,
+                        format,
+                        serial,
+                    } => report(serve_clipboard(&*access, node, format, serial)),
+                    ClipboardJob::Accept {
+                        node,
+                        format,
+                        compression,
+                        data,
+                    } => accept_clipboard(&*access, node, format, compression, &data, &report),
+                };
+                if !carried_on {
+                    // The loop is gone, so there is nobody to report to and nothing
+                    // left worth doing to the clipboard.
+                    return;
+                }
+            }
+        })?;
+    Ok(tx)
+}
+
+/// Look at the clipboard for [`Engine::poll_clipboard`].
+///
+/// The write-back format is read only when the answer could still change the
+/// verdict — the guard is armed, the serial has actually moved past the one the
+/// write produced, and the format is still on the clipboard — so the steady state
+/// costs one `change_serial` and nothing else.
+fn sample_clipboard(
+    access: &dyn wx_platform::traits::ClipboardAccess,
+    seen: Option<u64>,
+    armed: Option<(ClipboardFormat, u64)>,
+) -> ClipboardDone {
+    let serial = match access.change_serial() {
+        Ok(serial) => serial,
+        Err(e) => {
+            tracing::trace!(error = %e, "the clipboard cannot be polled");
+            return ClipboardDone::NothingNew;
+        }
+    };
+    if seen == Some(serial) {
+        return ClipboardDone::NothingNew;
+    }
+    let formats = access.available_formats().unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "could not list clipboard formats");
+        Vec::new()
+    });
+    let digest = armed
+        .filter(|(format, written)| *written != serial && formats.contains(format))
+        .and_then(|(format, _)| access.read(format).ok())
+        .map(|bytes| clipboard::fingerprint(&bytes));
+    ClipboardDone::Polled {
+        serial,
+        formats,
+        digest,
+    }
+}
+
+/// Read and compress the content a peer asked for.
+fn serve_clipboard(
+    access: &dyn wx_platform::traits::ClipboardAccess,
+    node: NodeId,
+    format: ClipboardFormat,
+    serial: u64,
+) -> ClipboardDone {
+    let refused = ClipboardDone::Served {
+        node,
+        format,
+        serial,
+        packed: None,
+    };
+    let data = match access.read(format) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(peer = %node, error = %e, ?format, "could not read the clipboard for a peer");
+            return refused;
+        }
+    };
+    if data.len() > MAX_CLIPBOARD_BYTES {
+        // The frame writer would refuse this and, on the shared control stream,
+        // take the session with it. Said out loud and answered honestly instead.
+        tracing::warn!(
+            peer = %node,
+            bytes = data.len(),
+            limit = MAX_CLIPBOARD_BYTES,
+            ?format,
+            "the clipboard holds more than the protocol carries; refusing to send it"
+        );
+        return refused;
+    }
+    let read = data.len();
+    let (compression, payload) = clipboard::compress(format, &data);
+    ClipboardDone::Served {
+        node,
+        format,
+        serial,
+        packed: Some(Packed {
+            compression,
+            payload,
+            read,
+        }),
+    }
+}
+
+/// Unpack a peer's payload and write it to this machine's clipboard.
+///
+/// Two reports rather than one, and the order is load-bearing: see
+/// [`ClipboardDone::Writing`]. Returns whether the loop is still listening.
+fn accept_clipboard(
+    access: &dyn wx_platform::traits::ClipboardAccess,
+    node: NodeId,
+    format: ClipboardFormat,
+    compression: Compression,
+    data: &[u8],
+    report: &impl Fn(ClipboardDone) -> bool,
+) -> bool {
+    let payload = match clipboard::decompress(compression, data) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(peer = %node, error = %e, "discarding a clipboard payload");
+            return report(ClipboardDone::NotWritten { armed: false });
+        }
+    };
+    if !report(ClipboardDone::Writing {
+        format,
+        digest: clipboard::fingerprint(&payload),
+    }) {
+        return false;
+    }
+    match access.write(format, &payload) {
+        Ok(()) => report(ClipboardDone::Wrote {
+            node,
+            format,
+            bytes: payload.len(),
+            serial: access.change_serial().ok(),
+        }),
+        Err(e) => {
+            tracing::warn!(peer = %node, error = %e, ?format, "could not write the clipboard");
+            report(ClipboardDone::NotWritten { armed: true })
+        }
+    }
 }
 
 /// Serialise one peer's clipboard traffic through a task of its own.
@@ -4185,7 +4573,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_is_corrected_when_the_handshake_snapshot_is_already_stale() {
+    fn a_peer_is_told_what_this_machine_can_do_and_not_what_it_said_itself() {
         // Measured on a real Wayland desktop while proving this slice out: the accept
         // loop clones `local_info` at the top of each iteration, *before* it awaits
         // the next connection, so the `NodeInfo` a peer receives can predate the
@@ -4194,19 +4582,36 @@ mod tests {
         // before the session existed. The peer then spends the whole session
         // believing this machine cannot take clipboard content, and refuses to offer
         // it any — which is what actually happened, in both directions.
-        let granted = Capabilities::HAS_DISPLAYS
+        let local = Capabilities::HAS_DISPLAYS
             | Capabilities::CLIPBOARD_TEXT
             | Capabilities::CAPABILITY_UPDATES;
-        let at_boot = Capabilities::HAS_DISPLAYS | Capabilities::CAPABILITY_UPDATES;
-        assert!(needs_capability_correction(at_boot, granted, true));
-        // Revocation is the same gap in reverse, and just as wrong to leave standing.
-        assert!(needs_capability_correction(granted, at_boot, true));
+        let peer = Capabilities::HAS_DISPLAYS | Capabilities::CAPABILITY_UPDATES;
 
-        // A snapshot that was already current costs one comparison and no message.
-        assert!(!needs_capability_correction(granted, granted, true));
-        // And a peer that never claimed it understands the message is never sent one:
-        // a variant its build lacks is a decode error, which closes the session.
-        assert!(!needs_capability_correction(at_boot, granted, false));
+        // What the message carries is this machine's set. The peer's is the wrong
+        // operand and the same shape, so nothing but an assertion catches the swap.
+        assert_eq!(
+            capability_correction(peer, local),
+            Some(ControlMsg::CapabilitiesChanged {
+                capabilities: local
+            })
+        );
+
+        // And it is sent even when the two machines agree, which is the case the
+        // comparison this replaced got wrong: two identically configured machines
+        // match each other while both hold a snapshot older than their own grants.
+        assert_eq!(
+            capability_correction(local, local),
+            Some(ControlMsg::CapabilitiesChanged {
+                capabilities: local
+            })
+        );
+
+        // A peer that never claimed it understands the message is never sent one: a
+        // variant its build lacks is a decode error, which closes the session.
+        assert_eq!(
+            capability_correction(Capabilities::HAS_DISPLAYS, local),
+            None
+        );
     }
 
     #[test]

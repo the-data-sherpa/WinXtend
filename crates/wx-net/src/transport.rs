@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | control (bidirectional) | initiator, first | handshake, then [`ControlMsg`] |
 //! | input (bidirectional) | initiator, second | [`InputFrame`]s that must not be lost |
-//! | clipboard (bidirectional) | initiator, third | the bulk [`ControlMsg`] variants |
+//! | clipboard (unidirectional) | either, on demand | the bulk [`ControlMsg`] variants |
 //! | (datagrams) | either | [`InputFrame`]s that may be dropped |
 //!
 //! Reliable input has its own stream rather than sharing the control stream on
@@ -81,8 +81,28 @@ const STREAM_TAG_INPUT: u8 = 1;
 /// lock, and a closed window blocks the first chunk exactly as it blocks the
 /// whole. The isolation has to come from QUIC, which means a second stream.
 ///
-/// Both directions ride this one bidirectional stream, exactly as input does: the
-/// initiator opens it, and each end writes its own half.
+/// # Why it is unidirectional, and opened only when there is something to send
+///
+/// Unlike control and input, this stream is **not** part of bringing a session up.
+/// Each end opens one of its own the first time it has a clipboard message to
+/// write, and reads whatever the peer opens; a session where neither end ever
+/// syncs the clipboard has no clipboard stream at all, and that is a normal
+/// outcome rather than a failure.
+///
+/// Both halves of that matter:
+///
+/// * **Not part of the handshake.** A peer built before this stream existed
+///   completes the handshake and then never opens one. Waiting for it there would
+///   hang [`establish`] against a build that is otherwise entirely compatible —
+///   capability bits gate features, the version guards the wire format, and this
+///   is a feature.
+/// * **Not gated on the handshake capability set either.** On Wayland the portal
+///   grant routinely lands *after* the handshake, so a peer's advertised clipboard
+///   support at that moment is a snapshot that is often already stale. A gate
+///   taken then would leave a peer that gains the capability a second later with
+///   no clipboard for the rest of the session. Opening on demand asks the question
+///   at the moment there is something to send, which is the only time the answer
+///   is current.
 const STREAM_TAG_CLIPBOARD: u8 = 2;
 
 /// How deep the per-session event queue is before backpressure applies.
@@ -113,6 +133,21 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// When a connection with no traffic at all is declared dead. Must be comfortably
 /// larger than [`KEEP_ALIVE`], or an idle session drops even while healthy.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a peer has to get from an accepted connection to a live session.
+///
+/// Covers the handshake and the streams that come up with it. It exists because
+/// none of those waits is bounded on its own: keepalives hold the QUIC idle
+/// timeout off indefinitely, so a peer that connects and then simply stops — a
+/// half-implemented build, or one that means to — otherwise waits forever. That is
+/// not only its own session's problem: [`Endpoint::accept`] finishes each
+/// connection before it looks at the next, so one such peer takes the whole
+/// inbound path with it and the agent stops accepting anybody.
+///
+/// Generous rather than tight. Nothing here waits on a human, but a first
+/// connection over a slow link crosses several round trips, and refusing a healthy
+/// peer is worse than tolerating a dead one for a few more seconds.
+const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -152,6 +187,8 @@ pub enum TransportError {
     HandshakeAbandoned,
     #[error("the peer opened an input stream with an unrecognised tag {0}")]
     UnknownStreamTag(u8),
+    #[error("the peer did not finish setting up the session within {0:?}")]
+    SetupTimedOut(Duration),
     #[error("the QUIC session produced no channel-binding material, so the handshake cannot be tied to it")]
     NoChannelBinding,
     #[error("the random number generator failed: {0}")]
@@ -220,14 +257,29 @@ impl Endpoint {
         Some(self.finish_accept(incoming, setup).await)
     }
 
+    /// Bounded as a whole, and not only in its parts.
+    ///
+    /// See [`SESSION_SETUP_TIMEOUT`]: this runs inline on the accept loop, so a
+    /// peer that stalls anywhere between the connection and a live session — the
+    /// control stream it never opens, the handshake reply it never sends, the
+    /// input stream it never brings up — would otherwise stop this agent accepting
+    /// anyone at all. One bound around the lot rather than one per await, because
+    /// the property that matters is about the whole path and a per-step timeout
+    /// leaves the next step to be found later.
     async fn finish_accept(
         &self,
         incoming: quinn::Incoming,
         setup: &SessionSetup<'_>,
     ) -> Result<(Session, Events), TransportError> {
-        let conn = incoming.await?;
-        let (send, recv) = conn.accept_bi().await?;
-        establish(conn, Role::Responder, setup, send, recv).await
+        let setup_session = async {
+            let conn = incoming.await?;
+            let (send, recv) = conn.accept_bi().await?;
+            establish(conn, Role::Responder, setup, send, recv).await
+        };
+        match tokio::time::timeout(SESSION_SETUP_TIMEOUT, setup_session).await {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::SetupTimedOut(SESSION_SETUP_TIMEOUT)),
+        }
     }
 
     /// Stop accepting and tell live peers we are going away.
@@ -256,15 +308,30 @@ async fn establish(
     let established =
         run_handshake(&conn, role, setup, nonce, &mut control_tx, &mut control_rx).await?;
 
-    // The initiator opens each stream and writes its tag immediately: an opened
-    // QUIC stream is invisible to the peer until something is written, so without
-    // the tag the responder's `accept_bi` would never return.
-    let ((input_tx, input_rx), (clipboard_tx, clipboard_rx)) = match role {
-        Role::Initiator => (
-            open_tagged(&conn, STREAM_TAG_INPUT).await?,
-            open_tagged(&conn, STREAM_TAG_CLIPBOARD).await?,
-        ),
-        Role::Responder => accept_tagged_streams(&conn).await?,
+    // The initiator opens the input stream and writes its tag immediately: an
+    // opened QUIC stream is invisible to the peer until something is written, so
+    // without the tag the responder's `accept_bi` would never return.
+    //
+    // The input stream, and only it. The clipboard is opened on demand and read
+    // wherever it turns up — see `STREAM_TAG_CLIPBOARD`, and `accept_bulk_streams`
+    // below.
+    let (input_tx, input_rx) = match role {
+        Role::Initiator => {
+            let (mut tx, rx) = conn.open_bi().await?;
+            tx.write_all(&[STREAM_TAG_INPUT]).await?;
+            (tx, rx)
+        }
+        Role::Responder => {
+            let (tx, mut rx) = conn.accept_bi().await?;
+            let mut tag = [0u8; 1];
+            rx.read_exact(&mut tag)
+                .await
+                .map_err(|_| TransportError::HandshakeAbandoned)?;
+            if tag[0] != STREAM_TAG_INPUT {
+                return Err(TransportError::UnknownStreamTag(tag[0]));
+            }
+            (tx, rx)
+        }
     };
 
     let inner = Arc::new(SessionInner {
@@ -272,70 +339,68 @@ async fn establish(
         established,
         control_tx: Mutex::new(control_tx),
         input_tx: Mutex::new(input_tx),
-        clipboard_tx: Mutex::new(clipboard_tx),
+        clipboard_tx: Mutex::new(None),
         seq: AtomicU64::new(1),
         dropped_datagrams: AtomicU64::new(0),
     });
 
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_DEPTH);
     tokio::spawn(read_control(control_rx, tx.clone()));
-    // The clipboard stream carries `ControlMsg` and is read by the same code: what
-    // differs between the two is only which writer can block the other, and that is
-    // settled by the time a message arrives.
-    tokio::spawn(read_control(clipboard_rx, tx.clone()));
     tokio::spawn(read_reliable_input(input_rx, tx.clone()));
+    tokio::spawn(accept_bulk_streams(conn.clone(), tx.clone()));
     tokio::spawn(read_datagrams(conn, tx, Arc::clone(&inner)));
 
     Ok((Session { inner }, Events { rx }))
 }
 
-/// Open a stream and say what it is for.
-async fn open_tagged(
-    conn: &quinn::Connection,
-    tag: u8,
-) -> Result<(quinn::SendStream, quinn::RecvStream), TransportError> {
-    let (mut tx, rx) = conn.open_bi().await?;
-    tx.write_all(&[tag]).await?;
-    Ok((tx, rx))
-}
-
-/// Accept the streams the initiator opens, sorted by their tags.
+/// Read whatever unidirectional streams the peer opens, for as long as it does.
 ///
-/// By tag rather than by arrival order. QUIC delivers streams in the order they
-/// were opened today, but nothing in the protocol requires an implementation to,
-/// and a mis-sorted pair would put input frames into the clipboard reader — which
-/// decodes them as `ControlMsg` and tears the session down on the first one. The
-/// tag exists precisely so the receiver does not have to guess.
-type TaggedPair = (
-    (quinn::SendStream, quinn::RecvStream),
-    (quinn::SendStream, quinn::RecvStream),
-);
-
-async fn accept_tagged_streams(conn: &quinn::Connection) -> Result<TaggedPair, TransportError> {
-    let mut input = None;
-    let mut clipboard = None;
-    while input.is_none() || clipboard.is_none() {
-        let (tx, mut rx) = conn.accept_bi().await?;
-        let mut tag = [0u8; 1];
-        rx.read_exact(&mut tag)
-            .await
-            .map_err(|_| TransportError::HandshakeAbandoned)?;
-        let slot = match tag[0] {
-            STREAM_TAG_INPUT => &mut input,
-            STREAM_TAG_CLIPBOARD => &mut clipboard,
-            other => return Err(TransportError::UnknownStreamTag(other)),
+/// A session's clipboard lane appears here rather than during setup, so that a
+/// peer which never opens one — an older build, or simply a machine nobody has
+/// copied anything on — costs nothing and is not an error. It runs for the life of
+/// the connection because a peer may gain the clipboard capability at any point,
+/// which on Wayland is the ordinary case and not an edge one.
+///
+/// Each stream is dispatched by its tag in a task of its own: a peer that opens a
+/// stream and never writes its tag must not be able to stall the next one, and a
+/// clipboard transfer of tens of megabytes holds up only itself.
+async fn accept_bulk_streams(
+    conn: quinn::Connection,
+    tx: mpsc::Sender<Result<SessionEvent, TransportError>>,
+) {
+    loop {
+        let rx = match conn.accept_uni().await {
+            Ok(rx) => rx,
+            // The connection is finished; the readers report the death.
+            Err(_) => return,
         };
-        if slot.is_some() {
-            // A second stream claiming a tag that is already filled. Refusing beats
-            // replacing: the first stream is the one the handshake is bound to.
-            return Err(TransportError::UnknownStreamTag(tag[0]));
-        }
-        *slot = Some((tx, rx));
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut tag = [0u8; 1];
+            if rx.read_exact(&mut tag).await.is_err() {
+                return;
+            }
+            match tag[0] {
+                // Carries `ControlMsg` and is read by the same code: what differs
+                // between this and the control stream is only which writer can
+                // block the other, and that is settled by the time a message
+                // arrives.
+                STREAM_TAG_CLIPBOARD => read_control(rx, tx).await,
+                other => {
+                    // Ignored rather than fatal, and the mirror image of opening on
+                    // demand: a peer built after this one may open a stream for
+                    // something this build has no reader for, and refusing the
+                    // whole session over a lane it simply does not use would make
+                    // every future addition a breaking change.
+                    tracing::debug!(
+                        tag = other,
+                        "ignoring a stream this build has no reader for"
+                    );
+                }
+            }
+        });
     }
-    Ok((
-        input.expect("the loop only exits once both are filled"),
-        clipboard.expect("the loop only exits once both are filled"),
-    ))
 }
 
 /// Keying material that identifies this TLS session and no other.
@@ -407,7 +472,9 @@ struct SessionInner {
     established: Established,
     control_tx: Mutex<quinn::SendStream>,
     input_tx: Mutex<quinn::SendStream>,
-    clipboard_tx: Mutex<quinn::SendStream>,
+    /// `None` until this end has something to put on it. See
+    /// [`STREAM_TAG_CLIPBOARD`].
+    clipboard_tx: Mutex<Option<quinn::SendStream>>,
     seq: AtomicU64,
     dropped_datagrams: AtomicU64,
 }
@@ -503,9 +570,22 @@ impl Session {
     /// not be able to hold up the messages that decide where the cursor is. The
     /// caller chooses — nothing here inspects the variant — because only the caller
     /// knows whether a given message is part of a bulk transfer.
+    ///
+    /// The first call opens the stream. That is what keeps a session with no
+    /// clipboard traffic free of one, and it is done under the same lock that
+    /// serialises the writes, so two messages racing to be first still produce one
+    /// stream and stay in order on it.
     pub async fn send_clipboard(&self, msg: &ControlMsg) -> Result<(), TransportError> {
         let bytes = encode_frame(msg)?;
         let mut stream = self.inner.clipboard_tx.lock().await;
+        let stream = match stream.as_mut() {
+            Some(stream) => stream,
+            None => {
+                let mut opened = self.inner.conn.open_uni().await?;
+                opened.write_all(&[STREAM_TAG_CLIPBOARD]).await?;
+                stream.insert(opened)
+            }
+        };
         stream.write_all(&bytes).await?;
         Ok(())
     }

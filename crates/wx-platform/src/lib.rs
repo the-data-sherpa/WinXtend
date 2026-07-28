@@ -66,7 +66,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use wx_proto::{Capabilities, DisplayServer, Platform};
+use wx_proto::{Capabilities, ClipboardFormat, DisplayServer, Platform};
 
 /// What a node advertises about itself in the handshake.
 ///
@@ -149,6 +149,53 @@ impl PlatformBackend {
     /// moment the portal session is revoked.
     pub fn current_capabilities(&self) -> Capabilities {
         self.live_capabilities.get()
+    }
+
+    /// Move the clipboard backend out, leaving one that refuses every call.
+    ///
+    /// For a caller that has to run clipboard work somewhere other than where it
+    /// holds this struct. The agent does: a portal read is a blocking pipe
+    /// transfer with a ten-second ceiling, and the loop it would otherwise run on
+    /// is the one carrying the user's keystrokes. That work needs a thread of its
+    /// own, and the thread has to *own* the backend, because [`ClipboardAccess`]
+    /// is `Send` and not `Sync`.
+    ///
+    /// What stays behind answers [`PlatformError::Unsupported`] rather than
+    /// panicking or doing nothing, so the field keeps the promise this struct
+    /// makes — every field present, every call answered — and a caller that
+    /// reaches for it afterwards gets a named error instead of silence.
+    pub fn take_clipboard(&mut self) -> Box<dyn ClipboardAccess> {
+        core::mem::replace(&mut self.clipboard, Box::new(DetachedClipboard))
+    }
+}
+
+/// The stand-in left behind by [`PlatformBackend::take_clipboard`].
+struct DetachedClipboard;
+
+impl DetachedClipboard {
+    fn moved_out<T>() -> Result<T> {
+        Err(PlatformError::Unsupported {
+            operation: "clipboard access",
+            backend: "detached",
+        })
+    }
+}
+
+impl ClipboardAccess for DetachedClipboard {
+    fn available_formats(&self) -> Result<Vec<ClipboardFormat>> {
+        Self::moved_out()
+    }
+
+    fn read(&self, _format: ClipboardFormat) -> Result<Vec<u8>> {
+        Self::moved_out()
+    }
+
+    fn write(&self, _format: ClipboardFormat, _data: &[u8]) -> Result<()> {
+        Self::moved_out()
+    }
+
+    fn change_serial(&self) -> Result<u64> {
+        Self::moved_out()
     }
 }
 

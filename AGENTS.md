@@ -139,8 +139,17 @@ connection — so what a peer learns at the handshake may be minutes old, and on
 Wayland the consent dialog is usually answered after the process starts and around
 when peers connect. `sync_capabilities` does not close that gap, because it only
 speaks on a transition and the transition already happened. `Engine::on_peer_ready`
-corrects the peer when the two differ; a new feature that depends on a peer's
-advertised capabilities should not assume the handshake value is current.
+therefore sends `CapabilitiesChanged` to every peer that can decode it,
+**unconditionally** — there is no sound local operand to compare against, because
+the snapshot the peer was actually given is a clone nobody kept, and comparing
+against the peer's own advertised set instead silently matches on two identically
+configured machines and skips the correction exactly when it is needed.
+
+The rule that follows for anything new: **do not gate a feature on a peer's
+handshake capability set**, and do not gate one on this machine's either. Ask at
+the moment the feature is used, when the answer is current. The clipboard's QUIC
+stream is built that way — opened on demand rather than during session setup — for
+this reason as much as for compatibility with a build that predates it.
 
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.

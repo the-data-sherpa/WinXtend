@@ -27,7 +27,14 @@ fn node_info(id: NodeId, name: &str) -> NodeInfo {
         name: name.into(),
         platform: Platform::Windows,
         display_server: DisplayServer::Windows,
-        capabilities: Capabilities::CAPTURE_INPUT | Capabilities::INJECT_INPUT,
+        // The clipboard bits are here because several of these tests move
+        // clipboard payloads: a fixture that advertised only input would describe a
+        // machine that never syncs the clipboard, and the tests below would then be
+        // exercising a session no agent would ever put clipboard traffic on.
+        capabilities: Capabilities::CAPTURE_INPUT
+            | Capabilities::INJECT_INPUT
+            | Capabilities::CLIPBOARD_TEXT
+            | Capabilities::CLIPBOARD_IMAGE,
         monitors: Vec::new(),
         agent_version: "0.1.0".into(),
     }
@@ -425,6 +432,41 @@ async fn a_clipboard_transfer_does_not_hold_up_the_cursor() {
         other => panic!("expected the handoff first, got {other:?}"),
     }
     writing.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_session_works_before_either_end_has_opened_a_clipboard_stream() {
+    // The clipboard lane is opened on demand, so a peer that never syncs anything
+    // — an older build, or a machine nobody has copied on — never opens one, and
+    // must still get a session that comes up and carries input. Waiting for that
+    // stream during setup is what wedged the responder against exactly such a peer.
+    //
+    // Then the same session grows the lane mid-flight, which is the Wayland case:
+    // the portal grant lands after the handshake, and a clipboard gated on what was
+    // advertised then would never arrive.
+    let (client_id, client_trust, server_id, server_trust) = paired();
+    let (_endpoints, client, server) =
+        connect_pair(&client_id, &client_trust, &server_id, &server_trust, false).await;
+    let (client, _ce) = client.expect("client handshake");
+    let (_server, mut server_events) = server.expect("server handshake");
+
+    let key = InputFrame::new(
+        client.next_seq(),
+        MonitorId(0),
+        InputEvent::Key(KeyEvent::text("a", KeyAction::Press, Modifiers::NONE)),
+    );
+    client.send_input(&key).await.unwrap();
+    match next_event(&mut server_events).await {
+        SessionEvent::Input(got) => assert_eq!(got, key),
+        other => panic!("expected the keystroke, got {other:?}"),
+    }
+
+    let msg = ControlMsg::ClipboardStale { serial: 3 };
+    client.send_clipboard(&msg).await.unwrap();
+    match next_event(&mut server_events).await {
+        SessionEvent::Control(got) => assert_eq!(got, msg),
+        other => panic!("expected the clipboard message, got {other:?}"),
+    }
 }
 
 /// A `ClipboardData` message of a given payload size.
