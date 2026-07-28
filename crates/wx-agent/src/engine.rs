@@ -361,6 +361,105 @@ enum ClipboardJob {
     },
 }
 
+impl ClipboardJob {
+    fn kind(&self) -> ClipboardJobKind {
+        match self {
+            ClipboardJob::Poll { .. } => ClipboardJobKind::Poll,
+            ClipboardJob::Serve { .. } => ClipboardJobKind::Serve,
+            ClipboardJob::Accept { .. } => ClipboardJobKind::Accept,
+        }
+    }
+}
+
+/// Which kind of job a dispatch or a report belongs to.
+///
+/// Separate from the job itself so that [`ClipboardTraffic`] can account for one
+/// without holding a payload, and so the accounting is the same value on the way
+/// out and on the way back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardJobKind {
+    Poll,
+    Serve,
+    Accept,
+}
+
+/// What the loop has outstanding with the clipboard worker.
+///
+/// # The rule this exists to keep
+///
+/// **A poll must never reach the worker between a write being armed and the
+/// serial that write produced coming back.** The worker is FIFO and owns no
+/// engine state, so a `Poll` job carries the write-back guard
+/// ([`ClipboardSync::armed`]) as it stood when the loop *dispatched* it. Dispatch
+/// a poll while a write is still with the worker and that snapshot is `None`,
+/// because the loop has not applied [`ClipboardDone::Writing`] yet — and the
+/// worker then runs the write first and samples afterwards, with nothing telling
+/// it to read the format back.
+///
+/// That is not a cosmetic ordering. Usually the poll lands on the same serial the
+/// write reported and [`LocalChange::Echo`] catches it anyway; but the Wayland
+/// portal moves the serial a second time when it echoes `SelectionOwnerChanged`,
+/// and if that lands after the write's own `change_serial` the poll sees a serial
+/// the guard does not name, has no digest to check it against, clears the guard
+/// and offers the peer its own payload straight back — tens of megabytes of it.
+/// Holding the poll until every write has reported keeps every `armed` snapshot
+/// current, which is the whole of the fix.
+///
+/// Pure and separate from the engine so that rule is stated once and can be
+/// tested without a desktop.
+#[derive(Debug, Default)]
+struct ClipboardTraffic {
+    /// A poll is with the worker and has not reported.
+    polling: bool,
+    /// Writes dispatched and not yet reported. A count rather than a flag because
+    /// two peers can each be having their payload written at the same time.
+    writes: usize,
+    /// The worker is gone and nothing will report again. See
+    /// [`ClipboardDone::WorkerGone`].
+    lost: bool,
+}
+
+impl ClipboardTraffic {
+    /// Whether a fresh poll may be sent right now.
+    fn may_poll(&self) -> bool {
+        !self.lost && !self.polling && self.writes == 0
+    }
+
+    fn dispatched(&mut self, kind: ClipboardJobKind) {
+        match kind {
+            ClipboardJobKind::Poll => self.polling = true,
+            ClipboardJobKind::Accept => self.writes += 1,
+            ClipboardJobKind::Serve => {}
+        }
+    }
+
+    fn settled(&mut self, kind: ClipboardJobKind) {
+        match kind {
+            ClipboardJobKind::Poll => self.polling = false,
+            ClipboardJobKind::Accept => self.writes = self.writes.saturating_sub(1),
+            ClipboardJobKind::Serve => {}
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    /// The worker will never report again.
+    ///
+    /// Clears what was outstanding as well as latching the fact, because those
+    /// jobs died with it: a `polling` flag left standing would make [`may_poll`]
+    /// false for the rest of the run, and local copies would then stop being
+    /// offered with nothing anywhere to say why.
+    ///
+    /// [`may_poll`]: ClipboardTraffic::may_poll
+    fn worker_lost(&mut self) {
+        self.polling = false;
+        self.writes = 0;
+        self.lost = true;
+    }
+}
+
 /// A payload read from the clipboard and made ready for the wire.
 struct Packed {
     compression: Compression,
@@ -392,11 +491,14 @@ enum ClipboardDone {
     /// A peer's payload is unpacked and the write is about to start.
     ///
     /// Sent *before* the write rather than with its result, and that ordering is
-    /// the whole of the echo suppression: the guard has to be armed before the
-    /// change it suppresses can be observed. Both this and [`Wake::ClipboardPoll`]
-    /// arrive on the one wake queue in send order, so a poll that could see the
-    /// write is necessarily behind this message and the guard is up by the time it
-    /// is handled.
+    /// half of the echo suppression: the guard has to be armed before the change it
+    /// suppresses can be observed, and both this and [`Wake::ClipboardPoll`] arrive
+    /// on the one wake queue in send order.
+    ///
+    /// The other half is [`ClipboardTraffic`], and it is not optional. Send order
+    /// alone only settles when the loop *handles* a poll; what decides what that
+    /// poll can see is the guard snapshot taken when the loop *dispatched* it, and
+    /// a poll dispatched while this write was still in flight carries none.
     Writing {
         format: ClipboardFormat,
         digest: u64,
@@ -414,6 +516,13 @@ enum ClipboardDone {
         /// which decides whether a guard is standing that must now be cleared.
         armed: bool,
     },
+    /// The worker thread has stopped, and nothing it was holding will report.
+    ///
+    /// Sent by a `Drop` guard rather than at the end of the loop, so that it is
+    /// sent on the unwind path too: a panic inside a platform backend leaves the
+    /// worker's queued jobs unreported, and the loop would otherwise go on
+    /// believing a poll was still in flight and never send another.
+    WorkerGone,
 }
 
 struct NewSession {
@@ -829,14 +938,9 @@ pub struct Engine {
     clipboard: ClipboardSync,
     /// Where blocking clipboard work goes. See [`spawn_clipboard_worker`].
     clipboard_jobs: std::sync::mpsc::SyncSender<ClipboardJob>,
-    /// Whether a poll is already with the worker, so a ticker faster than the OS
-    /// clipboard cannot stack polls up behind a transfer.
-    ///
-    /// Latched by a worker that has stopped answering at all, which is the one
-    /// thing that would silence local polling for good. Not guarded here because
-    /// the same worker also carries every serve and every write, and those are not
-    /// gated on this — a dead worker says so loudly on the next of either.
-    clipboard_polling: bool,
+    /// What is outstanding with that worker, and the one ordering rule the loop
+    /// has to keep around it. See [`ClipboardTraffic`].
+    clipboard_traffic: ClipboardTraffic,
     last_owner: NodeId,
     /// Host firewall warning, decided once at startup and then reported for the
     /// life of the run. Held rather than recomputed per status request because
@@ -1067,7 +1171,7 @@ impl Engine {
             driven_by: DrivenBy::default(),
             clipboard: ClipboardSync::new(),
             clipboard_jobs,
-            clipboard_polling: false,
+            clipboard_traffic: ClipboardTraffic::default(),
             last_owner: local,
             // Against the port actually bound, not the configured one: the two
             // differ when the config asks for port 0, and advice naming a port
@@ -3119,11 +3223,11 @@ impl Engine {
             // moment it connects.
             return;
         }
-        if self.clipboard_polling {
-            // One poll in flight at a time. The ticker is faster than a portal
-            // round trip on purpose, and stacking polls behind a slow one would
-            // answer a question that has already been answered — while filling the
-            // worker's queue ahead of a transfer somebody is waiting on.
+        if !self.clipboard_traffic.may_poll() {
+            // One poll in flight at a time, and none at all while a write is: the
+            // ticker is faster than a portal round trip on purpose, and a poll sent
+            // now would carry a write-back guard that has not been armed yet. See
+            // [`ClipboardTraffic`], which is where that rule is stated and tested.
             return;
         }
         // Both operands of the write-back decision are read here, on the loop, and
@@ -3133,20 +3237,14 @@ impl Engine {
             seen: self.clipboard.serial(),
             armed: self.clipboard.armed(),
         };
-        self.clipboard_polling = self.dispatch_clipboard(job);
+        self.dispatch_clipboard(job);
     }
 
-    /// Apply what the worker saw on the local clipboard.
-    fn on_clipboard_polled(
-        &mut self,
-        serial: u64,
-        formats: Vec<ClipboardFormat>,
-        digest: Option<u64>,
-    ) {
-        // The fingerprint is already taken, so the closure only hands it over. The
-        // state machine still decides whether it mattered.
-        let change = self.clipboard.observe(serial, &formats, |_| digest);
-
+    /// Say what the worker found on the local clipboard.
+    ///
+    /// `serial` is the one that was sampled, for the log lines; the variants that
+    /// act on it carry their own.
+    fn on_local_clipboard_change(&mut self, serial: u64, change: LocalChange) {
         match change {
             LocalChange::Unchanged => {}
             LocalChange::FirstSighting => {
@@ -3172,44 +3270,39 @@ impl Engine {
     ///
     /// Every arm is a state change the worker could not make itself, because the
     /// state is here and nowhere else. That is the trade the worker exists to make:
-    /// it does the waiting, the loop keeps the ownership.
+    /// it does the waiting, the loop keeps the ownership. The state changes
+    /// themselves are in [`settle_clipboard_report`]; what is left here is the
+    /// logging and the sending, which need the rest of the engine.
     fn on_clipboard_done(&mut self, done: ClipboardDone) {
-        match done {
-            ClipboardDone::NothingNew => self.clipboard_polling = false,
-            ClipboardDone::Polled {
-                serial,
-                formats,
-                digest,
-            } => {
-                self.clipboard_polling = false;
-                self.on_clipboard_polled(serial, formats, digest);
-            }
-            ClipboardDone::Served {
-                node,
-                format,
-                serial,
-                packed,
-            } => self.on_clipboard_served(node, format, serial, packed),
-            ClipboardDone::Writing { format, digest } => self.clipboard.writing(format, digest),
-            ClipboardDone::Wrote {
-                node,
-                format,
-                bytes,
-                serial,
-            } => {
-                tracing::info!(peer = %node, ?format, bytes, "took the clipboard from a peer");
-                if let Some(serial) = serial {
-                    self.clipboard.wrote(serial);
-                }
-            }
-            ClipboardDone::NotWritten { armed } => {
-                if armed {
-                    // The guard was put up for a write that never happened, so
-                    // there is nothing of this machine's on the clipboard to
-                    // suppress and leaving it standing would swallow the user's
-                    // next copy of the same content.
-                    self.clipboard.write_failed();
-                }
+        if let ClipboardDone::Served {
+            node,
+            format,
+            serial,
+            packed,
+        } = done
+        {
+            self.clipboard_traffic.settled(ClipboardJobKind::Serve);
+            self.on_clipboard_served(node, format, serial, packed);
+            return;
+        }
+        if let ClipboardDone::Wrote {
+            node,
+            format,
+            bytes,
+            ..
+        } = &done
+        {
+            tracing::info!(peer = %node, ?format, bytes, "took the clipboard from a peer");
+        }
+        let was_lost = self.clipboard_traffic.is_lost();
+        let change =
+            settle_clipboard_report(&mut self.clipboard, &mut self.clipboard_traffic, &done);
+        if !was_lost && self.clipboard_traffic.is_lost() {
+            self.clipboard_worker_lost();
+        }
+        if let ClipboardDone::Polled { serial, .. } = done {
+            if let Some(change) = change {
+                self.on_local_clipboard_change(serial, change);
             }
         }
     }
@@ -3218,18 +3311,46 @@ impl Engine {
     ///
     /// Never blocks, for the reason the whole worker exists: waiting for room here
     /// would put the stall back on the loop it was moved off.
-    fn dispatch_clipboard(&self, job: ClipboardJob) -> bool {
+    ///
+    /// The accounting is done from the job itself rather than by the caller, so
+    /// that the rule in [`ClipboardTraffic`] cannot be kept at one call site and
+    /// forgotten at the next: this is the only way to the worker.
+    fn dispatch_clipboard(&mut self, job: ClipboardJob) -> bool {
+        let kind = job.kind();
         match self.clipboard_jobs.try_send(job) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.clipboard_traffic.dispatched(kind);
+                true
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 tracing::warn!("the clipboard backend is not keeping up; dropping a clipboard job");
                 false
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                tracing::debug!("the clipboard worker has stopped; dropping a clipboard job");
+                if !self.clipboard_traffic.is_lost() {
+                    self.clipboard_traffic.worker_lost();
+                    self.clipboard_worker_lost();
+                }
                 false
             }
         }
+    }
+
+    /// The clipboard worker has stopped. Say so once, and out loud.
+    ///
+    /// At error level and with a notice, because what has just happened is that a
+    /// feature stopped working for the rest of the run: the serve and write paths
+    /// are peer-driven and would at least fall silent visibly, but offering local
+    /// copies is the primary direction and its only symptom is nothing happening.
+    fn clipboard_worker_lost(&mut self) {
+        tracing::error!(
+            "the clipboard worker has stopped; clipboard sync is off for the rest of this run"
+        );
+        self.notice(
+            ipc::NoticeLevel::Warning,
+            "clipboard sync has stopped working on this machine; restart the agent to get it back"
+                .to_string(),
+        );
     }
 
     /// Announce new local content to every peer that could use it.
@@ -3832,6 +3953,82 @@ fn clipboard_sharing_permitted(has_session: bool, reachable: bool, enabled_for_p
     has_session && reachable && enabled_for_peer
 }
 
+/// Apply a worker report to the clipboard state machine and the traffic record.
+///
+/// Free rather than inlined in [`Engine::on_clipboard_done`] so that the loop's
+/// half of the handoff can be driven in a test against the worker's own
+/// functions, with no desktop and no engine — the ordering between the two is the
+/// part that is easy to get wrong and impossible to see in either half alone.
+///
+/// Returns the verdict on a poll, which is the only report the loop has to act on
+/// beyond recording it.
+fn settle_clipboard_report(
+    sync: &mut ClipboardSync,
+    traffic: &mut ClipboardTraffic,
+    done: &ClipboardDone,
+) -> Option<LocalChange> {
+    match done {
+        ClipboardDone::NothingNew => {
+            traffic.settled(ClipboardJobKind::Poll);
+            None
+        }
+        ClipboardDone::Polled {
+            serial,
+            formats,
+            digest,
+        } => {
+            traffic.settled(ClipboardJobKind::Poll);
+            // The fingerprint is already taken, so the closure only hands it over.
+            // The state machine still decides whether it mattered.
+            Some(sync.observe(*serial, formats, |_| *digest))
+        }
+        ClipboardDone::Served { .. } => {
+            traffic.settled(ClipboardJobKind::Serve);
+            None
+        }
+        ClipboardDone::Writing { format, digest } => {
+            sync.writing(*format, *digest);
+            None
+        }
+        ClipboardDone::Wrote { serial, .. } => {
+            traffic.settled(ClipboardJobKind::Accept);
+            if let Some(serial) = serial {
+                sync.wrote(*serial);
+            }
+            None
+        }
+        ClipboardDone::NotWritten { armed } => {
+            traffic.settled(ClipboardJobKind::Accept);
+            if *armed {
+                // The guard was put up for a write that never happened, so there is
+                // nothing of this machine's on the clipboard to suppress and leaving
+                // it standing would swallow the user's next copy of the same content.
+                sync.write_failed();
+            }
+            None
+        }
+        ClipboardDone::WorkerGone => {
+            traffic.worker_lost();
+            None
+        }
+    }
+}
+
+/// Says so if the clipboard worker ever stops, however it stops.
+///
+/// A panic inside a platform backend unwinds straight out of the worker's loop,
+/// taking whatever it was holding with it and reporting nothing. `Drop` runs on
+/// that path as well as the ordinary one, so this is the one report that cannot be
+/// skipped — and without it the loop would go on believing a poll was still in
+/// flight, and would never send another for the life of the process.
+struct WorkerObituary(mpsc::UnboundedSender<Wake>);
+
+impl Drop for WorkerObituary {
+    fn drop(&mut self) {
+        let _ = self.0.send(Wake::Clipboard(ClipboardDone::WorkerGone));
+    }
+}
+
 /// Run the blocking half of clipboard sync on a thread of its own.
 ///
 /// # Why a thread, and why it owns the backend
@@ -3862,6 +4059,9 @@ fn spawn_clipboard_worker(
     std::thread::Builder::new()
         .name("wx-clipboard".into())
         .spawn(move || {
+            // Declared first so it is dropped last, and so it outlives every path
+            // out of the loop below — including the one a panic takes.
+            let _obituary = WorkerObituary(wake.clone());
             let report = |done: ClipboardDone| wake.send(Wake::Clipboard(done)).is_ok();
             for job in rx {
                 let carried_on = match job {
@@ -5138,6 +5338,249 @@ mod tests {
             enqueue(&main, Outbound::Control(payload())),
             Queued::Unresponsive,
             "this is the teardown the clipboard's own queue exists to prevent"
+        );
+    }
+
+    /// A clipboard that moves its change serial the way the Wayland portal does.
+    ///
+    /// Writing bumps it once, and the compositor's own `SelectionOwnerChanged`
+    /// echo bumps it again some time later — [`portal_echo`] is that second bump,
+    /// fired by the test exactly where the race puts it: after the write has
+    /// already reported the serial it produced.
+    ///
+    /// [`portal_echo`]: DoubleBumpClipboard::portal_echo
+    struct DoubleBumpClipboard {
+        serial: std::cell::Cell<u64>,
+        held: std::cell::RefCell<Option<(ClipboardFormat, Vec<u8>)>>,
+    }
+
+    impl DoubleBumpClipboard {
+        fn new() -> Self {
+            Self {
+                serial: std::cell::Cell::new(0),
+                held: std::cell::RefCell::new(None),
+            }
+        }
+
+        fn bump(&self) {
+            self.serial.set(self.serial.get() + 1);
+        }
+
+        fn copied_by_hand(&self, format: ClipboardFormat, data: &[u8]) {
+            *self.held.borrow_mut() = Some((format, data.to_vec()));
+            self.bump();
+        }
+
+        fn portal_echo(&self) {
+            self.bump();
+        }
+    }
+
+    impl wx_platform::traits::ClipboardAccess for DoubleBumpClipboard {
+        fn available_formats(&self) -> wx_platform::Result<Vec<ClipboardFormat>> {
+            Ok(self.held.borrow().iter().map(|(f, _)| *f).collect())
+        }
+
+        fn read(&self, format: ClipboardFormat) -> wx_platform::Result<Vec<u8>> {
+            match &*self.held.borrow() {
+                Some((held, data)) if *held == format => Ok(data.clone()),
+                _ => Err(PlatformError::Unsupported {
+                    operation: "reading a format the clipboard does not hold",
+                    backend: "test",
+                }),
+            }
+        }
+
+        fn write(&self, format: ClipboardFormat, data: &[u8]) -> wx_platform::Result<()> {
+            *self.held.borrow_mut() = Some((format, data.to_vec()));
+            self.bump();
+            Ok(())
+        }
+
+        fn change_serial(&self) -> wx_platform::Result<u64> {
+            Ok(self.serial.get())
+        }
+    }
+
+    /// One turn of the loop's clipboard poll: check the rule, dispatch, let the
+    /// worker run the job, apply what comes back. The two halves are the real
+    /// ones — only the queue between them is collapsed.
+    fn poll_once(
+        access: &DoubleBumpClipboard,
+        sync: &mut ClipboardSync,
+        traffic: &mut ClipboardTraffic,
+    ) -> Option<LocalChange> {
+        assert!(traffic.may_poll(), "the loop would not have polled here");
+        traffic.dispatched(ClipboardJobKind::Poll);
+        let done = sample_clipboard(access, sync.serial(), sync.armed());
+        settle_clipboard_report(sync, traffic, &done)
+    }
+
+    #[test]
+    fn a_poll_may_not_straddle_a_write_and_offer_a_peer_its_own_payload_back() {
+        // The dispatch ordering, driven end to end against the worker's own
+        // functions. A pure test of `ClipboardSync` cannot see this: the state
+        // machine absorbs the write-back correctly in every case, and what used to
+        // break it was the loop handing it a `armed` snapshot taken before the
+        // write was armed.
+        let access = DoubleBumpClipboard::new();
+        let mut sync = ClipboardSync::new();
+        let mut traffic = ClipboardTraffic::default();
+
+        access.copied_by_hand(ClipboardFormat::Utf8Text, b"whatever was there first");
+        assert_eq!(
+            poll_once(&access, &mut sync, &mut traffic),
+            Some(LocalChange::FirstSighting)
+        );
+
+        // A peer's payload arrives and the loop sends the write to the worker.
+        traffic.dispatched(ClipboardJobKind::Accept);
+
+        // The ticker fires while that write is still with the worker. This is the
+        // poll that used to slip through: the loop has not applied `Writing` yet,
+        // so it would carry `armed: None`, and the FIFO worker would run it *after*
+        // the write with nothing telling it to read the format back.
+        assert!(
+            !traffic.may_poll(),
+            "a poll sent now reaches the worker after the write and carries no guard"
+        );
+
+        // The worker runs the write and reports in its own order; the loop applies
+        // each report as it arrives.
+        let reports = std::cell::RefCell::new(Vec::new());
+        assert!(accept_clipboard(
+            &access,
+            node(1),
+            ClipboardFormat::Utf8Text,
+            Compression::None,
+            b"the peer's clipboard",
+            &|done| {
+                reports.borrow_mut().push(done);
+                true
+            },
+        ));
+        for done in reports.borrow().iter() {
+            settle_clipboard_report(&mut sync, &mut traffic, done);
+        }
+
+        // The portal's second bump, landing after the write reported its own
+        // serial. This is the move no serial-counting guard can catch, and the one
+        // that turns a stale `armed` into a full payload sent straight back.
+        access.portal_echo();
+
+        assert_eq!(
+            poll_once(&access, &mut sync, &mut traffic),
+            Some(LocalChange::Echo),
+            "the peer's own payload was offered straight back to it"
+        );
+    }
+
+    #[test]
+    fn a_guard_snapshot_taken_before_the_write_is_mistaken_for_a_fresh_copy() {
+        // Why the rule above is not cosmetic, written as the failure it prevents so
+        // that nobody removes the latch on the grounds that it looks unnecessary.
+        // Same clipboard, same payload, same second bump as the test above — the
+        // only difference is that the poll carries the snapshot as it stood before
+        // the write was armed, which is exactly what dispatching mid-write does.
+        let access = DoubleBumpClipboard::new();
+        let mut sync = ClipboardSync::new();
+        let mut traffic = ClipboardTraffic::default();
+
+        access.copied_by_hand(ClipboardFormat::Utf8Text, b"whatever was there first");
+        poll_once(&access, &mut sync, &mut traffic);
+
+        let reports = std::cell::RefCell::new(Vec::new());
+        traffic.dispatched(ClipboardJobKind::Accept);
+        accept_clipboard(
+            &access,
+            node(1),
+            ClipboardFormat::Utf8Text,
+            Compression::None,
+            b"the peer's clipboard",
+            &|done| {
+                reports.borrow_mut().push(done);
+                true
+            },
+        );
+        for done in reports.borrow().iter() {
+            settle_clipboard_report(&mut sync, &mut traffic, done);
+        }
+        access.portal_echo();
+
+        traffic.dispatched(ClipboardJobKind::Poll);
+        let stale = sample_clipboard(&access, sync.serial(), None);
+        assert!(
+            matches!(
+                settle_clipboard_report(&mut sync, &mut traffic, &stale),
+                Some(LocalChange::Offer { .. })
+            ),
+            "without the latch this is a spurious full-payload transfer, not a hazard on paper"
+        );
+    }
+
+    #[test]
+    fn every_write_has_to_report_before_the_next_poll_goes_out() {
+        // Two peers can be having their payloads written at once, and a serve can
+        // be in flight alongside either. Only the writes hold the poll off, and all
+        // of them have to report before it goes.
+        let mut traffic = ClipboardTraffic::default();
+        assert!(traffic.may_poll());
+
+        traffic.dispatched(ClipboardJobKind::Accept);
+        traffic.dispatched(ClipboardJobKind::Accept);
+        traffic.dispatched(ClipboardJobKind::Serve);
+        assert!(!traffic.may_poll());
+
+        traffic.settled(ClipboardJobKind::Serve);
+        traffic.settled(ClipboardJobKind::Accept);
+        assert!(
+            !traffic.may_poll(),
+            "one write reporting is not all of them reporting"
+        );
+
+        traffic.settled(ClipboardJobKind::Accept);
+        assert!(traffic.may_poll());
+    }
+
+    #[test]
+    fn a_write_that_never_landed_still_lets_polling_resume() {
+        // A payload that would not decompress reports `NotWritten` and nothing
+        // else. Counting that as a write still outstanding would stop this machine
+        // offering anything it copied, for good, over one corrupt message.
+        let mut sync = ClipboardSync::new();
+        let mut traffic = ClipboardTraffic::default();
+        traffic.dispatched(ClipboardJobKind::Accept);
+        settle_clipboard_report(
+            &mut sync,
+            &mut traffic,
+            &ClipboardDone::NotWritten { armed: false },
+        );
+        assert!(traffic.may_poll());
+    }
+
+    #[test]
+    fn a_worker_that_dies_holding_a_job_is_reported_rather_than_latching_silently() {
+        // The failure this guards: the worker panics inside a platform backend with
+        // a poll in its queue, that job dies unreported, and the loop goes on
+        // believing a poll is in flight — so it never sends another, and local
+        // copies stop being offered for the rest of the run with nothing in the log.
+        // `WorkerGone` is sent by a `Drop` guard, which is the one report a panic
+        // cannot skip.
+        let mut sync = ClipboardSync::new();
+        let mut traffic = ClipboardTraffic::default();
+        traffic.dispatched(ClipboardJobKind::Poll);
+        traffic.dispatched(ClipboardJobKind::Accept);
+        assert!(!traffic.is_lost());
+
+        settle_clipboard_report(&mut sync, &mut traffic, &ClipboardDone::WorkerGone);
+
+        assert!(
+            traffic.is_lost(),
+            "the loop has to learn this, because saying so once is the whole point"
+        );
+        assert!(
+            !traffic.may_poll(),
+            "and then stop asking a worker that is not there rather than warn every tick"
         );
     }
 
