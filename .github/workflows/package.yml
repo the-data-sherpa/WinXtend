@@ -1,0 +1,129 @@
+name: package
+
+# Deliberately not on push or pull_request. This job builds the UI, the agent,
+# and a Debian package, which is several times the cost of CI and answers a
+# question CI does not ask — so it runs when someone wants an artefact, and on a
+# release tag.
+#
+# It uploads a workflow artefact and nothing more. Attaching the `.deb` to a
+# GitHub release, signing it, or pushing it to any apt repository are all
+# deliberately manual for the alpha: publishing is outward-facing and is the
+# maintainer's call, not a workflow's.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    name: deb (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      # The same list as CI's "Install Tauri system dependencies" step, and for
+      # the same reason: Tauri links against the system webview and tray stack.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            ui/src-tauri -> ../../target/ui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `beforeBuildCommand` runs `npm run build:bundle`, which builds the agent
+      # sidecar and generates the systemd unit before the frontend, so this one
+      # command produces a complete package.
+      - name: Build the .deb
+        working-directory: ui
+        run: npm run package:deb
+
+      # The two failures this package exists to prevent are both silent: a
+      # bundle with no daemon in it installs perfectly and then cannot start
+      # anything, and a missing runtime dependency only shows up as a portal
+      # that never answers. Neither is visible in a build log, so they are
+      # asserted rather than eyeballed.
+      - name: Check the package contains what it must
+        run: |
+          set -euo pipefail
+          deb=$(find target/ui/release/bundle/deb -name '*.deb' -print -quit)
+          echo "checking $deb"
+          contents=$(dpkg-deb -c "$deb")
+          control=$(dpkg-deb -f "$deb" Depends)
+          echo "$contents"
+          echo "Depends: $control"
+
+          fail=0
+          for path in ./usr/bin/wx-agent ./usr/bin/winxtend-ui \
+                      ./usr/lib/systemd/user/winxtend.service; do
+            echo "$contents" | grep -qE "[[:space:]]${path#./}\$" \
+              || { echo "::error::$path is missing from the package"; fail=1; }
+          done
+          # libwebkit2gtk-4.1-0 and libgtk-3-0 are added by Tauri's own bundler
+          # rather than by tauri.conf.json, so they are checked here instead of
+          # declared twice; the rest come from `bundle.linux.deb.depends`.
+          for dep in libwebkit2gtk-4.1-0 xdg-desktop-portal \
+                     xdg-desktop-portal-gnome libei1; do
+            echo "$control" | grep -q "$dep" \
+              || { echo "::error::$dep is not a declared dependency"; fail=1; }
+          done
+          # The agent must be beside the UI *and* be the agent: an empty or
+          # truncated sidecar would satisfy the path check above.
+          size=$(dpkg-deb -c "$deb" | awk '$6 ~ /usr\/bin\/wx-agent$/ {print $3}')
+          [ "${size:-0}" -gt 1000000 ] \
+            || { echo "::error::usr/bin/wx-agent is $size bytes, which is not a build of it"; fail=1; }
+          exit $fail
+
+      # The unit is the part of this package that nothing else validates: a
+      # typo in a directive is accepted silently by systemd at install time and
+      # only fails at the next login, on the user's machine.
+      - name: Check the systemd unit parses
+        run: |
+          set -euo pipefail
+          deb=$(find target/ui/release/bundle/deb -name '*.deb' -print -quit)
+          dpkg-deb -x "$deb" extracted
+          unit=extracted/usr/lib/systemd/user/winxtend.service
+          # `verify` reports the missing ExecStart binary — it is not installed
+          # on the runner — so only unknown keys and syntax errors are treated
+          # as failures.
+          out=$(systemd-analyze verify --user "$unit" 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -Ei "winxtend\.service.*(Unknown|Failed to parse|invalid)"; then
+            echo "::error::the systemd unit does not parse cleanly"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winxtend-deb-amd64
+          path: target/ui/release/bundle/deb/*.deb
+          if-no-files-found: error

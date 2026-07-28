@@ -108,11 +108,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # ui/src-tauri/.cargo/config.toml redirects target-dir to ../../target/ui,
-      # so the cache has to be told where the artefacts actually land.
+      # so the cache has to be told where the artefacts actually land. The root
+      # workspace is cached here too, because the sidecar step below builds
+      # `wx-agent` out of it — without that entry every run of this job pays for
+      # a cold release build of the whole engine.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ui/src-tauri -> ../../target/ui
+          workspaces: |
+            . -> target
+            ui/src-tauri -> ../../target/ui
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `tauri.conf.json` names `binaries/wx-agent` as an `externalBin`, and
+      # `tauri-build` refuses to run when a declared one is missing — so this is
+      # not only for the bundle: `cargo check`, `clippy` and `test` in this
+      # workspace all fail without it. That strictness is the point. It is what
+      # makes "the installer shipped without the daemon" a build failure rather
+      # than something a user discovers.
+      - name: Build the agent sidecar
+        working-directory: ui
+        run: npm run bundle:agent
 
       # This workspace is not reached by the root `cargo fmt --all` either, so it
       # gets its own format gate, in the same fmt-clippy-test order as above.

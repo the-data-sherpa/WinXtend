@@ -219,6 +219,49 @@ anything touching the real registry, clipboard, or desktop still needs a Windows
   therefore derive `HAS_DISPLAYS` from the monitor list, through `with_displays` in
   `engine.rs`. Keep it as one rule in one place.
 
+## The UI workspace does not build until the agent sidecar exists
+
+`ui/src-tauri/tauri.conf.json` declares `binaries/wx-agent` as an `externalBin`, and
+`tauri-build` fails its build script when a declared one is missing — so `cargo check`,
+`clippy` and `test` in that workspace all fail on a fresh checkout until
+`cd ui && npm run bundle:agent` has been run once. That is deliberate: it makes an
+installer with no daemon in it a build failure rather than a user's discovery. The same
+step runs from `beforeBuildCommand`, so `npm run package:deb` needs nothing first.
+
+Both of its products — `ui/src-tauri/binaries/wx-agent-<triple>` and
+`packaging/winxtend.service` — are generated and `.gitignore`d. `tauri build` also
+rewrites `ui/src-tauri/Cargo.toml`, normalising `tauri` and `tauri-build` to
+`features = []`; it is a semantic no-op, so `git checkout` it rather than committing it. Adding a runtime
+dependency or a packaged file means editing `bundle.linux.deb` in `tauri.conf.json`;
+`libwebkit2gtk-4.1-0` and `libgtk-3-0` are added by Tauri's own bundler and must not be
+listed there as well, or they appear twice in `Depends`. `.github/workflows/package.yml`
+asserts the built `.deb`'s contents and dependency list, which is the only check that
+the package is complete.
+
+## Autostart is per-user on every platform, and the reasoning is load-bearing
+
+`crates/wx-agent/src/autostart.rs` registers an `HKCU\…\Run` entry on Windows and a
+systemd **user** unit on Linux. Neither is an implementation shortcut: a Windows
+session-0 service and a Linux system unit would both start, report healthy, and capture
+nothing, because neither has the interactive desktop — on Linux, the Wayland display,
+the session bus, and `xdg-desktop-portal`. The module doc and
+`packaging/winxtend.service.in` carry the full argument; read them before proposing a
+system service again.
+
+Two properties are easy to break and are tested: registration rewrites the recorded path
+every time (a stale one fails silently at every login), and a registration whose target
+is gone reads as *not* registered. The Linux path is testable end to end because
+`install_in`/`uninstall_in`/`is_registered_in` take a config root, so tests redirect it
+instead of touching `~/.config`; `systemctl daemon-reload` sits outside that split and is
+best-effort, because CI has no user systemd instance.
+
+`packaging/winxtend.service.in` is the single unit text: `autostart.rs` `include_str!`s
+it and `ui/scripts/bundle-agent.mjs` substitutes the same file for the packaged copy.
+Its `After=xdg-desktop-portal.service` exists to lose a real startup race — an
+autostarted agent that reaches the portal before it is answerable gets `Unsupported` and
+stays without input capability for the whole run. Do not drop the ordering to tidy the
+unit.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

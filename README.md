@@ -202,11 +202,83 @@ for what the next release is about.
 | Visual layout editor | ✅ |
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
+| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built and its contents checked in CI; not yet installed on a clean machine |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand |
 | Clipboard sync across machines | ⚠️ platform side done, not wired into the agent |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and the clipboard platform layer have landed; packaging and two-machine validation are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
+| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and the clipboard platform layer have landed; two-machine validation and a clean-machine first run are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
+
+## Installing on Ubuntu
+
+The alpha ships as a `.deb` containing both halves — the UI and the `wx-agent`
+daemon — because an installer with only the UI in it produces an application that
+cannot start anything.
+
+```bash
+sudo apt install ./WinXtend_0.1.0_amd64.deb
+```
+
+`apt` rather than `dpkg -i` so that the runtime dependencies are pulled in:
+`xdg-desktop-portal`, `xdg-desktop-portal-gnome`, `libei1`, and the WebKitGTK
+stack Tauri needs. Then launch **WinXtend** from the app grid; it starts the
+agent itself. What the package puts where:
+
+| Path | What it is |
+|---|---|
+| `/usr/bin/winxtend-ui` | The UI. Also the app-grid entry. |
+| `/usr/bin/wx-agent` | The daemon. Beside the UI, which is the only place the UI trusts to hold an agent matching its protocol version, and on `PATH` for `wx-agent --status`. |
+| `/usr/lib/systemd/user/winxtend.service` | The autostart unit, installed but **not** enabled. See below. |
+
+There is no build of this for other distributions yet, and the package is
+unsigned and in no repository: it is an alpha artefact to be downloaded and
+installed by hand.
+
+### Starting with the session
+
+Turn it on from the UI — **This machine → Starts with the session**. From a
+terminal, the equivalent is:
+
+```bash
+wx-agent --install      # enable
+wx-agent --uninstall    # disable
+```
+
+Either way this enables a systemd **user** unit, `winxtend.service`, and it takes
+effect at the next login. A *system* unit is deliberately not offered: the agent
+needs the user's Wayland display, session D-Bus, and `xdg-desktop-portal`, and a
+system service has none of the three — it would start, look healthy, and capture
+nothing. The portal's consent and its restore token are per-user for the same
+reason, and `systemctl --user` needs no root. Lingering
+(`loginctl enable-linger`) is not wanted: with no graphical session there is
+nothing for the agent to capture or inject into.
+
+`--install` writes `~/.config/systemd/user/winxtend.service` naming the agent
+that installed it, which shadows the packaged copy. After a `.deb` install both
+name `/usr/bin/wx-agent`, so the two agree.
+
+### Ports and firewall
+
+| Port | Protocol | What for |
+|---|---|---|
+| 24800 | UDP | The QUIC listener. Configurable; `wx-agent --status` prints the port in use. |
+| 5353 | UDP | mDNS, for finding other machines. |
+
+Ubuntu ships `ufw` **disabled**, so on a stock install there is nothing to do. If
+it is enabled, the agent says so — in `wx-agent --status`, in the UI's status
+screen, and in its log — rather than quietly failing to be discovered, and names
+the two commands that fix it:
+
+```bash
+sudo ufw allow 24800/udp
+sudo ufw allow 5353/udp
+```
+
+The agent can tell that ufw is on (`/etc/ufw/ufw.conf` is world-readable) but not
+whether these ports are already allowed (`/etc/ufw/user.rules` is root-only), so
+the message is worded as something to check. Only `ufw` is detected; a machine
+driving nftables or firewalld directly gets no warning.
 
 ## Building
 
@@ -265,9 +337,36 @@ The UI is a separate Cargo workspace so it does not pull Tauri into the engine
 build:
 
 ```bash
-cd ui && npm install && npm run build
+cd ui && npm install
+npm run bundle:agent      # required before any cargo command below
+npm run build
 cd src-tauri && cargo check
 ```
+
+### Building the package
+
+```bash
+cd ui && npm run package:deb   # target/ui/release/bundle/deb/*.deb
+```
+
+`npm run bundle:agent` is not optional and not only for packaging.
+`tauri.conf.json` declares `wx-agent` as an `externalBin`, and `tauri-build`
+refuses to run at all when a declared external binary is missing — so
+`cargo check`, `cargo clippy` and `cargo test` in `ui/src-tauri` all fail until it
+has been run once. That is the intended behaviour: it makes "the installer
+shipped without the daemon" a build failure rather than something a user finds
+out. `package:deb` runs it for you, via `beforeBuildCommand`.
+
+It builds a release `wx-agent`, copies it to
+`ui/src-tauri/binaries/wx-agent-<target-triple>` — the triple suffix is how Tauri
+picks the right binary, and a file without it is invisible to the bundler — and
+generates `packaging/winxtend.service` from the template beside it. Both are
+build products and both are `.gitignore`d.
+
+`.github/workflows/package.yml` builds the same package on a runner and checks
+that the agent, the unit, and every runtime dependency are in it. It uploads a
+workflow artefact and publishes nothing: attaching a release, signing, and any
+apt repository are deliberately manual for the alpha.
 
 ## Running
 
@@ -282,6 +381,15 @@ wx-agent --pair <code>        # enter the code shown on the other machine
 wx-agent --install            # start with this user's session
 wx-agent --print-config       # dump the resolved configuration
 ```
+
+None of these is required to use WinXtend: everything above is reachable from the
+UI, including registering autostart. They exist for scripting and for reading
+what the agent thinks is going on.
+
+On Linux `--install` enables the systemd user unit described under
+[Starting with the session](#starting-with-the-session); on Windows it writes an
+`HKCU\…\Run` entry. Both are per-user session registrations, and for the same
+reason.
 
 Pairing is deliberately two-sided: one machine generates a six-digit code, a human
 reads it out, the other machine types it. There is no shared password in a config
@@ -339,7 +447,9 @@ cd ui && npm test                         # layout-editor geometry, status forma
 ```
 
 The cargo commands above stop at the engine workspace; the Tauri crate has its own
-`cargo clippy` and `cargo test`, run from `ui/src-tauri`.
+`cargo clippy` and `cargo test`, run from `ui/src-tauri` — and needing
+`npm run bundle:agent` to have been run once first, for the reason under
+[Building the package](#building-the-package).
 `.github/workflows/ci.yml` is the authoritative list of what every push and pull
 request is checked against, on Linux, Windows, and macOS.
 
@@ -370,11 +480,13 @@ examples, not an exhaustive list:
   The gates run in both directions, not only Windows-ward, which is why Linux and
   macOS do not report the same total as each other either.
 - `crates/wx-agent/src/autostart.rs` uses both mechanisms. Several of its tests are
-  `#[cfg(windows)]` outright, so off Windows they are not compiled and cannot be
-  counted; `registering_is_idempotent_and_removable` is instead
-  `#[cfg_attr(not(windows), ignore)]`, so it compiles everywhere but only runs where
-  there is an autostart mechanism to exercise, and anywhere but Windows it is
-  counted ignored rather than passed.
+  `#[cfg(windows)]` outright and several others `#[cfg(target_os = "linux")]`, so
+  each set is compiled on one platform and cannot be counted on the others;
+  `registering_is_idempotent_and_removable` is instead
+  `#[cfg_attr(not(any(windows, target_os = "linux")), ignore)]`, so it compiles
+  everywhere but only runs where there is an autostart mechanism to exercise, and
+  on macOS it is counted ignored rather than passed. It ran nowhere until the
+  systemd user unit landed; macOS is now the only platform left that skips it.
 
 `crates/wx-video/tests/windows_capture_smoke.rs` is `#![cfg(target_os = "windows")]`
 too, but it moves no passing total: its cases are additionally `#[ignore]`d because
@@ -397,8 +509,10 @@ The alpha is Linux/Wayland. Roughly in order of value:
    is the strongest reason to prefer this one.
 2. **Wire clipboard sync into the agent.** The platform side works on Windows and
    on Wayland; nothing above the platform traits acts on it yet.
-3. **Packaging for Linux** — a distributable agent, a systemd user unit, and a
-   first-run path that does not require `cargo`.
+3. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
+   toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu). What
+   is left is the first-run walkthrough on a clean machine, which needs two of
+   them.
 4. **The macOS backend.**
 5. **Screen streaming, once there is a backend to stream from.** This is the one
    place WinXtend would reach past a classic software KVM: a machine with no

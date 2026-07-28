@@ -25,6 +25,13 @@ pnpm-debug.log*
 # Bundled installers and app images
 /ui/src-tauri/target/release/bundle
 
+# Build products of ui/scripts/bundle-agent.mjs. Both are copies of something
+# already in the tree — the release `wx-agent`, and `packaging/winxtend.service.in`
+# with its placeholder filled in — so committing either would only ever mean
+# shipping a stale one.
+/ui/src-tauri/binaries
+/packaging/winxtend.service
+
 # ---------------------------------------------------------------- Secrets and local state
 # The agent keeps its ed25519 identity key, trust store, and cached layout in the
 # per-user OS config directory, NOT in the repo. These patterns exist to catch a

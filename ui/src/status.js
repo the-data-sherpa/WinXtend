@@ -49,10 +49,27 @@ function localPanel() {
     ["Discovery", status.discovery ? "on" : "off"],
     [
       "Starts with the session",
-      // Read-only on purpose: registering an autostart entry is the agent's own
-      // `--install` mode, and there is no request for it on the control channel.
-      // Saying so beats a switch that silently does nothing.
-      status.autostart ? "yes" : "no, run wx-agent --install to change that",
+      // A control rather than a fact. It used to be read-only and to say "run
+      // wx-agent --install" instead, which is a terminal step in the one flow —
+      // first run on a fresh machine — that has to work without one. The agent
+      // does the registering either way; this only asks it to.
+      h(
+        "span",
+        { class: "row" },
+        h("span", {}, status.autostart ? "yes" : "no"),
+        h(
+          "button",
+          {
+            type: "button",
+            onClick: () =>
+              attempt("changing what starts with the session", async () => {
+                await callOk({ kind: "setAutostart", enabled: !status.autostart });
+                await refreshStatus();
+              }),
+          },
+          status.autostart ? "Stop starting it" : "Start it with the session"
+        )
+      ),
     ],
     ["Can do", capabilitiesText(status.capabilities, true)],
     [
@@ -118,6 +135,11 @@ function localPanel() {
       h("span", { class: "swatch", style: { background: nodeColor(status.nodeId) } })
     ),
     h("div", { class: "titled" }, nameNode),
+    // Above the facts rather than buried among them. A firewall is the one cause
+    // of "no machine ever appears" that the user can fix and that nothing else on
+    // this screen would hint at: every other field looks perfectly healthy while
+    // it is happening.
+    status.firewall ? h("p", { class: "notice warning" }, status.firewall) : null,
     h(
       "dl",
       { class: "facts-grid" },
