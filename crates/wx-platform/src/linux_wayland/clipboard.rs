@@ -53,12 +53,25 @@ use wx_proto::ClipboardFormat;
 
 use crate::error::{PlatformError, Result};
 
+/// What the message carrying a payload costs on top of the payload itself.
+///
+/// [`MAX_FRAME_LEN`] bounds the *encoded* frame, and the bytes travel inside
+/// `ControlMsg::ClipboardData`, which spells a variant tag, a format tag, a serial
+/// varint, a compression tag and the payload's own length varint around them —
+/// under twenty bytes as postcard writes them today. Rounded far up rather than
+/// counted to the byte, so that a field added to that message later cannot quietly
+/// put the boundary back.
+const FRAME_OVERHEAD_BYTES: usize = 64;
+
 /// The most any one clipboard payload may be.
 ///
 /// [`MAX_FRAME_LEN`] is what the protocol codec will carry, so anything larger is
 /// rejected here — with a message naming the size — rather than handed upwards to
-/// tear a session down at the frame writer.
-pub const MAX_CLIPBOARD_BYTES: usize = MAX_FRAME_LEN as usize;
+/// tear a session down at the frame writer. Less [`FRAME_OVERHEAD_BYTES`], because
+/// the codec weighs the encoded message and not the payload: a limit set to the
+/// frame length exactly would pass every check here and still be refused there,
+/// which is the outcome this constant exists to prevent.
+pub const MAX_CLIPBOARD_BYTES: usize = MAX_FRAME_LEN as usize - FRAME_OVERHEAD_BYTES;
 
 /// The MIME type each format is read and written as.
 ///
@@ -231,9 +244,14 @@ impl ClipboardState {
         {
             let mut inner = self.lock();
             inner.ours = session_is_owner.unwrap_or(false);
-            // Somebody else's selection replaces ours, and the bytes behind our
-            // offer can never be asked for again.
-            if !inner.ours {
+            // Only when the portal positively says the selection is somebody
+            // else's: then our offer is gone and its bytes can never be asked for
+            // again. A portal that omits the field is a different case, and the two
+            // halves cost different things — treating it as not ours sends the next
+            // read to the portal, which fails at worst, while throwing the staged
+            // bytes away leaves an offer of ours standing with nothing behind it,
+            // and that hangs somebody's paste.
+            if session_is_owner == Some(false) {
                 inner.staged.clear();
             }
             inner.offered = mimes;
@@ -340,7 +358,7 @@ impl ClipboardState {
         // moment `SetSelection` returns, and an offer whose bytes are not there
         // yet is the paste that hangs in the receiving application rather than
         // failing.
-        self.stage(mimes, payload);
+        let previous = self.stage(mimes, payload);
         match transport.set_selection(mimes) {
             Ok(()) => {
                 // Recorded here rather than waiting for the portal's echo. The
@@ -357,7 +375,11 @@ impl ClipboardState {
                 Ok(())
             }
             Err(e) => {
-                self.lock().staged.clear();
+                // Put back what the refused offer displaced. The selection on the
+                // clipboard is still the last one that went through, so clearing
+                // outright would leave that offer standing with nothing to answer a
+                // paste of it with.
+                self.lock().staged = previous;
                 Err(e)
             }
         }
@@ -380,12 +402,15 @@ impl ClipboardState {
         None
     }
 
-    fn stage(&self, mimes: &[&'static str], payload: Arc<[u8]>) {
+    /// Stage the bytes behind an offer about to be made, returning what they
+    /// displaced so a refused offer can put it back.
+    fn stage(&self, mimes: &[&'static str], payload: Arc<[u8]>) -> Vec<(&'static str, Arc<[u8]>)> {
         let mut inner = self.lock();
-        inner.staged = mimes
+        let staged = mimes
             .iter()
             .map(|mime| (*mime, Arc::clone(&payload)))
             .collect();
+        std::mem::replace(&mut inner.staged, staged)
     }
 
     /// Record that the offer went through, without waiting for the portal's echo.
@@ -1076,6 +1101,67 @@ mod tests {
             .write(&transport, ClipboardFormat::Utf8Text, b"nope")
             .is_err());
         assert!(state.staged_for(MIME_TEXT).is_none());
+    }
+
+    #[test]
+    fn an_offer_the_portal_refused_leaves_the_previous_one_answerable() {
+        // The selection on the clipboard is still the write that went through, so
+        // the bytes behind it have to survive the one that did not: clearing them
+        // would answer a paste of the standing offer with nothing at all.
+        let state = ClipboardState::new();
+        state
+            .write(
+                &FakeTransport::default(),
+                ClipboardFormat::Utf8Text,
+                b"kept",
+            )
+            .unwrap();
+        let refusing = FakeTransport {
+            fail: true,
+            ..Default::default()
+        };
+        assert!(state
+            .write(&refusing, ClipboardFormat::Utf8Text, b"nope")
+            .is_err());
+        assert_eq!(&*state.staged_for(MIME_TEXT).unwrap(), b"kept");
+        assert!(state.selection_is_ours());
+    }
+
+    #[test]
+    fn a_portal_that_omits_the_owner_flag_does_not_cost_us_the_staged_bytes() {
+        // Not ours as far as the next read is concerned — that only sends the read
+        // to the portal — but the offer may well still be ours, and throwing its
+        // bytes away would hang the paste that asks for them.
+        let state = ClipboardState::new();
+        state
+            .write(
+                &FakeTransport::default(),
+                ClipboardFormat::Utf8Text,
+                b"mine",
+            )
+            .unwrap();
+        state.selection_changed(vec![MIME_TEXT.into()], None);
+        assert!(!state.selection_is_ours());
+        assert_eq!(&*state.staged_for(MIME_TEXT).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn the_size_limit_leaves_room_for_the_message_that_carries_it() {
+        // `check_size` guards the payload and the codec guards the encoded frame,
+        // so a limit set to the frame length exactly would pass every check in this
+        // file and still be refused at the writer.
+        assert!(MAX_CLIPBOARD_BYTES + FRAME_OVERHEAD_BYTES <= MAX_FRAME_LEN as usize);
+        let framed = wx_proto::encode_frame(&wx_proto::ControlMsg::ClipboardData {
+            format: ClipboardFormat::Png,
+            serial: u64::MAX,
+            compression: wx_proto::Compression::None,
+            data: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            framed.len() - wx_proto::codec::LEN_PREFIX <= FRAME_OVERHEAD_BYTES,
+            "the reserved allowance must cover what the message itself costs"
+        );
     }
 
     #[test]

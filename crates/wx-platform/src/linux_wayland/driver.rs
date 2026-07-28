@@ -526,19 +526,7 @@ async fn negotiate<'a>(
     // Persisted before anything else can fail: a token thrown away because the libei
     // connection did not come up would cost the user another dialog for a problem
     // that had nothing to do with consent.
-    match started.restore_token() {
-        Some(token) => {
-            if let Err(e) = store.save(token) {
-                // Not fatal. The session in hand is fine; only the next launch pays.
-                tracing::warn!(error = %e, "could not persist the portal restore token; the next launch will prompt");
-            } else {
-                tracing::debug!("portal restore token persisted");
-            }
-        }
-        None => tracing::warn!(
-            "the portal returned no restore token; every launch will show a consent dialog"
-        ),
-    }
+    record_token(store, granted, started.restore_token());
 
     let devices = started.devices();
 
@@ -573,6 +561,60 @@ async fn negotiate<'a>(
         input,
         clipboard,
     })
+}
+
+/// Keep, or deliberately forget, the token for the grant that just came back.
+///
+/// The decision itself is [`persists_token`]; this is the half that touches the
+/// file, and the clearing is not incidental. A grant that arrives without devices
+/// means the user answered the dialog differently from last time, so a token left
+/// over from an earlier full grant no longer describes what they want and would be
+/// sent again on the next launch — leaving the promise that the dialog comes back
+/// unkept.
+fn record_token(store: &RestoreTokenStore, granted: Capabilities, token: Option<&str>) {
+    if !persists_token(granted) {
+        store.clear();
+        tracing::info!(
+            "a clipboard-only grant is not recorded; the next launch shows the consent dialog again"
+        );
+        return;
+    }
+    match token {
+        Some(token) => {
+            if let Err(e) = store.save(token) {
+                // Not fatal. The session in hand is fine; only the next launch pays.
+                tracing::warn!(error = %e, "could not persist the portal restore token; the next launch will prompt");
+            } else {
+                tracing::debug!("portal restore token persisted");
+            }
+        }
+        None => tracing::warn!(
+            "the portal returned no restore token; every launch will show a consent dialog"
+        ),
+    }
+}
+
+/// Whether a grant of this shape may leave a restore token behind.
+///
+/// Only one that carries the devices. A restore token is the portal's promise to
+/// grant the same thing again silently, so recording one for a clipboard-only grant
+/// would restore that same grant on every later launch — and with no dialog left,
+/// `SelectDevices` has no way to put the keyboard and pointer back. The machine
+/// would be permanently undriveable, recoverable only by deleting a token file the
+/// user does not know exists.
+///
+/// The costs are asymmetric, which is what decides it. Someone who wants
+/// clipboard-only sees a dialog each launch, which is mildly annoying — and that
+/// dialog is exactly how they keep making the choice. Someone who unticked "Allow
+/// Remote Interaction" once, possibly by accident, would otherwise have no way back
+/// at all. Never stranding a user outranks saving a dialog.
+///
+/// [`accept_granted`] warns about the same hazard for a half *device* grant, and
+/// refuses that one outright because it cannot be published honestly. This grant can
+/// be published honestly and is worth keeping for the run it was made in; it is only
+/// worth nothing to the launch after.
+fn persists_token(granted: Capabilities) -> bool {
+    granted.contains(INJECT_CAPABILITIES)
 }
 
 /// The device types this session asks for, with the names a user reads.
@@ -1288,6 +1330,49 @@ mod tests {
             RestoreTokenStore::in_dir(&dir.0).load(),
             None,
             "the next launch must ask the user once rather than fail identically"
+        );
+    }
+
+    #[test]
+    fn a_grant_that_carries_the_devices_is_remembered() {
+        // The half that hardware confirmed: a second launch came back restoring=true
+        // with no dialog. Its opposite cannot be produced on the alpha target — the
+        // dialog there would not hand back a clipboard-only grant — so the two tests
+        // below are the only cover that side has.
+        let dir = TempDir::new("with-devices");
+        let store = RestoreTokenStore::in_dir(&dir.0);
+        record_token(
+            &store,
+            INJECT_CAPABILITIES.union(CLIPBOARD_CAPABILITIES),
+            Some("a-good-token"),
+        );
+        assert_eq!(store.load().as_deref(), Some("a-good-token"));
+    }
+
+    #[test]
+    fn a_clipboard_only_grant_is_never_recorded() {
+        // Restoring it silently would leave a machine that cannot be driven and has
+        // no dialog left to add the devices back at. One dialog per launch is the
+        // cheaper of the two failures by a long way.
+        let dir = TempDir::new("clipboard-only");
+        let store = RestoreTokenStore::in_dir(&dir.0);
+        assert!(!persists_token(CLIPBOARD_CAPABILITIES));
+        record_token(&store, CLIPBOARD_CAPABILITIES, Some("a-good-token"));
+        assert_eq!(store.load(), None);
+    }
+
+    #[test]
+    fn a_clipboard_only_grant_forgets_the_token_from_a_fuller_one() {
+        // Without this the promise is not kept: the older token would still be sent
+        // on the next launch, and the dialog the user is owed would never appear.
+        let dir = TempDir::new("downgraded");
+        let store = RestoreTokenStore::in_dir(&dir.0);
+        store.save("from-a-full-grant").unwrap();
+        record_token(&store, CLIPBOARD_CAPABILITIES, None);
+        assert_eq!(
+            RestoreTokenStore::in_dir(&dir.0).load(),
+            None,
+            "the user changed their answer, so the old token no longer describes it"
         );
     }
 
