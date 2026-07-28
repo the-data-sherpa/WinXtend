@@ -184,7 +184,18 @@ fn install(config: &mut Config, config_path: &std::path::Path) -> anyhow::Result
             // Printed as well as returned, because the message is a set of
             // instructions the user is expected to follow by hand.
             eprintln!("cannot register autostart automatically:\n  {e}");
-            bail!("autostart registration is not supported on this platform");
+            // The last line anyhow prints is the one a user reads first, so it
+            // must not contradict the one above it. Only `Unsupported` means
+            // there is no mechanism here; a path systemd cannot name, or a
+            // directory that cannot be written, is a failure on a platform that
+            // supports this perfectly well, and saying otherwise sends the user
+            // looking for a missing feature instead of at the detail above.
+            match e {
+                autostart::AutostartError::Unsupported { .. } => {
+                    bail!("autostart registration is not supported on this platform")
+                }
+                _ => bail!("could not register autostart"),
+            }
         }
     }
 }
@@ -199,7 +210,12 @@ fn uninstall(config: &mut Config, config_path: &std::path::Path) -> anyhow::Resu
         }
         Err(e) => {
             eprintln!("cannot remove autostart automatically:\n  {e}");
-            bail!("autostart registration is not supported on this platform");
+            match e {
+                autostart::AutostartError::Unsupported { .. } => {
+                    bail!("autostart registration is not supported on this platform")
+                }
+                _ => bail!("could not remove the autostart registration"),
+            }
         }
     }
 }

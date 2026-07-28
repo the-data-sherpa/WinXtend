@@ -218,8 +218,9 @@ pub mod linux_impl {
     /// it only reaches it: `systemd-analyze verify --user` reads the escaped
     /// newline in `ExecStart="/opt/win\ntend/wx-agent"` back as a real newline,
     /// exactly as intended, and then calls the unit a fatal error that will not
-    /// be started. The same for `\t`, for `\x0b`, and for the `\\` and `\"`
-    /// [`quoted`] already writes.
+    /// be started. The same for `\t`, for `\x0b`, and for a backslash or a
+    /// double quote written as `\\` or `\"`, which is why [`quoted`] does not
+    /// bother writing those.
     ///
     /// A space and a percent are deliberately not in this set: both are
     /// expressible, and rendering them correctly is what [`quoted`] is for. This
@@ -268,22 +269,20 @@ pub mod linux_impl {
     /// Quoted unconditionally, even when nothing needs it: `ui/scripts/bundle-agent.mjs`
     /// substitutes the same template for the packaged unit, and two renderings
     /// that differ only in an edge case are two renderings that will drift.
-    /// Inside the quotes systemd reads `\` as an escape, so a backslash and a
-    /// double quote each need one. `%` is not covered by quoting at all —
-    /// systemd resolves its specifiers across the whole directive — so a literal
-    /// percent has to be written `%%` or the command silently becomes a
-    /// different one, or the unit refuses to load, at the next login only.
     ///
-    /// This renders; it does not decide. Whether a path can be expressed at all
-    /// is [`representable`]'s question, and [`unit_text`] asks it first, so
-    /// nothing reaches here that systemd would then reject.
+    /// Two things happen here and only two. The quotes are for the space. The
+    /// doubling is for `%`, which quoting does not cover at all — systemd
+    /// resolves its specifiers across the whole directive — so a literal percent
+    /// has to be written `%%` or the command silently becomes a different one,
+    /// or the unit refuses to load, at the next login only.
+    ///
+    /// Nothing else is escaped, because nothing else can be. The characters
+    /// systemd will not take in an executable path it rejects *after*
+    /// unescaping, so writing `\\` or `\"` for them would produce exactly the
+    /// path it refuses; they are turned away by [`representable`] instead, which
+    /// [`unit_text`] calls before this. This renders; it does not decide.
     fn quoted(path: &Path) -> String {
-        let escaped = path
-            .display()
-            .to_string()
-            .replace('\\', r"\\")
-            .replace('"', "\\\"")
-            .replace('%', "%%");
+        let escaped = path.display().to_string().replace('%', "%%");
         format!("\"{escaped}\"")
     }
 

@@ -95,12 +95,12 @@ function placeSidecar(agent, triple) {
 // must render identically to `linux_impl::quoted` in
 // `crates/wx-agent/src/autostart.rs` — the two substituters sharing one template
 // is the whole reason there is a template — so it quotes unconditionally too,
-// escaping the backslash and the double quote systemd reads inside the quotes,
-// and doubling the percent systemd resolves as a specifier whether it is quoted
-// or not. The three replacements are in the same order as the Rust ones so the
-// two can be diffed by eye.
+// and doubles the percent systemd resolves as a specifier whether it is quoted
+// or not. Nothing else is escaped, for the reason the Rust twin gives: systemd
+// rejects the rest after unescaping, so `representable` below turns those paths
+// away rather than rendering something systemd would refuse.
 function quoted(path) {
-  return `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
+  return `"${path.replaceAll("%", "%%")}"`;
 }
 
 // The characters systemd will not accept in an `ExecStart` executable path at
