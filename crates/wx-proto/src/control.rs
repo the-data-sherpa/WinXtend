@@ -54,6 +54,13 @@ pub enum RejectReason {
     ProtocolTooOld {
         min_supported: u16,
     },
+    /// No longer sent by this build: a peer ahead of us negotiates down instead
+    /// of being refused — see `admit` in `crates/wx-net/src/handshake.rs` and
+    /// [`crate::check_version`].
+    ///
+    /// Kept anyway, and not to be removed: it is a postcard variant index, so
+    /// deleting it renumbers every variant after it, and peers on builds that
+    /// predate the change still send it to us.
     ProtocolTooNew {
         ours: u16,
     },
@@ -126,6 +133,9 @@ impl Default for VideoConfig {
 pub enum ControlMsg {
     /// Opens a connection. Always the first message sent.
     Hello {
+        /// Sender's [`crate::PROTOCOL_VERSION`]: the *top* of the range it
+        /// speaks, not a demand for an exact match. The receiver settles on a
+        /// version both ends implement — [`crate::check_version`].
         protocol: u16,
         info: NodeInfo,
         /// Random per-connection value, signed in [`ControlMsg::AuthProof`] to

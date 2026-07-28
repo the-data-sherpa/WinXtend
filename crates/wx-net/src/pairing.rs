@@ -261,6 +261,8 @@ mod tests {
         let initiator = Established {
             role: Role::Initiator,
             peer: info(NodeId([2u8; 32])),
+            protocol: wx_proto::PROTOCOL_VERSION,
+            peer_protocol: wx_proto::PROTOCOL_VERSION,
             local_nonce: nonce_i,
             peer_nonce: nonce_r,
             peer_was_paired: false,
@@ -268,6 +270,8 @@ mod tests {
         let responder = Established {
             role: Role::Responder,
             peer: info(NodeId([1u8; 32])),
+            protocol: wx_proto::PROTOCOL_VERSION,
+            peer_protocol: wx_proto::PROTOCOL_VERSION,
             local_nonce: nonce_r,
             peer_nonce: nonce_i,
             peer_was_paired: false,

@@ -293,6 +293,47 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_variant_is_a_hard_decode_failure() {
+        // Load-bearing for version negotiation (see `caps::check_version`): it is
+        // tempting to assume that because variants are append-only, an older build
+        // can simply skip one it has never seen and carry on at the older feature
+        // level. It cannot. postcard is not self-describing — a variant is a bare
+        // index with no length — so there is nothing to skip past, and
+        // `next_message` surfaces that as an error the caller must treat as fatal
+        // to the stream.
+        //
+        // That is why negotiating an older *version* is not on its own permission
+        // to send an older peer new messages: `Capabilities` is what keeps them
+        // off the wire.
+
+        // An old build reading a message a newer one appended a variant for.
+        #[derive(Serialize)]
+        enum NewBuild {
+            #[allow(dead_code)]
+            Known(u8),
+            Appended(u8),
+        }
+        #[derive(serde::Deserialize, Debug)]
+        enum OldBuild {
+            #[allow(dead_code)]
+            Known(u8),
+        }
+
+        let encoded = encode_frame(&NewBuild::Appended(7)).unwrap();
+        let mut reader = FrameReader::new();
+        reader.push(&encoded);
+        let err = reader.next_message::<OldBuild>().unwrap_err();
+        assert!(matches!(err, CodecError::Deserialize(_)), "{err:?}");
+
+        // And the same for the real control enum, so this does not quietly stop
+        // describing it: an index past the end of `ControlMsg` is an error rather
+        // than a skipped message, however plausible its payload looks.
+        let mut future = postcard::to_allocvec(&10_000u32).unwrap();
+        future.extend_from_slice(&[0u8; 8]);
+        assert!(decode::<ControlMsg>(&future).is_err());
+    }
+
+    #[test]
     fn input_frames_fit_a_datagram() {
         let frame = InputFrame::new(
             u64::MAX,

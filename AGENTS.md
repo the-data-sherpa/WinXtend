@@ -213,6 +213,20 @@ anything touching the real registry, clipboard, or desktop still needs a Windows
   `crates/wx-proto/src/lib.rs` for the variants, and `Capabilities::FILE_TRANSFER` in
   `crates/wx-proto/src/caps.rs` for a bit that is deliberately defined and advertised
   by nothing.
+- **Append-only does not mean older peers can skip what they do not know.** postcard is
+  not self-describing: an unrecognised variant index is a hard decode error, and a
+  control stream that fails to decode is torn down.
+  `codec::tests::an_unknown_variant_is_a_hard_decode_failure` pins it. So appending is
+  safe only *because* capability bits keep the new variant off the wire.
+- **`PROTOCOL_VERSION` guards the wire format; capability bits gate features.** The two
+  are not interchangeable, and the division decides what a change needs: a new feature
+  over an existing encoding gets a capability bit and **no** bump; only a changed
+  encoding of something already on the wire is a bump. A build speaks the whole range
+  `MIN_COMPATIBLE_VERSION..=PROTOCOL_VERSION`, advertises the top of it, and both ends
+  independently settle on `min` — so a *newer* peer negotiates down rather than being
+  refused, while a below-floor one is still refused outright. `check_version` in
+  `crates/wx-proto/src/caps.rs` carries the full argument, including why unilateral
+  `min` cannot make the two ends disagree; read it before changing either constant.
 - **Optional features are gated on what the peer advertised, before they send.**
   `Engine::peer_supports` / `send_optional` / `broadcast_optional` in
   `crates/wx-agent/src/engine.rs` are that seam, and a refusal is a `warn` naming the

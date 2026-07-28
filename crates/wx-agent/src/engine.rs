@@ -1366,6 +1366,14 @@ impl Engine {
         let trusted = established.peer_was_paired;
         let info = established.peer.clone();
         let name = info.name.clone();
+        // Reported on every session, not only mismatched ones. "Which wire format
+        // were these two actually speaking" is the first question a two-machine
+        // bug report has to answer, and it cannot be inferred from the build
+        // numbers — the point of negotiation is that the version in use may be
+        // neither machine's newest. Both numbers, so a negotiated-down session is
+        // visible as such rather than looking like a matched pair.
+        let protocol = established.protocol;
+        let peer_protocol = established.peer_protocol;
         self.state.on_session(info.clone(), trusted, now);
         {
             let trust = self.trust.lock().expect("trust store lock");
@@ -1386,10 +1394,16 @@ impl Engine {
         self.last_heard.insert(node, now);
 
         if trusted {
-            tracing::info!(peer = %node, %name, "session established");
+            tracing::info!(peer = %node, %name, protocol, peer_protocol, "session established");
             self.on_peer_ready(node, &info).await;
         } else {
-            tracing::info!(peer = %node, %name, "session established for pairing only");
+            tracing::info!(
+                peer = %node,
+                %name,
+                protocol,
+                peer_protocol,
+                "session established for pairing only"
+            );
             let pending = PendingPairing {
                 node,
                 name: name.clone(),
