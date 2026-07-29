@@ -229,8 +229,9 @@ sudo apt install ./WinXtend_0.1.0_amd64.deb
 
 `apt` rather than `dpkg -i` so that the runtime dependencies are pulled in:
 `xdg-desktop-portal`, `xdg-desktop-portal-gnome`, and the WebKitGTK stack Tauri
-needs. Then launch **WinXtend** from the app grid; it starts the
-agent itself. What the package puts where:
+needs. Then launch **WinXtend** from the app grid; it attaches to an agent that is
+already running — including one the systemd user unit below started — and starts
+one itself if there is none. What the package puts where:
 
 | Path | What it is |
 |---|---|
@@ -476,7 +477,8 @@ that it can be argued with; please do.
 cargo test --workspace                    # everything
 cargo test -p wx-core                     # layout and routing, no I/O needed
 cargo clippy --workspace --all-targets    # clean
-cd ui && npm test                         # layout-editor geometry, status formatting
+cd ui && npm test                         # layout-editor geometry, status formatting,
+                                          # attaching to an agent, what the banner may claim
 ```
 
 The cargo commands above stop at the engine workspace; the Tauri crate has its own
