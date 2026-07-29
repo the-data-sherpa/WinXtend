@@ -340,6 +340,14 @@ pairing to end left a card standing that suppressed every later prompt — see
 `end_pending_pairing` in `engine.rs`, which is the one path allowed to remove a
 pending pairing so that the announcement cannot be forgotten.
 
+## A transport error string is never user-facing copy
+
+`wx_net::TransportError` renders things like "reading from a stream: connection
+lost", which belong in the log and in a peer's state and nowhere a person reads;
+copy shown to someone must be written for them at a site that knows what actually
+happened. `Engine::on_peer_gone` in `crates/wx-agent/src/engine.rs` carries the
+two as separate arguments for exactly this reason — see its doc comment.
+
 ## A plain `cargo build` of the UI produces a dev-mode binary
 
 `generate_context!` picks `devUrl` over `frontendDist` whenever `tauri/custom-protocol`

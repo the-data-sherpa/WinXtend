@@ -292,6 +292,30 @@ fn teardown_is_current(current: Option<u64>, reported: u64) -> bool {
     }
 }
 
+/// Dials outstanding, for the same reason sessions carry a generation.
+static NEXT_DIAL: AtomicU64 = AtomicU64::new(1);
+
+fn next_dial_id() -> u64 {
+    NEXT_DIAL.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether a dial's failure describes the attempt this machine is still waiting on.
+///
+/// [`teardown_is_current`] one layer down, and needed for the same reason:
+/// `begin_pairing` clears `dialing` so a second attempt may start while the first
+/// task is still working through its addresses, which takes seconds of connect
+/// timeouts. The first task's failure would otherwise be read as the second's —
+/// discarding the code the user is looking at right now and failing its card for a
+/// machine that is answering.
+///
+/// Unlike a teardown, a failure with nothing outstanding is *not* honoured. The
+/// only thing that removes the entry without replacing it is a session being
+/// installed for that peer, and a superseded dial may neither mark a connected
+/// peer down nor take the code the live attempt is waiting to bind.
+fn dial_is_current(current: Option<u64>, reported: u64) -> bool {
+    current == Some(reported)
+}
+
 /// Everything the loop consumes, from every source.
 enum Wake {
     /// Local keyboard or mouse activity.
@@ -316,6 +340,8 @@ enum Wake {
     /// A dial never got as far as a session.
     DialFailed {
         node: NodeId,
+        /// Which attempt failed. See [`dial_is_current`].
+        dial: u64,
         error: String,
         /// Whether this was the dial a pairing was waiting on. A reconnect dial
         /// that fails while a pairing dial to the same peer is in flight must not
@@ -1023,7 +1049,10 @@ pub struct Engine {
     /// PINs generated for pairings this side started, held until the session
     /// exists to bind them to. See [`OfferedPins`].
     offered_pins: OfferedPins,
-    dialing: HashSet<NodeId>,
+    /// Peers being dialled, against the id of the attempt in flight. Keyed by the
+    /// attempt and not merely by the peer, because a second attempt may start
+    /// while the first is still running; see [`dial_is_current`].
+    dialing: HashMap<NodeId, u64>,
     events: broadcast::Sender<Event>,
     wake: mpsc::UnboundedSender<Wake>,
     /// Last value pushed to the capture backend, so it is only changed on a real
@@ -1264,7 +1293,7 @@ impl Engine {
             last_heard: HashMap::new(),
             pending: HashMap::new(),
             offered_pins: OfferedPins::default(),
-            dialing: HashSet::new(),
+            dialing: HashMap::new(),
             events,
             wake: wake.clone(),
             suppressed: false,
@@ -1493,9 +1522,20 @@ impl Engine {
             } => self.on_pump_gone(node, generation, reason).await,
             Wake::DialFailed {
                 node,
+                dial,
                 error,
                 pairing,
             } => {
+                if !dial_is_current(self.dialing.get(&node).copied(), dial) {
+                    tracing::debug!(
+                        peer = %node,
+                        stale = dial,
+                        current = ?self.dialing.get(&node),
+                        error = %error,
+                        "ignoring the failure of a dial that has already been superseded"
+                    );
+                    return;
+                }
                 self.dialing.remove(&node);
                 if pairing {
                     end_undialled_pairing(
@@ -2133,7 +2173,7 @@ impl Engine {
             }
             ControlMsg::Goodbye { reason } => {
                 tracing::info!(peer = %node, %reason, "peer said goodbye");
-                self.on_peer_gone(node, None).await;
+                self.on_peer_gone(node, None, None).await;
             }
             ControlMsg::FileTransferOffer { .. }
             | ControlMsg::FileTransferAccept { .. }
@@ -2199,11 +2239,25 @@ impl Engine {
             );
             return;
         }
-        self.on_peer_gone(node, reason).await;
+        // No user-facing copy: a pump's reason is whatever `wx_net` wrote about the
+        // stream, which belongs in the log and in the peer's state and nowhere a
+        // person reads.
+        self.on_peer_gone(node, reason, None).await;
     }
 
     /// A session ended. The cursor may be on the other side of it.
-    async fn on_peer_gone(&mut self, node: NodeId, reason: Option<String>) {
+    ///
+    /// `reason` is for logs and peer state and may be a raw transport error.
+    /// `told_to_user` is the separate channel for copy somebody wrote for a person
+    /// to read, and is the only one a card is allowed to show: "reading from a
+    /// stream: connection lost" is a diagnostic, not an explanation. Callers that
+    /// have no such copy pass `None` and get the written sentence below.
+    async fn on_peer_gone(
+        &mut self,
+        node: NodeId,
+        reason: Option<String>,
+        told_to_user: Option<&str>,
+    ) {
         if let Some(link) = self.sessions.remove(&node) {
             link.session.close("closing");
         }
@@ -2222,14 +2276,14 @@ impl Engine {
         self.last_heard.remove(&node);
         // Announced, not merely dropped: the exchange is over for the UI too, and
         // it has no other way to find that out. See [`end_pending_pairing`]. The
-        // caller's reason wins where there is one: a peer the user disabled or
-        // forgot themselves did not lose its connection, and saying so sends them
-        // looking for a network fault they do not have.
+        // caller's own copy wins where there is any: a peer the user switched off
+        // or unpaired themselves did not lose its connection, and saying so sends
+        // them looking for a network fault they do not have.
         end_pending_pairing(
             &mut self.pending,
             &self.events,
             node,
-            reason.as_deref().unwrap_or("the connection was lost"),
+            told_to_user.unwrap_or("the connection was lost"),
         );
         // The request outstanding with that peer dies with the session, and leaving
         // it recorded is not merely untidy. It would let the peer's *next* session
@@ -2724,9 +2778,11 @@ impl Engine {
 
     /// Dial a peer, trying each address in turn.
     fn dial(&mut self, node: NodeId, addresses: Vec<SocketAddr>, pairing_mode: bool) {
-        if self.sessions.contains_key(&node) || !self.dialing.insert(node) {
+        if self.sessions.contains_key(&node) || self.dialing.contains_key(&node) {
             return;
         }
+        let dial = next_dial_id();
+        self.dialing.insert(node, dial);
         self.state.set_status(node, ConnStatus::Connecting);
         let endpoint = Arc::clone(&self.endpoint);
         let identity = Arc::clone(&self.identity);
@@ -2765,6 +2821,7 @@ impl Engine {
             }
             let _ = wake.send(Wake::DialFailed {
                 node,
+                dial,
                 error: last,
                 pairing: pairing_mode,
             });
@@ -2985,7 +3042,12 @@ impl Engine {
                 self.save_config();
                 self.resync_peers();
                 if !enabled {
-                    self.on_peer_gone(parsed, Some("disabled".into())).await;
+                    self.on_peer_gone(
+                        parsed,
+                        Some("disabled".into()),
+                        Some("that machine was switched off here"),
+                    )
+                    .await;
                 }
                 self.publish_peer(parsed);
                 Response::Ok
@@ -3120,8 +3182,12 @@ impl Engine {
             self.adopt_layout(layout, true);
             self.broadcast_layout();
         }
-        self.on_peer_gone(node, Some("no longer paired".into()))
-            .await;
+        self.on_peer_gone(
+            node,
+            Some("no longer paired".into()),
+            Some("that machine was unpaired here"),
+        )
+        .await;
     }
 
     fn resync_peers(&mut self) {
@@ -5342,6 +5408,27 @@ mod tests {
         let a = next_session_generation();
         let b = next_session_generation();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_superseded_dials_failure_does_not_kill_the_attempt_that_replaced_it() {
+        // Pressing Pair twice is the ordinary way to reach this: the first dial is
+        // still working through its addresses, `begin_pairing` clears `dialing` so
+        // a second may start, and the first then fails. Unqualified, that failure
+        // discarded the code the second attempt had just put on screen and failed
+        // its card for a machine that was answering.
+        let first = next_dial_id();
+        let second = next_dial_id();
+        assert!(!dial_is_current(Some(second), first));
+        assert!(dial_is_current(Some(second), second));
+    }
+
+    #[test]
+    fn a_dial_that_was_overtaken_by_a_session_reports_nothing() {
+        // The other way the entry goes: the peer dialled this machine at the same
+        // time and its session was installed, which clears `dialing`. The losing
+        // dial must not then mark a connected peer down.
+        assert!(!dial_is_current(None, 42));
     }
 
     #[test]
