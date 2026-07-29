@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the WinXtend window is allowed to ask Tauri's own plugins for. The agent is reached through this crate's own commands, which are not gated by this file; the only built-in plugin the interface uses is the event bus that carries agent news into the webview.",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

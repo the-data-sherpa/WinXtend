@@ -24,6 +24,20 @@
 //! can build a request as a plain object and read the answer with a `switch`. A
 //! typed wrapper per request would add a place for the two sides to disagree about
 //! the contract without adding any checking that the enums do not already do.
+//!
+//! # Why `capabilities/` matters more than it looks
+//!
+//! None of the commands above are gated by Tauri's capability system: a command
+//! registered by this crate is allowed because it was registered. Every *plugin*
+//! command is the opposite — refused at runtime unless a file in
+//! `src-tauri/capabilities` grants it — and `listen`, which the frontend uses to
+//! receive republished agent events, is one of those.
+//!
+//! That asymmetry is worth stating because of how it fails. With no capability
+//! file the window still starts, still draws, and still starts an agent when the
+//! button is pressed; only the automatic path breaks, and it breaks silently. See
+//! [`tests::the_window_may_subscribe_to_the_events_this_process_emits`] for what
+//! that cost once.
 
 pub mod link;
 pub mod problems;
@@ -464,6 +478,89 @@ mod tests {
         // Two agents on one machine is how the mesh is tested without a second
         // machine, and the UI has to be able to talk to the second one.
         assert_eq!(CONFIG_DIR_ENV, "WINXTEND_CONFIG_DIR");
+    }
+
+    /// The capability set, as `tauri.conf.json`'s window sees it.
+    fn capabilities() -> Vec<serde_json::Value> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("no capability directory at {}: {e}", dir.display()))
+        {
+            let path = entry.expect("reading the capability directory").path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let text = std::fs::read_to_string(&path).expect("reading a capability");
+                out.push(
+                    serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display())),
+                );
+            }
+        }
+        assert!(!out.is_empty(), "no capability files in {}", dir.display());
+        out
+    }
+
+    #[test]
+    fn the_window_may_subscribe_to_the_events_this_process_emits() {
+        // The bug this guards is not a crash. Tauri refuses `plugin:event|listen`
+        // when nothing grants it, `listen` is the first thing the frontend does at
+        // startup, and its rejection used to abort the rest of that startup —
+        // including the attach that finds an agent the window did not start, and
+        // the timer that would have retried. The visible result on a machine whose
+        // agent was running perfectly well under `systemctl --user` was "The
+        // WinXtend agent is not running", with a Start button that worked, because
+        // this crate's own commands are not gated by the ACL and the automatic path
+        // is the only one that needed events.
+        //
+        // Asserted here rather than left to `tauri_build`, which only checks that
+        // the files it finds are well formed and is perfectly happy to find none.
+        let label = window_label();
+        let granted: Vec<String> = capabilities()
+            .iter()
+            .filter(|cap| {
+                cap["windows"]
+                    .as_array()
+                    .is_none_or(|w| w.iter().any(|w| w == &serde_json::json!(label)))
+            })
+            .flat_map(|cap| {
+                cap["permissions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+            .filter_map(|p| p.as_str().map(str::to_string))
+            .collect();
+
+        for needed in ["core:event:allow-listen", "core:event:allow-unlisten"] {
+            assert!(
+                granted
+                    .iter()
+                    .any(|p| p == needed || p == "core:event:default" || p == "core:default"),
+                "the {label} window is not granted {needed}; the frontend subscribes to \
+                 agent events with `listen` and will be refused. Granted: {granted:?}"
+            );
+        }
+    }
+
+    /// Label of the window the capabilities have to name.
+    ///
+    /// Read from the configuration rather than assumed, because a capability lists
+    /// windows by label and a renamed window silently stops being covered by one —
+    /// the same silent failure as having no capability file at all.
+    fn window_label() -> String {
+        let text =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"))
+                .expect("reading tauri.conf.json");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("tauri.conf.json");
+        let windows = config["app"]["windows"]
+            .as_array()
+            .expect("at least one window is configured");
+        assert_eq!(windows.len(), 1, "more windows than the capability covers");
+        windows[0]["label"]
+            .as_str()
+            .unwrap_or("main") // Tauri's default when a window does not name itself.
+            .to_string()
     }
 
     #[test]

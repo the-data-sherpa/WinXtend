@@ -29,6 +29,14 @@ export const store = {
   journal: [],
   /// Set while a connect/start attempt is running, so buttons can be disabled.
   busy: false,
+  /// Why the agent's events are not reaching this window, or null while they are.
+  ///
+  /// Separate from `fault` because the two are independent: the control channel
+  /// can be perfectly healthy while the webview's own event bus is not, and that
+  /// combination has to be describable. A window in that state shows correct
+  /// numbers that quietly stop changing, which is worse than no numbers, so it is
+  /// something the banner says out loud rather than something the store forgets.
+  eventsProblem: null,
 };
 
 const listeners = new Set();
@@ -179,6 +187,39 @@ export function connected() {
   return Boolean(store.daemon?.connected && store.status);
 }
 
+/// Set while an attach attempt is running, so a poll does not stack attempts.
+let attaching = false;
+
+/// Attach to an agent that is already running, without making noise about it.
+///
+/// This is the only path that finds a daemon nobody asked this window to start —
+/// the one from the previous session, the one a systemd user unit brought up with
+/// the desktop, the one started from a terminal. It runs at startup and on a
+/// timer, where a missing agent is the expected case, so a failure updates
+/// `store.fault` for the banner and is otherwise swallowed: a thrown error every
+/// two seconds would fill the activity log with the same line.
+///
+/// It deliberately does not depend on the event subscription. Events keep an
+/// attached window fresh; they have nothing to do with finding an agent, and
+/// making discovery wait on them is how a window that could have attached ends up
+/// telling the user nothing is running.
+export async function attachToRunningAgent() {
+  if (attaching || connected()) return connected();
+  attaching = true;
+  try {
+    await refreshDaemon();
+    if (store.daemon?.endpoint && !store.daemon.connected) {
+      await connect();
+    }
+  } catch {
+    // The banner already carries the reason; see store.fault.
+  } finally {
+    attaching = false;
+    changed();
+  }
+  return connected();
+}
+
 // ---------------------------------------------------------------------------
 // Event handling
 // ---------------------------------------------------------------------------
@@ -296,20 +337,43 @@ export function applyEvent(event) {
 }
 
 /// Subscribe to what the host process republishes. Called once at startup.
+///
+/// Reports failure by returning `false` and setting `store.eventsProblem` rather
+/// than throwing, because every caller is a startup sequence and a throw here used
+/// to take the rest of that sequence with it — including the attach that would
+/// have found the running agent, and the timer that would have retried. Tauri's
+/// capability system is the way this fails in practice: `listen` is a built-in
+/// plugin command, so it is refused by the ACL unless `src-tauri/capabilities`
+/// grants it, while this crate's own commands keep working. The window is then
+/// perfectly able to talk to the agent and never tries.
+///
+/// A window without events is degraded, not broken: everything on screen still
+/// arrives through `refreshStatus`, so the honest answer is to carry on and say
+/// what is missing.
 export async function listenToAgent() {
-  await listen("agent-event", (message) => applyEvent(message.payload));
-  await listen("agent-status", async (message) => {
-    const note = message.payload;
-    if (note.connected) return; // the connect path already logged and refreshed
-    const wasConnected = Boolean(store.daemon?.connected);
-    store.status = null;
-    store.pairing = null;
-    await refreshDaemon();
-    if (wasConnected) {
-      log("error", `Lost the connection to the agent: ${note.message}`);
-      store.fault = { code: "disconnected", message: note.message };
-    }
+  try {
+    await listen("agent-event", (message) => applyEvent(message.payload));
+    await listen("agent-status", async (message) => {
+      const note = message.payload;
+      if (note.connected) return; // the connect path already logged and refreshed
+      const wasConnected = Boolean(store.daemon?.connected);
+      store.status = null;
+      store.pairing = null;
+      await refreshDaemon();
+      if (wasConnected) {
+        log("error", `Lost the connection to the agent: ${note.message}`);
+        store.fault = { code: "disconnected", message: note.message };
+      }
+      changed();
+    });
+    store.eventsProblem = null;
+    return true;
+  } catch (thrown) {
+    const error = asAgentError(thrown);
+    store.eventsProblem = error.message;
+    log("error", `This window cannot receive agent events: ${error.message}`);
     changed();
-  });
+    return false;
+  }
 }
 

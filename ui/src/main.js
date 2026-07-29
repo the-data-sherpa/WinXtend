@@ -8,16 +8,17 @@
 import "./styles.css";
 
 import {
+  attachToRunningAgent,
   connect,
   connected,
   listenToAgent,
   log,
   onChange,
-  refreshDaemon,
   refreshStatus,
   startAgent,
   store,
 } from "./agent.js";
+import { bannerFor } from "./banner.js";
 import { h, replace } from "./dom.js";
 import * as devices from "./devices.js";
 import * as layout from "./layout.js";
@@ -43,8 +44,6 @@ let active = "devices";
 let bannerEl = null;
 let connectionEl = null;
 let localNameEl = null;
-/// Set while an automatic attempt is running, so the poll does not stack attempts.
-let autoConnecting = false;
 
 function renderChrome() {
   const daemon = store.daemon;
@@ -64,89 +63,60 @@ function renderChrome() {
 }
 
 function renderBanner() {
-  const daemon = store.daemon;
-  const fault = store.fault;
-  if (connected()) {
+  const banner = bannerFor({
+    connected: connected(),
+    busy: store.busy,
+    daemon: store.daemon,
+    fault: store.fault,
+    eventsProblem: store.eventsProblem,
+  });
+  if (!banner) {
     bannerEl.hidden = true;
     return;
   }
   bannerEl.hidden = false;
 
-  if (store.busy) {
-    replace(bannerEl, h("span", {}, "Talking to the agent..."));
-    bannerEl.className = "banner";
-    return;
-  }
+  const buttons = {
+    start: () =>
+      h(
+        "button",
+        {
+          type: "button",
+          class: "primary",
+          onClick: () =>
+            startAgent().catch((error) => {
+              log("error", `Starting the agent: ${error.message}`);
+            }),
+        },
+        "Start the agent"
+      ),
+    retry: () =>
+      h(
+        "button",
+        {
+          type: "button",
+          onClick: () =>
+            connect().catch((error) => {
+              log("error", `Connecting: ${error.message}`);
+            }),
+        },
+        "Try again"
+      ),
+  };
 
-  const startButton = h(
-    "button",
-    {
-      type: "button",
-      class: "primary",
-      onClick: () =>
-        startAgent().catch((error) => {
-          log("error", `Starting the agent: ${error.message}`);
-        }),
-    },
-    "Start the agent"
-  );
-  const retryButton = h(
-    "button",
-    {
-      type: "button",
-      onClick: () =>
-        connect().catch((error) => {
-          log("error", `Connecting: ${error.message}`);
-        }),
-    },
-    "Try again"
-  );
-
-  const code = fault?.code;
-  let headline;
-  let detail;
-  let actions;
-  if (code === "notRunning" || !daemon?.endpoint) {
-    headline = "The WinXtend agent is not running.";
-    detail = daemon?.agentPath
-      ? "Nothing is being shared. The agent is the process that captures the keyboard and mouse; this window only configures it."
-      : "The agent program could not be found next to this application, so it cannot be started from here.";
-    actions = daemon?.agentPath ? [startButton] : [];
-  } else if (code === "stale") {
-    headline = "An agent left its details behind but is not answering.";
-    detail = `${fault.message}. It was probably killed rather than asked to stop. Starting it again is safe.`;
-    actions = [startButton, retryButton];
-  } else if (code === "disconnected" || code === "notConnected") {
-    headline = "The connection to the agent was lost.";
-    detail = `${fault.message}. Keyboard and mouse sharing carries on without this window.`;
-    actions = [retryButton];
-  } else if (fault) {
-    headline = "The agent could not be reached.";
-    detail = fault.message;
-    actions = [retryButton];
-  } else {
-    headline = "Not connected to the agent.";
-    detail = "";
-    actions = [retryButton];
-  }
-
-  bannerEl.className = "banner warning";
+  bannerEl.className = banner.tone === "info" ? "banner" : "banner warning";
   replace(
     bannerEl,
     h(
       "div",
       { class: "banner-text" },
-      h("strong", {}, headline),
-      detail ? h("span", {}, detail) : null,
-      daemon?.agentPath === null && code === "notRunning"
-        ? h(
-            "span",
-            { class: "mono small" },
-            "Set WINXTEND_AGENT to the path of wx-agent to start it from here."
-          )
-        : null
+      h("strong", {}, banner.headline),
+      banner.detail ? h("span", {}, banner.detail) : null,
+      // Plain rather than `mono`: a hint is now a sentence about what is missing,
+      // which may or may not have a variable name in it.
+      banner.hint ? h("span", { class: "small" }, banner.hint) : null
     ),
-    h("div", { class: "row" }, ...actions)
+    h("div", { class: "row" }, ...banner.actions.map((name) => buttons[name]()))
   );
 }
 
@@ -172,26 +142,6 @@ function selectView(name) {
   renderAll();
 }
 
-/// Try to attach without making noise about it.
-///
-/// Used on startup and by the poll, where a missing agent is the expected case and a
-/// thrown error every two seconds would fill the activity log with the same line.
-async function autoConnect() {
-  if (autoConnecting || connected()) return;
-  autoConnecting = true;
-  try {
-    await refreshDaemon();
-    if (store.daemon?.endpoint && !store.daemon.connected) {
-      await connect();
-    }
-  } catch {
-    // The banner already carries the reason; see store.fault.
-  } finally {
-    autoConnecting = false;
-    renderAll();
-  }
-}
-
 function wire() {
   bannerEl = document.getElementById("banner");
   connectionEl = document.getElementById("connection");
@@ -208,11 +158,17 @@ function wire() {
 async function main() {
   wire();
   renderAll();
+  // Subscribing first so that nothing the agent publishes between attaching and
+  // listening is missed — but the result is not awaited for permission to carry
+  // on. Discovery does not need events, and a startup that stops here is a window
+  // that never looks for the daemon at all: no attach, and no timer below to try
+  // again. `listenToAgent` therefore reports through `store.eventsProblem`, which
+  // the banner names, instead of throwing.
   await listenToAgent();
-  await autoConnect();
+  await attachToRunningAgent();
 
   setInterval(() => {
-    if (!connected()) autoConnect();
+    if (!connected()) attachToRunningAgent();
   }, DISCOVER_INTERVAL_MS);
 
   setInterval(() => {
@@ -226,13 +182,16 @@ async function main() {
   // Coming back to the window is the moment stale numbers are most obvious.
   window.addEventListener("focus", () => {
     if (connected()) refreshStatus().catch(() => {});
-    else autoConnect();
+    else attachToRunningAgent();
   });
 }
 
 main().catch((error) => {
-  // Nothing else has rendered yet if this fails, so say so in the document itself
-  // rather than only in a console the user will never open.
+  // Only a fault in this file reaches here now: everything that talks to the agent
+  // reports through the store so that the banner can describe it. A message in the
+  // document rather than only in a console the user will never open, and below the
+  // banner rather than instead of it, because a half-started window still has to
+  // say what it does know.
   document.body.appendChild(
     h(
       "pre",
