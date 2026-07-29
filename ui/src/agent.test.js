@@ -7,7 +7,13 @@ const tauri = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: tauri.listen }));
 
-import { attachToRunningAgent, connected, listenToAgent, store } from "./agent.js";
+import {
+  applyEvent,
+  attachToRunningAgent,
+  connected,
+  listenToAgent,
+  store,
+} from "./agent.js";
 
 /// A `DaemonView` for an agent this window did not start: an endpoint file is on
 /// disk, and nothing is attached to it yet.
@@ -155,5 +161,140 @@ describe("attaching to an agent this window did not start", () => {
 
     const attaches = tauri.invoke.mock.calls.filter(([c]) => c === "connect_agent");
     expect(attaches).toHaveLength(1);
+  });
+});
+
+describe("pairing prompts", () => {
+  /// The event the agent pushes when another machine is showing a code and is
+  /// waiting for it to be typed here.
+  const requested = (node, name) => ({ kind: "pairingRequested", node, name });
+
+  it("does not replace a code the user is halfway through typing", () => {
+    applyEvent(requested("aa", "workhorse"));
+    store.pairing.pin = "123";
+    applyEvent(requested("bb", "laptop"));
+
+    expect(store.pairing.node).toBe("aa");
+    expect(store.pairing.pin).toBe("123");
+  });
+
+  // The reported failure, and the reason retrying never helped the captain: the
+  // guard above had no expiry. `store.pairing` was set by the first request and
+  // cleared by nothing, so every later request — from any machine, for the rest
+  // of the window's life — was dropped in silence. The agent now says when a
+  // pairing is over, including the case that started this, a session that died
+  // underneath one; the card that remains is a receipt and must stand aside.
+  it("prompts again once the pairing that was on screen has ended", () => {
+    applyEvent(requested("aa", "workhorse"));
+    applyEvent({
+      kind: "pairingFinished",
+      node: "aa",
+      accepted: false,
+      message: "the connection was lost",
+    });
+
+    // The user is told why, without having to dismiss anything for the next
+    // attempt to work.
+    expect(store.pairing.finished).toBe(true);
+    expect(store.pairing.error).toBe("the connection was lost");
+
+    applyEvent(requested("aa", "workhorse"));
+
+    expect(store.pairing.finished).toBeUndefined();
+    expect(store.pairing.direction).toBe("incoming");
+    expect(store.pairing.node).toBe("aa");
+  });
+
+  // The other half of why nothing appeared on the second machine: the agent
+  // emits `pairingRequested` microseconds after the session comes up, which is
+  // long before a window started from the desktop has attached, and a reload
+  // throws away everything the previous window heard. Without the snapshot
+  // there is no replay and the prompt is simply lost.
+  it("shows a pairing that was already under way when the window attached", async () => {
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({
+            kind: "status",
+            status: {
+              ...SNAPSHOT,
+              pairings: [
+                { node: "aa", name: "workhorse", initiatedLocally: false, pin: null },
+              ],
+            },
+          });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    await attachToRunningAgent();
+
+    expect(store.pairing).toMatchObject({
+      direction: "incoming",
+      node: "aa",
+      name: "workhorse",
+      pin: "",
+    });
+  });
+
+  it("shows the code again to the machine that generated it", async () => {
+    // The initiator's window, reloaded while it was showing the PIN. It cannot
+    // ask the agent to make another one — that would restart the exchange and
+    // invalidate the digits the user is already typing on the other machine.
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({
+            kind: "status",
+            status: {
+              ...SNAPSHOT,
+              pairings: [
+                { node: "bb", name: "laptop", initiatedLocally: true, pin: "123456" },
+              ],
+            },
+          });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    await attachToRunningAgent();
+
+    expect(store.pairing).toMatchObject({ direction: "outgoing", node: "bb", pin: "123456" });
+  });
+
+  it("does not overwrite a prompt the user is answering with the snapshot's copy", async () => {
+    applyEvent(requested("aa", "workhorse"));
+    store.pairing.pin = "1234";
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({
+            kind: "status",
+            status: {
+              ...SNAPSHOT,
+              pairings: [
+                { node: "aa", name: "workhorse", initiatedLocally: false, pin: null },
+              ],
+            },
+          });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    await attachToRunningAgent();
+
+    expect(store.pairing.pin).toBe("1234");
   });
 });

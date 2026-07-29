@@ -519,10 +519,48 @@ pub struct StatusSnapshot {
     /// cannot be known without root.
     #[serde(default)]
     pub firewall: Option<String>,
+    /// Pairings the agent has under way right now, oldest first.
+    ///
+    /// Carried for the same reason as `firewall`, and it is the same trap:
+    /// [`Event::PairingRequested`] is a moment, and a window that attaches after
+    /// that moment — started late, or reloaded — would otherwise never learn a
+    /// machine is waiting for a code, and no later event would tell it. The
+    /// agent emits the request within microseconds of the session coming up, so
+    /// losing that race is the ordinary case rather than the unlucky one.
+    ///
+    /// A list rather than one entry because the agent really can have several,
+    /// and picking one here would be this file guessing at a policy the UI
+    /// already has: it shows one prompt at a time and chooses which itself.
+    #[serde(default)]
+    pub pairings: Vec<PendingPairingSnapshot>,
     pub monitors: Vec<MonitorSpec>,
     pub cursor: CursorSnapshot,
     pub layout: LayoutSpec,
     pub peers: Vec<PeerSnapshot>,
+}
+
+/// One pairing exchange the agent is in the middle of.
+///
+/// The direction is what decides which card a window draws, and it is not
+/// symmetric: the side that started the exchange generated the six digits and
+/// displays them, the other side types them in. See [`Response::PairingStarted`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPairingSnapshot {
+    pub node: String,
+    pub name: String,
+    /// Whether this machine started the exchange, and so is the side showing
+    /// the code rather than the side prompting for it.
+    pub initiated_locally: bool,
+    /// The six digits, on the side that generated them.
+    ///
+    /// Absent on the side that must type them: that machine never knows the
+    /// code, and the digits its user has typed so far belong to the window, not
+    /// to the agent. Present here so a window opened after `beginPairing` can
+    /// still show the user what to type on the other machine — the same value
+    /// [`Response::PairingStarted`] already returned over this channel.
+    #[serde(default)]
+    pub pin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -696,6 +734,7 @@ pub fn status_snapshot(
     uptime: Duration,
     firewall: Option<&str>,
     autostart: bool,
+    pairings: Vec<PendingPairingSnapshot>,
 ) -> StatusSnapshot {
     let owner = state.cursor_owner();
     let owner_name = if owner == state.local() {
@@ -725,6 +764,7 @@ pub fn status_snapshot(
         discovery: config.network.discovery,
         autostart,
         firewall: firewall.map(str::to_string),
+        pairings,
         monitors: state.local_monitors().iter().map(MonitorSpec::of).collect(),
         cursor: CursorSnapshot {
             owner: owner.to_hex(),
@@ -1382,6 +1422,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             false,
+            Vec::new(),
         );
 
         assert_eq!(snapshot.capabilities, granted.0);
@@ -1403,6 +1444,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(revoked.capabilities, wx_proto::Capabilities::HAS_DISPLAYS.0);
     }
@@ -1422,6 +1464,12 @@ mod tests {
             discovery: true,
             autostart: false,
             firewall: Some("ufw is enabled".into()),
+            pairings: vec![PendingPairingSnapshot {
+                node: NodeId([2u8; 32]).to_hex(),
+                name: "workhorse".into(),
+                initiated_locally: true,
+                pin: Some("123456".into()),
+            }],
             monitors: vec![MonitorSpec {
                 id: 0,
                 name: "DP-1".into(),
@@ -1513,6 +1561,7 @@ mod tests {
                 Duration::from_secs(1),
                 firewall,
                 false,
+                Vec::new(),
             )
             .firewall
         };
@@ -1554,6 +1603,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             false,
+            Vec::new(),
         );
         assert!(
             !snapshot.autostart,
@@ -1589,6 +1639,7 @@ mod tests {
             Duration::from_secs(7),
             None,
             false,
+            Vec::new(),
         );
         assert_eq!(snapshot.capabilities, advertised.0);
         assert_ne!(

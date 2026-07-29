@@ -712,6 +712,67 @@ struct PendingPairing {
     started: Instant,
 }
 
+/// Drop a pairing that cannot go on, and tell the UI it is over.
+///
+/// Free rather than a method on the engine so that both of its callers are
+/// obliged to use the same rule, and so that a test can reach it: an engine
+/// needs a platform backend, a config directory and the network to exist, and
+/// the behaviour worth pinning here is one map removal and one event.
+///
+/// The event is the UI's only expiry. `store.pairing` in the frontend is set by
+/// `pairingRequested` and cleared by nothing else, so a pairing the agent has
+/// silently forgotten leaves that window holding a card it will never take down
+/// — and, because it holds one, dropping every later request. Every path that
+/// removes a `pending` entry must therefore come through here.
+fn end_pending_pairing(
+    pending: &mut HashMap<NodeId, PendingPairing>,
+    events: &broadcast::Sender<Event>,
+    node: NodeId,
+    why: &str,
+) -> bool {
+    if pending.remove(&node).is_none() {
+        return false;
+    }
+    let _ = events.send(Event::PairingFinished {
+        node: node.to_hex(),
+        accepted: false,
+        message: Some(why.to_string()),
+    });
+    true
+}
+
+/// What a UI needs in order to draw the pairings already under way.
+///
+/// Free for the same reason as [`end_pending_pairing`]: it is the whole of what
+/// [`ipc::StatusSnapshot::pairings`] is, and it is reachable from a test.
+fn pending_pairing_snapshots(
+    pending: &HashMap<NodeId, PendingPairing>,
+) -> Vec<ipc::PendingPairingSnapshot> {
+    let mut by_age: Vec<&PendingPairing> = pending.values().collect();
+    // Oldest first, so a window that attaches late adopts the same pairing the
+    // events would have offered it first, and so two windows agree. `started` can
+    // tie between two sessions admitted in the same instant; the node id breaks it
+    // only to keep the order stable across status requests.
+    by_age.sort_by(|a, b| a.started.cmp(&b.started).then_with(|| a.node.cmp(&b.node)));
+    by_age
+        .into_iter()
+        .map(|p| ipc::PendingPairingSnapshot {
+            node: p.node.to_hex(),
+            name: p.name.clone(),
+            initiated_locally: p.initiated_locally,
+            // Only for the side that generated it. The responder also holds a
+            // `PairingSession` once the user has typed something, and that is the
+            // user's own guess — echoing it back as "the code" would show a second
+            // window a number nobody should be typing anywhere.
+            pin: p
+                .pairing
+                .as_ref()
+                .filter(|_| p.initiated_locally)
+                .map(|s| s.pin().as_str().to_string()),
+        })
+        .collect()
+}
+
 /// What the agent needs in order to start.
 pub struct EngineOptions {
     /// Directory holding the identity key, trust store, config, and IPC endpoint
@@ -2107,7 +2168,14 @@ impl Engine {
         }
         self.gates.remove(&node);
         self.last_heard.remove(&node);
-        self.pending.remove(&node);
+        // Announced, not merely dropped: the exchange is over for the UI too, and
+        // it has no other way to find that out. See [`end_pending_pairing`].
+        end_pending_pairing(
+            &mut self.pending,
+            &self.events,
+            node,
+            "the connection was lost",
+        );
         // The request outstanding with that peer dies with the session, and leaving
         // it recorded is not merely untidy. It would let the peer's *next* session
         // set this machine's clipboard with no offer in front of it, because a
@@ -2273,15 +2341,8 @@ impl Engine {
 
     /// Give up on a pairing, telling the UI why.
     async fn abandon_pairing(&mut self, node: NodeId, why: &str) {
-        let existed = self.pending.remove(&node).is_some();
+        end_pending_pairing(&mut self.pending, &self.events, node, why);
         self.offered_pins.discard(node);
-        if existed {
-            let _ = self.events.send(Event::PairingFinished {
-                node: node.to_hex(),
-                accepted: false,
-                message: Some(why.to_string()),
-            });
-        }
         // The session was only ever admitted for pairing, so it has no further
         // purpose and must not be left open to an untrusted peer.
         if !self.state.is_reachable(node) {
@@ -2715,6 +2776,7 @@ impl Engine {
                     self.state.uptime(Instant::now()),
                     self.firewall.as_deref(),
                     self.autostart_registered(),
+                    pending_pairing_snapshots(&self.pending),
                 )),
             },
             Request::ListPeers => Response::Peers {
@@ -2922,6 +2984,10 @@ impl Engine {
         if let Some(link) = self.sessions.remove(&node) {
             link.session.close("restarting pairing");
         }
+        // Silently, unlike every other removal: this is the same pairing starting
+        // again, not one ending. A `PairingFinished` here would race the
+        // `pairingStarted` answer below and put the window's fresh card into the
+        // failed state. See [`end_pending_pairing`].
         self.pending.remove(&node);
         self.dialing.remove(&node);
         self.dial(node, addresses, true);
@@ -6284,5 +6350,132 @@ mod tests {
         let layout = autolayout::bootstrap(node(1), &[mon(0, 0, 1920)]);
         let cursor = VirtualCursor::anywhere(&layout).expect("no cursor could be placed");
         assert_eq!(cursor.monitor().node, node(1));
+    }
+
+    // -- pairings the UI has to be told about ------------------------------
+    //
+    // These exercise the two free functions rather than `Engine::on_peer_gone`
+    // and `Request::Status`, because an `Engine` needs a platform backend, a
+    // config directory and a live endpoint, and starting one here would put an
+    // mDNS advertisement on whatever network the test runs on. The functions are
+    // the whole of the behaviour: `on_peer_gone` calls one and the status
+    // request builds its list from the other.
+
+    fn established_with(peer: NodeId, role: wx_net::Role) -> Box<Established> {
+        Box::new(Established {
+            role,
+            peer: NodeInfo {
+                id: peer,
+                name: "workhorse".into(),
+                platform: wx_proto::Platform::Linux,
+                display_server: wx_proto::DisplayServer::Wayland,
+                capabilities: Capabilities::HAS_DISPLAYS,
+                monitors: Vec::new(),
+                agent_version: "0.1.0".into(),
+            },
+            protocol: wx_proto::PROTOCOL_VERSION,
+            peer_protocol: wx_proto::PROTOCOL_VERSION,
+            local_nonce: [3u8; 32],
+            peer_nonce: [4u8; 32],
+            peer_was_paired: false,
+        })
+    }
+
+    /// A pairing as the engine holds it. The `PairingSession` is the code this
+    /// side generated, which only the initiator has at this point.
+    fn pending_pairing(peer: NodeId, initiated_locally: bool, started: Instant) -> PendingPairing {
+        let established = established_with(peer, wx_net::Role::Initiator);
+        let pairing = initiated_locally.then(|| {
+            PairingSession::new(
+                &established,
+                Pin::parse("123456").expect("a six-digit code"),
+            )
+        });
+        PendingPairing {
+            node: peer,
+            name: "workhorse".into(),
+            initiated_locally,
+            established,
+            pairing,
+            started,
+        }
+    }
+
+    #[test]
+    fn a_pairing_that_dies_with_its_session_is_announced_to_the_ui() {
+        // The regression: `on_peer_gone` used to drop the entry with
+        // `pending.remove(&node)` and say nothing. The UI sets its pairing card
+        // from events alone, so a silent removal left every window holding a card
+        // for an exchange the agent had already forgotten — and, because that card
+        // suppressed the next request, no pairing could ever be prompted for
+        // again without reloading the window.
+        let (events, mut rx) = broadcast::channel(8);
+        let mut pending = HashMap::new();
+        pending.insert(node(2), pending_pairing(node(2), false, Instant::now()));
+
+        let removed =
+            end_pending_pairing(&mut pending, &events, node(2), "the connection was lost");
+
+        assert!(removed);
+        assert!(pending.is_empty(), "the pairing outlived its session");
+        match rx.try_recv().expect("the UI was told nothing") {
+            Event::PairingFinished {
+                node: hex,
+                accepted,
+                message,
+            } => {
+                assert_eq!(hex, node(2).to_hex());
+                assert!(!accepted);
+                assert_eq!(message.as_deref(), Some("the connection was lost"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn losing_a_session_that_was_not_pairing_announces_nothing() {
+        // The other half of the rule: `on_peer_gone` runs on every session loss,
+        // and a paired peer disconnecting must not make the UI show a failed
+        // pairing that never happened.
+        let (events, mut rx) = broadcast::channel(8);
+        let mut pending = HashMap::new();
+
+        assert!(!end_pending_pairing(
+            &mut pending,
+            &events,
+            node(2),
+            "the connection was lost"
+        ));
+        assert!(rx.try_recv().is_err(), "a pairing nobody started was ended");
+    }
+
+    #[test]
+    fn a_late_window_can_recover_the_pairing_it_never_heard_about() {
+        // What a UI attaching after `PairingRequested` was emitted has to be able
+        // to read out of the status snapshot: which machine, which way round, and
+        // — only on the side that generated it — the code to show the user.
+        let now = Instant::now();
+        let older = now - Duration::from_secs(5);
+        let mut pending = HashMap::new();
+        pending.insert(node(2), pending_pairing(node(2), false, now));
+        pending.insert(node(3), pending_pairing(node(3), true, older));
+
+        let snapshots = pending_pairing_snapshots(&pending);
+
+        assert_eq!(snapshots.len(), 2);
+        // Oldest first, so every window adopts the same one.
+        assert_eq!(snapshots[0].node, node(3).to_hex());
+        assert!(snapshots[0].initiated_locally);
+        assert_eq!(
+            snapshots[0].pin.as_deref(),
+            Some("123456"),
+            "the side showing the code cannot show it"
+        );
+        assert_eq!(snapshots[1].node, node(2).to_hex());
+        assert!(!snapshots[1].initiated_locally);
+        assert_eq!(
+            snapshots[1].pin, None,
+            "a code was offered to the side that is supposed to type it"
+        );
     }
 }

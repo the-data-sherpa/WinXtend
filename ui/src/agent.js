@@ -179,6 +179,7 @@ export async function disconnect() {
 export async function refreshStatus() {
   const response = await callOk({ kind: "status" });
   store.status = response.status;
+  adoptPendingPairing(store.status);
   changed();
   return store.status;
 }
@@ -249,6 +250,45 @@ function upsertPeer(peer) {
   status.peers = peers;
 }
 
+/// Whether a pairing is still in progress here, as opposed to over and on screen.
+///
+/// The card outlives the exchange on purpose: "the connection was lost" is what
+/// explains to the user why the code they were shown stopped working, and a card
+/// that simply vanished would leave them retrying a machine they think is fine.
+/// It just no longer stands in the way of anything.
+function livePairing() {
+  return Boolean(store.pairing) && !store.pairing.finished;
+}
+
+/// Take up a pairing the agent already has under way.
+///
+/// The events are the live path and this is the recovery one: `pairingRequested`
+/// is a moment, and a window is routinely not listening at that moment — the
+/// agent emits it within microseconds of the session coming up, long before a
+/// window started from the desktop has attached, and a reload throws away
+/// everything the previous one heard. Without this, the machine being asked to
+/// pair shows nothing at all and the user has no way to reach the prompt.
+///
+/// Only ever *adds* a card. A snapshot that does not mention a pairing this
+/// window is showing is not evidence the pairing is gone: `beginPairing` answers
+/// before the agent has dialled the other machine, so the outgoing card exists
+/// for a moment while the agent has nothing pending. Ending a pairing is the
+/// agent's to announce, and it does — see `pairingFinished`.
+function adoptPendingPairing(status) {
+  if (livePairing()) return;
+  const pending = status?.pairings?.[0];
+  if (!pending) return;
+  store.pairing = {
+    direction: pending.initiatedLocally ? "outgoing" : "incoming",
+    node: pending.node,
+    name: pending.name,
+    // The initiator's card shows the code; the responder's holds what the user
+    // types, and starts empty.
+    pin: pending.initiatedLocally ? pending.pin || "" : "",
+    error: null,
+  };
+}
+
 /// Apply one agent event to the store. Exported for the event listener only.
 export function applyEvent(event) {
   const status = store.status;
@@ -274,7 +314,15 @@ export function applyEvent(event) {
       // The other machine started this and is showing a code. Only one prompt at a
       // time: a second request while one is open would replace the code the user is
       // halfway through typing.
-      if (!store.pairing) {
+      //
+      // "Open" means unfinished, which is the whole of what this guard used to get
+      // wrong. `store.pairing` was written by this branch and cleared by nothing
+      // except the user, so the first pairing to end — dropped session, refusal,
+      // even a success nobody dismissed — left a card standing that silently
+      // swallowed every later request, on both machines, until the window was
+      // reloaded. A finished card is a receipt, not a prompt in progress, and must
+      // give way to the next request. See `pairingFinished` for what ends one.
+      if (!livePairing()) {
         store.pairing = {
           direction: "incoming",
           node: event.node,

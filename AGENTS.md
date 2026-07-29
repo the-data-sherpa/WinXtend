@@ -324,6 +324,22 @@ rather than throwing, and `ui/src/banner.js` owns what the window is entitled to
 claim — "the agent is not running" is a statement about the daemon and may only be
 made after the endpoint file has actually been looked for and found missing.
 
+## Anything a window must show has to be in the snapshot, not only in an event
+
+`ipc::Event` is a moment and there is no replay. A window is routinely not
+listening at that moment: the agent under `systemctl --user` is up long before
+anyone opens the UI, it emits `PairingRequested` microseconds after the session
+carrying it comes up, and a webview reload throws away everything the previous
+window heard. So any condition the user has to act on must also be a field on
+`ipc::StatusSnapshot`, which every window asks for on connecting — `firewall` and
+`pairings` are both there for this reason and say so in their doc comments.
+
+The mirror of it on the frontend: state the store latches on an event needs an
+event that ends it. `store.pairing` in `ui/src/agent.js` had none, so the first
+pairing to end left a card standing that suppressed every later prompt — see
+`end_pending_pairing` in `engine.rs`, which is the one path allowed to remove a
+pending pairing so that the announcement cannot be forgotten.
+
 ## A plain `cargo build` of the UI produces a dev-mode binary
 
 `generate_context!` picks `devUrl` over `frontendDist` whenever `tauri/custom-protocol`
