@@ -182,6 +182,12 @@ body {
   background: var(--panel-2);
 }
 
+/* `display` above outranks the user-agent `[hidden]` rule, so hiding the banner
+   from the code has to be spelled out here or its last sentence stays on screen. */
+.banner[hidden] {
+  display: none;
+}
+
 .banner.warning {
   background: var(--busy-bg);
   color: var(--ink);
