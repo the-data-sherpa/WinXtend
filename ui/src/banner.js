@@ -36,8 +36,8 @@ export function bannerFor({ connected, busy, daemon, fault, eventsProblem }) {
     return {
       tone: "warning",
       headline: "Connected, but this window is not receiving live updates.",
-      detail: `${eventsProblem}. Sharing is unaffected — the agent does not need this window — but what is on screen only changes when it is refreshed.`,
-      hint: "",
+      detail: `${eventsProblem}. What is on screen is a snapshot and will quietly stop matching the agent.`,
+      hint: "Pairing needs this: a request from another machine will not appear here, and a pairing started from this window will sit on its code without ever saying whether it was accepted.",
       actions: [],
     };
   }
@@ -63,6 +63,21 @@ export function bannerFor({ connected, busy, daemon, fault, eventsProblem }) {
       tone: "warning",
       headline: "This window could not check whether the agent is running.",
       detail: `${fault.message}. The fault is in the window, not in the agent: sharing may well be running, and this window cannot see it.`,
+      hint: events,
+      actions: ["retry"],
+    };
+  }
+
+  // The host looked and could not tell. `endpoint` is null here for the same
+  // reason it is null when no agent exists, so the reason it carries is the only
+  // thing separating "there is no daemon" from "this window cannot see the daemon
+  // that is running" — and saying the first when the second is true is what sends
+  // a user to restart a service that never stopped.
+  if (!daemon.endpoint && daemon.message) {
+    return {
+      tone: "warning",
+      headline: "This window could not read the agent's details.",
+      detail: `${daemon.message}. Whether an agent is running cannot be told from here: sharing may well be going on.`,
       hint: events,
       actions: ["retry"],
     };

@@ -208,7 +208,14 @@ export async function attachToRunningAgent() {
   attaching = true;
   try {
     await refreshDaemon();
-    if (store.daemon?.endpoint && !store.daemon.connected) {
+    // `!connected()` rather than `!store.daemon.connected`: the host holding a link
+    // is not the same as this window holding a snapshot, and the gap between them is
+    // reachable — a connect whose following status request was refused, or a webview
+    // reloaded while the host's link outlived it. Keying on the host's flag alone
+    // leaves that state permanent, since every later tick sees `connected: true` and
+    // does nothing, and only a click on "Try again" gets out of it. `connect_agent`
+    // returns the existing link when there is one, so asking again costs nothing.
+    if (store.daemon?.endpoint && !connected()) {
       await connect();
     }
   } catch {

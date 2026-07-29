@@ -113,6 +113,41 @@ describe("attaching to an agent this window did not start", () => {
     expect(tauri.invoke).not.toHaveBeenCalledWith("connect_agent");
   });
 
+  it("recovers on its own when the host is attached but this window has no snapshot", async () => {
+    // The host holding a link and this window holding a snapshot are two different
+    // things, and they come apart: `connect_agent` succeeds, the status request
+    // that follows it is refused, and the window is left attached with nothing to
+    // draw. Keying rediscovery on the host's `connected` flag made that permanent —
+    // every later tick saw `connected: true`, did nothing, and the banner sat on
+    // "Not connected to the agent" until someone clicked, which is the one thing
+    // this path exists to avoid.
+    let statuses = 0;
+    const daemon = { ...FOUND, connected: true };
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+          return Promise.resolve(daemon);
+        case "connect_agent":
+          // Idempotent host-side: the link is already there and is handed back.
+          return Promise.resolve(daemon);
+        case "agent_request":
+          return statuses++ === 0
+            ? Promise.resolve({ kind: "error", code: "internal", message: "not ready" })
+            : Promise.resolve({ kind: "status", status: SNAPSHOT });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    expect(await attachToRunningAgent()).toBe(false);
+    expect(store.daemon.connected).toBe(true);
+    expect(store.status).toBeNull();
+
+    // No click on "Try again": the next turn of the rediscovery timer is enough.
+    expect(await attachToRunningAgent()).toBe(true);
+    expect(store.status.nodeName).toBe("cowen-ubuntu");
+  });
+
   it("does not stack attempts while one is already running", async () => {
     hostWith(FOUND);
 

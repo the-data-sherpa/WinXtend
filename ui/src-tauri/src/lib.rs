@@ -51,7 +51,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use wx_agent::config::Config;
-use wx_agent::ipc::{EndpointFile, Event, LayoutSpec, Request, Response};
+use wx_agent::ipc::{EndpointFile, Event, IpcError, LayoutSpec, Request, Response};
 
 use link::{ConnectError, Link, Notifier, StatusNote, EVENT_CHANNEL, STATUS_CHANNEL};
 use problems::ProblemView;
@@ -187,7 +187,13 @@ pub struct DaemonView {
     /// Where a daemon would be started from, so a missing binary can be named.
     pub agent_path: Option<String>,
     pub ui_version: String,
-    /// Set when the last attempt failed, for the banner's second line.
+    /// Why this view is not the whole truth, for the banner's second line.
+    ///
+    /// Set when the last attempt failed, and — the case that matters — whenever
+    /// `endpoint` is `None` for any reason other than the file being absent. The
+    /// two are not interchangeable: an absent file means no agent, an unreadable
+    /// one means this process could not tell, and only the first of those licenses
+    /// the interface to announce that the agent is not running.
     pub message: Option<String>,
 }
 
@@ -210,21 +216,31 @@ impl From<&EndpointFile> for EndpointView {
 }
 
 fn daemon_view(state: &AppState, connected: bool, message: Option<String>) -> DaemonView {
-    // Report why the endpoint could not be read rather than discarding the error.
-    // A swallowed failure here is indistinguishable in the UI from "no agent is
-    // running", which sends the user looking for a daemon that is already up.
-    let endpoint = match state.config_dir.as_deref() {
+    // Carry why the endpoint could not be read to the frontend, rather than to a
+    // stderr no installed user ever sees. `endpoint: None` is read by the banner as
+    // "there is no agent"; anything other than a missing file that lands there is a
+    // window telling someone their daemon is stopped while `systemctl --user`
+    // says it is up, so only `NotRunning` is allowed to be silent.
+    let (endpoint, problem) = match state.config_dir.as_deref() {
         Some(dir) => match EndpointFile::read(dir) {
-            Ok(file) => Some(file),
-            Err(e) => {
-                eprintln!("wx-ui: endpoint unreadable at {}: {e}", dir.display());
-                None
-            }
+            Ok(file) => (Some(file), None),
+            Err(IpcError::NotRunning(_)) => (None, None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "the agent's details at {} could not be read ({e})",
+                    EndpointFile::path(dir).display()
+                )),
+            ),
         },
-        None => {
-            eprintln!("wx-ui: no config directory resolved");
-            None
-        }
+        None => (
+            None,
+            Some(
+                "this system has no per-user configuration directory, so the agent's \
+                 endpoint file cannot be found"
+                    .to_string(),
+            ),
+        ),
     };
     DaemonView {
         connected,
@@ -232,7 +248,10 @@ fn daemon_view(state: &AppState, connected: bool, message: Option<String>) -> Da
         endpoint: endpoint.as_ref().map(EndpointView::from),
         agent_path: spawn::find_agent().map(|p| p.display().to_string()),
         ui_version: UI_VERSION.to_string(),
-        message,
+        // The endpoint problem wins: it is the one that decides whether the banner
+        // may call the agent stopped, and a caller's message describes an attempt
+        // that could not have got started without it.
+        message: problem.or(message),
     }
 }
 
@@ -518,9 +537,14 @@ mod tests {
         let granted: Vec<String> = capabilities()
             .iter()
             .filter(|cap| {
+                // A capability with no `windows` key grants nothing: Tauri builds
+                // the capability's window set from that list, and an empty list of
+                // globs matches no label. Reading a missing list as "all windows"
+                // would let a capability file pass this test and still be refused
+                // at runtime, which is the exact silent failure being guarded.
                 cap["windows"]
                     .as_array()
-                    .is_none_or(|w| w.iter().any(|w| w == &serde_json::json!(label)))
+                    .is_some_and(|w| w.iter().any(|w| w == &serde_json::json!(label)))
             })
             .flat_map(|cap| {
                 cap["permissions"]
@@ -561,6 +585,56 @@ mod tests {
             .as_str()
             .unwrap_or("main") // Tauri's default when a window does not name itself.
             .to_string()
+    }
+
+    fn state_for(dir: Option<PathBuf>) -> AppState {
+        AppState {
+            link: Mutex::new(None),
+            config_dir: dir,
+            config_dir_overridden: true,
+            generations: AtomicU64::new(1),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_endpoint_file_is_not_reported_as_a_missing_agent() {
+        // The reported bug in its host-side form. `endpoint: None` is the frontend's
+        // licence to say "the agent is not running", so a file it could not parse
+        // must arrive with a reason attached rather than as a silent absence — the
+        // daemon behind it may be running perfectly well.
+        let dir = std::env::temp_dir().join(format!("winxtend-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating a scratch config directory");
+        std::fs::write(EndpointFile::path(&dir), "{\"port\": 4").expect("writing a truncated file");
+
+        let view = daemon_view(&state_for(Some(dir.clone())), false, None);
+        assert!(view.endpoint.is_none());
+        let message = view
+            .message
+            .expect("an unreadable endpoint file explains itself");
+        assert!(message.contains("ipc.json"), "{message}");
+
+        // And a genuinely absent file stays silent, because that one really does
+        // mean no agent is running.
+        std::fs::remove_file(EndpointFile::path(&dir)).expect("removing the endpoint file");
+        let view = daemon_view(&state_for(Some(dir.clone())), false, None);
+        assert!(view.endpoint.is_none());
+        assert_eq!(view.message, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_system_with_nowhere_to_look_says_so_rather_than_saying_nothing_is_running() {
+        let view = daemon_view(&state_for(None), false, None);
+        assert!(view.endpoint.is_none());
+        assert!(
+            view.message
+                .as_deref()
+                .is_some_and(|m| m.contains("configuration directory")),
+            "{:?}",
+            view.message
+        );
     }
 
     #[test]

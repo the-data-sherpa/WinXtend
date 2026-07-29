@@ -58,6 +58,27 @@ describe("what the banner is allowed to claim", () => {
     expect(banner.actions).toEqual([]);
   });
 
+  it("does not call the agent stopped when the endpoint file could not be read", () => {
+    // Same claim, host-side path: `endpoint` is null here because `ipc.json` would
+    // not parse, not because it was absent. A daemon under `systemctl --user` can
+    // be running behind an unreadable file, so the window has to name the file it
+    // could not read instead of announcing a stopped agent.
+    const banner = bannerFor({
+      connected: false,
+      busy: false,
+      daemon: {
+        ...FOUND,
+        endpoint: null,
+        message: "the agent's details at /home/someone/.config/winxtend/ipc.json could not be read",
+      },
+      fault: null,
+      eventsProblem: null,
+    });
+    expect(words(banner)).not.toMatch(/agent is not running/i);
+    expect(banner.detail).toContain("ipc.json");
+    expect(banner.actions).toEqual(["retry"]);
+  });
+
   it("says the agent is not running once the host has looked and found nothing", () => {
     const banner = bannerFor({
       connected: false,
@@ -118,5 +139,13 @@ describe("what the banner is allowed to claim", () => {
     // the one failure a user cannot see.
     expect(banner.headline).toMatch(/not receiving live updates/i);
     expect(banner.detail).toContain(ACL);
+    // And does not wave it away. Pairing is driven entirely by these events, so a
+    // window without them cannot show an incoming request or finish an outgoing
+    // one; "sharing is unaffected" would send the user to try pairing and watch it
+    // hang. Nor does it promise a refresh it offers no button for.
+    expect(words(banner)).toMatch(/pairing/i);
+    expect(words(banner)).not.toMatch(/unaffected/i);
+    expect(words(banner)).not.toMatch(/refresh/i);
+    expect(banner.actions).toEqual([]);
   });
 });

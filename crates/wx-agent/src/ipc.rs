@@ -148,34 +148,57 @@ impl EndpointFile {
     /// The permissions are the security boundary, so they are set before the
     /// token is written where the platform allows it — a token that is briefly
     /// world-readable is a token that leaked.
+    ///
+    /// Written to a sibling and renamed into place rather than truncated and
+    /// rewritten where it sits. Every reader of this file is a separate process
+    /// racing the agent's startup, and a reader that opens a truncated file gets a
+    /// parse error it cannot tell apart from real corruption — which a UI then has
+    /// to render as something, having been given no way to say "an agent may well
+    /// be there and I could not read its details". The rename is atomic, so a
+    /// reader sees either the previous run's details or this run's, never a
+    /// fragment of either.
     pub fn write(&self, dir: &Path) -> Result<(), IpcError> {
         std::fs::create_dir_all(dir).map_err(io_err("creating the config directory"))?;
         let path = Self::path(dir);
+        let temp = path.with_extension("json.new");
         let json = serde_json::to_string_pretty(self)?;
 
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(io_err("creating the endpoint file"))?;
-            file.write_all(json.as_bytes())
-                .map_err(io_err("writing the endpoint file"))?;
-            Ok(())
-        }
+        let staged = || -> Result<(), IpcError> {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&temp)
+                    .map_err(io_err("creating the endpoint file"))?;
+                file.write_all(json.as_bytes())
+                    .map_err(io_err("writing the endpoint file"))?;
+                // Before the rename, so a machine that loses power mid-write leaves
+                // the old file rather than an empty one holding a live agent's place.
+                file.sync_all()
+                    .map_err(io_err("writing the endpoint file"))?;
+            }
 
-        #[cfg(not(unix))]
-        {
-            // Windows: the config directory lives under the user's profile and is
-            // already ACL'd to that user, which is the same boundary the unix mode
-            // bits draw.
-            std::fs::write(&path, json).map_err(io_err("writing the endpoint file"))
+            #[cfg(not(unix))]
+            {
+                // Windows: the config directory lives under the user's profile and is
+                // already ACL'd to that user, which is the same boundary the unix mode
+                // bits draw.
+                std::fs::write(&temp, &json).map_err(io_err("writing the endpoint file"))?;
+            }
+
+            std::fs::rename(&temp, &path).map_err(io_err("replacing the endpoint file"))
+        };
+
+        let result = staged();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
+        result
     }
 
     pub fn read(dir: &Path) -> Result<Self, IpcError> {
