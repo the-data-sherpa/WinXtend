@@ -171,6 +171,10 @@ export async function startAgent() {
 export async function disconnect() {
   await hostCall("disconnect_agent");
   store.status = null;
+  // Dropped with the link that would have ended it: no further agent event can
+  // reach this window, so a card left live here would outlive its own pairing and
+  // go on suppressing every later prompt. Matches the involuntary case below.
+  store.pairing = null;
   log("info", "Detached from the agent. It keeps running.");
   changed();
 }

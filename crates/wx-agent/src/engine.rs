@@ -317,6 +317,10 @@ enum Wake {
     DialFailed {
         node: NodeId,
         error: String,
+        /// Whether this was the dial a pairing was waiting on. A reconnect dial
+        /// that fails while a pairing dial to the same peer is in flight must not
+        /// be mistaken for the pairing's own failure; see [`OfferedPins`].
+        pairing: bool,
     },
     Discovery(DiscoveryEvent),
     Ipc(IpcCommand),
@@ -692,6 +696,17 @@ impl OfferedPins {
         self.pins.remove(&node);
     }
 
+    /// Forget a code whose own connection was never made, reporting whether
+    /// there was one. Narrower than [`OfferedPins::discard`] on purpose: only a
+    /// code still waiting for its dial can belong to a dial that just failed.
+    fn discard_awaiting_dial(&mut self, node: NodeId) -> bool {
+        if !self.awaiting_dial.remove(&node) {
+            return false;
+        }
+        self.pins.remove(&node);
+        true
+    }
+
     /// A session for `node` ended. Keeps a code whose own connection has not
     /// happened yet; see the type's documentation for why that matters.
     fn on_session_ended(&mut self, node: NodeId) {
@@ -731,6 +746,31 @@ fn end_pending_pairing(
     why: &str,
 ) -> bool {
     if pending.remove(&node).is_none() {
+        return false;
+    }
+    let _ = events.send(Event::PairingFinished {
+        node: node.to_hex(),
+        accepted: false,
+        message: Some(why.to_string()),
+    });
+    true
+}
+
+/// Give up a pairing whose dial never reached the other machine.
+///
+/// The counterpart to [`end_pending_pairing`] one step earlier in the exchange:
+/// nothing is put into `pending` until a session comes up, so a dial that never
+/// produces one leaves the card the window raised on the `pairingStarted` answer
+/// with nothing that could ever end it — not this function's sibling, and not the
+/// stale-pairing sweep, which only walks `pending`. Free, and returning whether it
+/// announced anything, for the same reasons as [`end_pending_pairing`].
+fn end_undialled_pairing(
+    offered_pins: &mut OfferedPins,
+    events: &broadcast::Sender<Event>,
+    node: NodeId,
+    why: &str,
+) -> bool {
+    if !offered_pins.discard_awaiting_dial(node) {
         return false;
     }
     let _ = events.send(Event::PairingFinished {
@@ -1451,8 +1491,20 @@ impl Engine {
                 generation,
                 reason,
             } => self.on_pump_gone(node, generation, reason).await,
-            Wake::DialFailed { node, error } => {
+            Wake::DialFailed {
+                node,
+                error,
+                pairing,
+            } => {
                 self.dialing.remove(&node);
+                if pairing {
+                    end_undialled_pairing(
+                        &mut self.offered_pins,
+                        &self.events,
+                        node,
+                        "could not reach that machine",
+                    );
+                }
                 self.state
                     .on_disconnected(node, Some(error.clone()), Instant::now());
                 tracing::debug!(peer = %node, error = %error, "dial failed");
@@ -2169,12 +2221,15 @@ impl Engine {
         self.gates.remove(&node);
         self.last_heard.remove(&node);
         // Announced, not merely dropped: the exchange is over for the UI too, and
-        // it has no other way to find that out. See [`end_pending_pairing`].
+        // it has no other way to find that out. See [`end_pending_pairing`]. The
+        // caller's reason wins where there is one: a peer the user disabled or
+        // forgot themselves did not lose its connection, and saying so sends them
+        // looking for a network fault they do not have.
         end_pending_pairing(
             &mut self.pending,
             &self.events,
             node,
-            "the connection was lost",
+            reason.as_deref().unwrap_or("the connection was lost"),
         );
         // The request outstanding with that peer dies with the session, and leaving
         // it recorded is not merely untidy. It would let the peer's *next* session
@@ -2708,7 +2763,11 @@ impl Engine {
                     }
                 }
             }
-            let _ = wake.send(Wake::DialFailed { node, error: last });
+            let _ = wake.send(Wake::DialFailed {
+                node,
+                error: last,
+                pairing: pairing_mode,
+            });
         });
     }
 
@@ -6447,6 +6506,60 @@ mod tests {
             "the connection was lost"
         ));
         assert!(rx.try_recv().is_err(), "a pairing nobody started was ended");
+    }
+
+    #[test]
+    fn a_pairing_whose_dial_never_landed_is_announced_to_the_ui() {
+        // The exit path one step before a session exists: `begin_pairing` answers
+        // with a code, the window puts a live card on screen, and the dial then
+        // fails. Nothing was ever put into `pending`, so neither the sibling
+        // function nor the stale-pairing sweep can reach it — without this, the
+        // card stayed live and suppressed every later request for the life of the
+        // window, which is the reported symptom read from the other side.
+        let (events, mut rx) = broadcast::channel(8);
+        let mut pins = OfferedPins::default();
+        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+
+        let ended =
+            end_undialled_pairing(&mut pins, &events, node(2), "could not reach that machine");
+
+        assert!(ended);
+        assert!(
+            pins.claim(node(2)).is_none(),
+            "a code was left for a connection that will never be made"
+        );
+        match rx.try_recv().expect("the UI was told nothing") {
+            Event::PairingFinished {
+                node: hex,
+                accepted,
+                message,
+            } => {
+                assert_eq!(hex, node(2).to_hex());
+                assert!(!accepted);
+                assert_eq!(message.as_deref(), Some("could not reach that machine"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dial_that_fails_after_its_code_was_claimed_announces_nothing() {
+        // Why `Wake::DialFailed` may not simply discard: once the code has been
+        // bound to a session the pairing is under way, and the only failure left to
+        // report belongs to `end_pending_pairing`. Announcing here as well would
+        // fail a card the user is still typing into.
+        let (events, mut rx) = broadcast::channel(8);
+        let mut pins = OfferedPins::default();
+        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        assert!(pins.claim(node(2)).is_some());
+
+        assert!(!end_undialled_pairing(
+            &mut pins,
+            &events,
+            node(2),
+            "could not reach that machine"
+        ));
+        assert!(rx.try_recv().is_err(), "a pairing in progress was failed");
     }
 
     #[test]

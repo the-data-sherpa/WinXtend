@@ -11,6 +11,7 @@ import {
   applyEvent,
   attachToRunningAgent,
   connected,
+  disconnect,
   listenToAgent,
   store,
 } from "./agent.js";
@@ -296,5 +297,25 @@ describe("pairing prompts", () => {
     await attachToRunningAgent();
 
     expect(store.pairing.pin).toBe("1234");
+  });
+
+  // Detaching drops the link the agent would have announced the end over, so a
+  // card left standing here can never be finished by anything: the pairing dies
+  // underneath, the rediscovery timer reattaches, and the snapshot only ever adds
+  // cards. It would have suppressed every later prompt for the life of the window
+  // — the same latch, reached voluntarily.
+  it("does not keep a pairing card across a detach", async () => {
+    hostWith(FOUND);
+    await attachToRunningAgent();
+    applyEvent(requested("aa", "workhorse"));
+
+    tauri.invoke.mockImplementation((command) =>
+      command === "disconnect_agent"
+        ? Promise.resolve({ ...FOUND, connected: false })
+        : Promise.reject(new Error(`unexpected command ${command}`))
+    );
+    await disconnect();
+
+    expect(store.pairing).toBeNull();
   });
 });
