@@ -210,7 +210,7 @@ for what the next release is about.
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
-| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit and the registration is tested against a scratch config root, but no systemd user manager has yet started it at a real login |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes, so the `.deb`'s own copy under `/usr/lib/systemd/user` is still the untested one |
 | Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
@@ -229,8 +229,9 @@ sudo apt install ./WinXtend_0.1.0_amd64.deb
 
 `apt` rather than `dpkg -i` so that the runtime dependencies are pulled in:
 `xdg-desktop-portal`, `xdg-desktop-portal-gnome`, and the WebKitGTK stack Tauri
-needs. Then launch **WinXtend** from the app grid; it starts the
-agent itself. What the package puts where:
+needs. Then launch **WinXtend** from the app grid; it attaches to an agent that is
+already running — including one the systemd user unit below started — and starts
+one itself if there is none. What the package puts where:
 
 | Path | What it is |
 |---|---|
@@ -476,7 +477,8 @@ that it can be argued with; please do.
 cargo test --workspace                    # everything
 cargo test -p wx-core                     # layout and routing, no I/O needed
 cargo clippy --workspace --all-targets    # clean
-cd ui && npm test                         # layout-editor geometry, status formatting
+cd ui && npm test                         # layout-editor geometry, status formatting,
+                                          # attaching to an agent, what the banner may claim
 ```
 
 The cargo commands above stop at the engine workspace; the Tauri crate has its own

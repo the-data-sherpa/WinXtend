@@ -142,6 +142,15 @@ real compositor on one box, with no extra packages:
 
 GNOME denies programmatic screenshots (`org.gnome.Shell.Screenshot`) to untrusted
 callers, so visual confirmation of the UI needs a human or a portal prompt.
+`org.gnome.Shell.Introspect.GetWindows` is refused the same way, so a nested shell
+cannot be asked what it is showing either; instrument the process instead.
+
+A second agent can be run on a live desktop without ever reaching the portal: with
+`WAYLAND_DISPLAY`, `DISPLAY` and `XDG_SESSION_TYPE` all unset, `detect_display_server`
+picks the evdev backend, which asks for nothing and reports "input capture
+unavailable". That is the safe way to exercise the mesh, the control channel, or the
+UI beside someone's working session — including from a throwaway systemd user unit,
+where `UnsetEnvironment=` does it — because nothing can then take the keyboard.
 
 The backend is split to keep that reachable from CI: the parts needing no desktop —
 restore-token persistence in `token.rs`, the session state machine in `session.rs`, the
@@ -293,6 +302,38 @@ Adding a runtime dependency or a packaged file means editing `bundle.linux.deb` 
 bundler and must not be listed there as well, or they appear twice in `Depends`.
 `.github/workflows/package.yml` asserts the built `.deb`'s contents and dependency list,
 which is the only check that the package is complete.
+
+## The window runs under a capability ACL, and only half of it is gated
+
+Tauri refuses every `plugin:*` command the webview sends unless a file in
+`ui/src-tauri/capabilities/` grants it, while the commands this crate registers with
+`invoke_handler` are allowed because they were registered. Nothing announces the
+difference: with no capability file the window still opens, still draws, and still
+starts an agent when the button is pressed — only `listen` is refused, so only the
+paths that need agent events break, and they break silently. That is how an agent
+running healthily under `systemctl --user` came to be reported as "not running": the
+frontend awaited its event subscription before it looked for a daemon, and the
+rejection took the discovery and its retry timer with it.
+
+Two rules follow. A new use of any Tauri plugin API needs a matching permission, and
+`tauri_build` will not tell you — it validates the capability files it finds and is
+content to find none; `the_window_may_subscribe_to_the_events_this_process_emits` in
+`ui/src-tauri/src/lib.rs` is the guard instead. And frontend startup must not let one
+failed step cancel the rest: `listenToAgent` reports through `store.eventsProblem`
+rather than throwing, and `ui/src/banner.js` owns what the window is entitled to
+claim — "the agent is not running" is a statement about the daemon and may only be
+made after the endpoint file has actually been looked for and found missing.
+
+## A plain `cargo build` of the UI produces a dev-mode binary
+
+`generate_context!` picks `devUrl` over `frontendDist` whenever `tauri/custom-protocol`
+is off, and that feature is turned on by the CLI's manifest rewrite at package time,
+not by anything in `Cargo.toml`. So `cargo run` in `ui/src-tauri` opens a window
+pointed at `http://localhost:1420`, which shows nothing whatever unless `npm run dev`
+is up — no error, just a blank window that reads exactly like a broken frontend. To
+exercise the binary the `.deb` ships, build it the way the package does:
+`npm run tauri build`, or `cargo build --release --features tauri/custom-protocol` for
+a quick one. `cargo test`, `cargo clippy` and `cargo fmt` are unaffected.
 
 ## Autostart is per-user on every platform, and the reasoning is load-bearing
 
