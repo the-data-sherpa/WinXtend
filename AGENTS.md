@@ -357,11 +357,22 @@ from the existing snapshot, which is why nothing was added to `StatusSnapshot`
 for it.
 
 `CursorSnapshot::locked` is **this machine's own router flag** and does not
-cross the wire (`Router::is_locked`, `wx-core/src/cursor.rs`). It pins the
-cursor only while this machine is the one holding it, so a machine that does not
-have the cursor must not report the cursor as locked — that would be a claim
-about somewhere else. `Request::LockAll` is a different thing entirely: it is
-screensaver sync, not the cursor lock.
+cross the wire (`Router::is_locked`, `crates/wx-core/src/router.rs`; the
+`cursor.rs` one is `VirtualCursor::is_locked`). What it pins is the virtual
+cursor's *current* monitor, whosever that monitor is: `VirtualCursor::move_by`
+consults `locked` before resolving a crossing and refuses it wherever the cursor
+happens to be, and `Request::SetCursorLock` sets the flag regardless of who owns
+the cursor. So locking while a peer holds the cursor keeps input flowing to that
+peer instead of clawing control back — see
+`locking_keeps_input_flowing_to_the_peer_that_already_owns_it` in
+`crates/wx-core/src/router.rs`, which pins exactly that. Two things follow, and
+they are easy to confuse. The lock a machine sets is in effect immediately, even
+when the cursor is elsewhere, and copy must not describe it as dormant or
+promise the cursor will come back. But the flag still says nothing about the
+*peer's* own lock, so a machine that does not have the cursor must not report
+the peer's cursor as locked — that would be a claim about somewhere else.
+`Request::LockAll` is a different thing entirely: it is screensaver sync, not
+the cursor lock.
 
 There is no machine in charge in this mesh. Do not describe one as a master or a
 slave in code, copy, or comments; ownership moves to whichever machine the user

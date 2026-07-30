@@ -7,7 +7,7 @@
 // copy of the agent's own log file, and it says so.
 
 import { callOk, changed, disconnect, log, refreshStatus, store } from "./agent.js";
-import { cursorStateFor } from "./cursor.js";
+import { cursorBadge, cursorStateFor } from "./cursor.js";
 import { h, replace } from "./dom.js";
 import {
   capabilitiesText,
@@ -162,19 +162,7 @@ function cursorPanel() {
   return h(
     "section",
     { class: "panel" },
-    h(
-      "header",
-      {},
-      h("h1", {}, "Cursor"),
-      h(
-        "span",
-        { class: `pill ${state.tone}` },
-        state.node
-          ? h("span", { class: "swatch small", style: { background: nodeColor(state.node) } })
-          : null,
-        state.badge
-      )
-    ),
+    h("header", {}, h("h1", {}, "Cursor"), cursorBadge(state)),
     h(
       "p",
       { class: `cursor-owner${state.certain ? "" : " uncertain"}` },

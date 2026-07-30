@@ -88,16 +88,23 @@ describe("the lock", () => {
     expect(state.detail).toContain("will not cross an edge");
   });
 
-  // `locked` is this machine's own router flag and does not cross the wire, so a
-  // machine that does not hold the cursor must not report the cursor as locked —
-  // that would be a claim about the machine that does hold it.
-  it("is not claimed to be in effect on a machine that does not have the cursor", () => {
+  // `locked` is this machine's own router flag and does not cross the wire, so
+  // the sentence stays a statement about this machine's flag — but the flag is
+  // in effect now, and it is what is keeping the cursor on the other machine:
+  // `locking_keeps_input_flowing_to_the_peer_that_already_owns_it` in
+  // `crates/wx-core/src/router.rs` pins that. Promising the cursor would come
+  // back was the exact opposite of what the engine does.
+  it("says the lock is what is keeping the cursor on the other machine", () => {
     const state = cursorStateFor(
       snapshot({ cursor: { ...THERE, locked: true }, peers: [peer("connected")] })
     );
     expect(state.headline).toBe("cowen-ubuntu has the keyboard and mouse.");
     expect(state.badge).toBe("Cursor on cowen-ubuntu");
-    expect(state.detail).toContain("set to keep the cursor once it arrives back here");
+    expect(state.detail).toContain("has the cursor locked");
+    expect(state.detail).toContain("keeping it there");
+    expect(state.detail).toContain("will not come back until you unlock it");
+    // The old copy said the lock was dormant and the cursor could still arrive.
+    expect(state.detail).not.toMatch(/arrives back|comes back here|once it returns/);
   });
 });
 

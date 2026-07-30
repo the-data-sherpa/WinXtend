@@ -1,4 +1,6 @@
-// Which machine has the keyboard and mouse, decided as data rather than as DOM.
+// Which machine has the keyboard and mouse: the decision as data, plus the one
+// badge that renders it, kept together so the two screens that show it cannot
+// drift apart in either the words or the markup.
 //
 // There is no machine in charge here and this file must not invent one: ownership
 // belongs to whichever machine the user is currently driving from, and it moves.
@@ -20,11 +22,14 @@
 // `certain`, and the ones that are not certain say so in words as well.
 //
 // The second rule: `locked` is *this* machine's own router flag and does not
-// cross the wire. It pins the cursor only while this machine is the one holding
-// it. Saying "the cursor is locked" on a machine that does not have the cursor
-// would be a claim about somewhere else that this build cannot make.
+// cross the wire. It pins the virtual cursor to whatever monitor that cursor is
+// on at the time, a peer's included — locking while another machine holds the
+// cursor keeps it there rather than calling it back. What the flag cannot do is
+// describe the peer: a machine that does not have the cursor knows only its own
+// flag, so "that machine has the cursor locked" is a claim it cannot make.
 
-import { shortId } from "./format.js";
+import { h } from "./dom.js";
+import { nodeColor, shortId } from "./format.js";
 
 /// Why a peer that is not `connected` cannot be treated as holding the cursor.
 ///
@@ -139,15 +144,38 @@ export function cursorStateFor(status) {
     headline: `${name} has the keyboard and mouse.`,
     detail: join(
       where ? `The cursor is on its ${where}.` : null,
-      // Said here rather than left to the button, because the button's own label
-      // ("Unlock the cursor") is the only other sign that this machine is set to
-      // hold on, and it is not on this screen at all when the badge is.
+      // The lock is in effect right now, and it is what is holding the cursor
+      // over there: `VirtualCursor::move_by` refuses the crossing on whichever
+      // monitor the cursor occupies, so locking from here pins it to the peer
+      // instead of reclaiming it — pinned by
+      // `locking_keeps_input_flowing_to_the_peer_that_already_owns_it` in
+      // `crates/wx-core/src/router.rs`. Said here rather than left to the
+      // button, because the button's label ("Unlock the cursor") is the only
+      // other sign of it and is not on this screen at all when the badge is.
       cursor.locked
-        ? "This machine is set to keep the cursor once it arrives back here."
+        ? "This machine has the cursor locked, which is what is keeping it there; it will not come back until you unlock it on the Status screen."
         : null
     ),
     certain: true,
   };
+}
+
+/// The badge element itself, so the window header and the Status panel cannot
+/// draw the same decision two different ways.
+///
+/// The label is its own element rather than a bare text node so that the header,
+/// where the pill is squeezed by an arbitrarily long peer name, can clip it with
+/// an ellipsis: `text-overflow` needs a block container, which an anonymous flex
+/// item is not.
+export function cursorBadge(state, { title } = {}) {
+  return h(
+    "span",
+    { class: `pill ${state.tone}`, title },
+    state.node
+      ? h("span", { class: "swatch small", style: { background: nodeColor(state.node) } })
+      : null,
+    h("span", { class: "label" }, state.badge)
+  );
 }
 
 function join(...parts) {
