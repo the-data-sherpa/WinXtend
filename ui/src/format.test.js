@@ -41,7 +41,7 @@ describe("what a machine says it can do", () => {
 
   it("separates a machine that has not answered from one that reports nothing", () => {
     // A connected peer advertising no bits has answered the question, and the
-    // answer is "nothing" — which a macOS, X11, or headless peer in this build gives.
+    // answer is "nothing" — which a macOS or headless peer in this build gives.
     // Showing it as though it had never reported hides a real, actionable fact.
     expect(capabilitiesText(0, true)).toBe("Reports it can do nothing");
     expect(capabilitiesText(undefined, true)).toBe("Reports it can do nothing");
