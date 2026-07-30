@@ -337,8 +337,15 @@ window heard. So any condition the user has to act on must also be a field on
 The mirror of it on the frontend: state the store latches on an event needs an
 event that ends it. `store.pairing` in `ui/src/agent.js` had none, so the first
 pairing to end left a card standing that suppressed every later prompt — see
-`end_pending_pairing` in `engine.rs`, which is the one path allowed to remove a
-pending pairing so that the announcement cannot be forgotten.
+`end_pending_pairing` in `engine.rs`, the path a pending pairing is removed
+through so that the announcement cannot be forgotten. Two removals sit outside
+it and only those two: `finish_pairing`, which removes the entry and emits
+`PairingFinished { accepted: true }` itself, and `begin_pairing`, which removes
+it deliberately silently because the same pairing is starting over rather than
+ending. A card the window adopted from a snapshot rather than from an event is
+the other half of the same rule, and ends when the snapshot stops listing it —
+see `adoptPendingPairing`, which is what a window whose event subscription was
+refused has instead of `pairingFinished`.
 
 ## A transport error string is never user-facing copy
 

@@ -13,6 +13,7 @@ import {
   connected,
   disconnect,
   listenToAgent,
+  refreshStatus,
   store,
 } from "./agent.js";
 
@@ -301,9 +302,9 @@ describe("pairing prompts", () => {
 
   // Detaching drops the link the agent would have announced the end over, so a
   // card left standing here can never be finished by anything: the pairing dies
-  // underneath, the rediscovery timer reattaches, and the snapshot only ever adds
-  // cards. It would have suppressed every later prompt for the life of the window
-  // — the same latch, reached voluntarily.
+  // underneath, the rediscovery timer reattaches, and the snapshot never takes
+  // down a card this window raised itself. It would have suppressed every later
+  // prompt for the life of the window — the same latch, reached voluntarily.
   it("does not keep a pairing card across a detach", async () => {
     hostWith(FOUND);
     await attachToRunningAgent();
@@ -317,5 +318,43 @@ describe("pairing prompts", () => {
     await disconnect();
 
     expect(store.pairing).toBeNull();
+  });
+
+  // The window with no events at all: Tauri's ACL refused `listen`, so no
+  // `pairingFinished` can ever reach it and the snapshot is the whole of what it
+  // hears. A card it adopted from an earlier snapshot has nothing else that could
+  // end it, so the agent's stale-pairing sweep would leave it standing and
+  // swallowing every later request — the same latch, reached without events.
+  it("takes down an adopted card the agent no longer has pending", async () => {
+    tauri.listen.mockRejectedValue("Command plugin:event|listen not allowed by ACL");
+    let pairings = [{ node: "aa", name: "workhorse", initiatedLocally: false, pin: null }];
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({ kind: "status", status: { ...SNAPSHOT, pairings } });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    expect(await listenToAgent()).toBe(false);
+    await attachToRunningAgent();
+    expect(store.pairing.node).toBe("aa");
+
+    // The agent timed that exchange out. The card becomes a receipt, so the user
+    // is told why the code they were shown stopped working.
+    pairings = [];
+    await refreshStatus();
+    expect(store.pairing.finished).toBe(true);
+    expect(store.pairing.error).toMatch(/ended/);
+
+    // And the next genuine request gets through.
+    pairings = [{ node: "bb", name: "laptop", initiatedLocally: false, pin: null }];
+    await refreshStatus();
+    expect(store.pairing).toMatchObject({ direction: "incoming", node: "bb", name: "laptop" });
+    expect(store.pairing.finished).toBeUndefined();
   });
 });

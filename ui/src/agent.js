@@ -273,23 +273,46 @@ function livePairing() {
 /// everything the previous one heard. Without this, the machine being asked to
 /// pair shows nothing at all and the user has no way to reach the prompt.
 ///
-/// Only ever *adds* a card. A snapshot that does not mention a pairing this
-/// window is showing is not evidence the pairing is gone: `beginPairing` answers
-/// before the agent has dialled the other machine, so the outgoing card exists
-/// for a moment while the agent has nothing pending. Ending a pairing is the
-/// agent's to announce, and it does — see `pairingFinished`.
+/// Never takes down a card *this window created*. A snapshot that does not
+/// mention such a card is not evidence the pairing is gone: `beginPairing`
+/// answers before the agent has dialled the other machine, so the outgoing card
+/// exists for a moment while the agent has nothing pending, and a card raised by
+/// `pairingRequested` belongs to a window whose events work and which will
+/// therefore hear the end of it. Ending those is the agent's to announce, and it
+/// does — see `pairingFinished`.
+///
+/// A card adopted here is the exception, and needs one. It came out of a
+/// snapshot, so its absence from a later snapshot is the exchange being over and
+/// nothing else; and `pairingFinished` may never arrive, because a window whose
+/// event subscription was refused (`store.eventsProblem`) still polls status and
+/// hears no events at all. Without this it would latch that card for good and
+/// drop every later request — the failure this whole path exists to undo.
 function adoptPendingPairing(status) {
+  const pending = status?.pairings || [];
+  if (
+    livePairing() &&
+    store.pairing.adopted &&
+    !pending.some((p) => p.node === store.pairing.node)
+  ) {
+    store.pairing = {
+      ...store.pairing,
+      finished: true,
+      accepted: false,
+      error: "The pairing ended before it was confirmed.",
+    };
+  }
   if (livePairing()) return;
-  const pending = status?.pairings?.[0];
-  if (!pending) return;
+  const next = pending[0];
+  if (!next) return;
   store.pairing = {
-    direction: pending.initiatedLocally ? "outgoing" : "incoming",
-    node: pending.node,
-    name: pending.name,
+    direction: next.initiatedLocally ? "outgoing" : "incoming",
+    node: next.node,
+    name: next.name,
     // The initiator's card shows the code; the responder's holds what the user
     // types, and starts empty.
-    pin: pending.initiatedLocally ? pending.pin || "" : "",
+    pin: next.initiatedLocally ? next.pin || "" : "",
     error: null,
+    adopted: true,
   };
 }
 

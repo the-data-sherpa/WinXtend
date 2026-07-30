@@ -764,7 +764,12 @@ struct PendingPairing {
 /// `pairingRequested` and cleared by nothing else, so a pairing the agent has
 /// silently forgotten leaves that window holding a card it will never take down
 /// — and, because it holds one, dropping every later request. Every path that
-/// removes a `pending` entry must therefore come through here.
+/// removes a `pending` entry must therefore come through here, bar two that are
+/// covered on their own terms: [`Engine::finish_pairing`], which removes the
+/// entry and emits `PairingFinished { accepted: true }` itself, and
+/// [`Engine::begin_pairing`], which removes it deliberately silently because the
+/// same pairing is starting over rather than ending. Anything else that reaches
+/// for `pending.remove` is a card left standing.
 fn end_pending_pairing(
     pending: &mut HashMap<NodeId, PendingPairing>,
     events: &broadcast::Sender<Event>,
@@ -3182,10 +3187,18 @@ impl Engine {
             self.adopt_layout(layout, true);
             self.broadcast_layout();
         }
+        // The pairing card's "Block this machine" button reaches this while the
+        // exchange is still pending, so the machine on the other end of the
+        // announcement was never paired at all: telling it that it was unpaired
+        // here is a sentence a CLI client or a second window has no way to correct.
         self.on_peer_gone(
             node,
             Some("no longer paired".into()),
-            Some("that machine was unpaired here"),
+            Some(if block {
+                "that machine was blocked here"
+            } else {
+                "that machine was unpaired here"
+            }),
         )
         .await;
     }
