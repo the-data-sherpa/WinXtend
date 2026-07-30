@@ -299,11 +299,19 @@ function livePairing() {
 /// in.
 ///
 /// The card is corrected everywhere; only the journal line is not. An absence can
-/// say the exchange ended and no more, while `pairingFinished` says why — so in a
-/// window the agent can still reach, the vaguer sentence has no reason to be
-/// written at all, and in one it cannot reach there is no event for it to
-/// duplicate. Written or not written, rather than written and then taken back: an
-/// activity log that rewrites itself is not a record of what happened.
+/// say the exchange ended and no more, while `pairingFinished` says why, so the
+/// line is written only where no event can arrive to say it better — and where
+/// one cannot, there is nothing for it to duplicate either.
+///
+/// That gate is not airtight, and the case it misses is the one named above: a
+/// window whose events work, holding a card the agent has stopped listing and
+/// will never send an event about, because it does not know it is in that state.
+/// There the card silently turns into "Pairing failed: The pairing ended before
+/// it was confirmed" and the activity log beside it says nothing about the
+/// pairing at all. Accepted, because the alternative on offer was to write the
+/// vaguer line everywhere and delete it again whenever the agent's own verdict
+/// turned up, and an activity log that retroactively rewrites itself is worth
+/// less than one with a gap in it.
 ///
 /// Over is not the same as failed, and the disappearance does not say which. A
 /// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
