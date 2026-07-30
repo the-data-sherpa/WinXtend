@@ -252,8 +252,8 @@ screens are reported at raw pixel size with a scale of 1.0.
 | Visual layout editor | ✅ |
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
-| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
-| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes, so the `.deb`'s own copy under `/usr/lib/systemd/user` is still the untested one |
+| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. It has installed from no prior version on two machines — one of them with no Rust toolchain and none of the `-dev` packages on it — and worked on both. Neither was a pristine OS install, and an existing GNOME desktop had already supplied the WebKitGTK runtime, so the declared dependencies have never had to pull anything onto a machine that lacked them |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes: on both installed machines `systemctl --user show winxtend.service -p FragmentPath` reports that copy, so the `.deb`'s own copy under `/usr/lib/systemd/user` is the untested one by check rather than by presumption |
 | Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
@@ -590,9 +590,14 @@ The alpha is Linux/Wayland. Roughly in order of value:
    Linux machine can be either end of a mesh. Wayland input is the standing gap in
    every tool in this space, and it is the strongest reason to prefer this one.
 2. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
-   toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu). What
-   is left is the first-run walkthrough on a clean machine, which needs two of
-   them.
+   toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu) — and
+   the package has installed from no prior version on the two machines above and
+   worked on both, one of them with no Rust toolchain on it. That is not the same
+   as validated packaging: neither machine was a clean one, so the declared
+   dependencies have never had to pull anything onto a system missing them, and
+   the unit that loaded on both was the `--install` copy rather than the `.deb`'s
+   own. What is left is the first-run walkthrough on a clean machine, which needs
+   two of them.
 3. **A UI control for the per-peer clipboard switch.** The setting is honoured
    today but only reachable by editing `config.toml` — see
    [Sharing the clipboard](#sharing-the-clipboard).
