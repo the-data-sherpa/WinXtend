@@ -67,6 +67,7 @@ fn snapshot() -> StatusSnapshot {
         discovery: true,
         autostart: true,
         firewall: None,
+        pairings: Vec::new(),
         monitors: Vec::new(),
         cursor: CursorSnapshot {
             owner: "903ebcf9".repeat(8),
