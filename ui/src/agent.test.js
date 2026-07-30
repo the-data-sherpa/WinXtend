@@ -357,4 +357,42 @@ describe("pairing prompts", () => {
     expect(store.pairing).toMatchObject({ direction: "incoming", node: "bb", name: "laptop" });
     expect(store.pairing.finished).toBeUndefined();
   });
+
+  // A pairing that worked leaves `pairings` by the same door as one that was
+  // abandoned — the agent trusts the peer, drops the entry, and says "accepted"
+  // only in the event this window cannot receive. Reading the disappearance as a
+  // verdict told the user their pairing had failed while the Devices list beside
+  // it, drawn from that very snapshot, showed the machine paired.
+  it("reads a finished pairing's outcome from the peer, not from its absence", async () => {
+    tauri.listen.mockRejectedValue("Command plugin:event|listen not allowed by ACL");
+    let status = {
+      ...SNAPSHOT,
+      pairings: [{ node: "aa", name: "workhorse", initiatedLocally: false, pin: null }],
+    };
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({ kind: "status", status });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    expect(await listenToAgent()).toBe(false);
+    await attachToRunningAgent();
+    expect(store.pairing.node).toBe("aa");
+
+    // The user typed the code and the agent paired the machine.
+    status = {
+      ...SNAPSHOT,
+      pairings: [],
+      peers: [{ node: "aa", name: "workhorse", paired: true, enabled: true, blocked: false }],
+    };
+    await refreshStatus();
+
+    expect(store.pairing).toMatchObject({ finished: true, accepted: true, error: null });
+  });
 });

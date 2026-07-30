@@ -287,6 +287,14 @@ function livePairing() {
 /// event subscription was refused (`store.eventsProblem`) still polls status and
 /// hears no events at all. Without this it would latch that card for good and
 /// drop every later request — the failure this whole path exists to undo.
+///
+/// Over is not the same as failed, and the disappearance does not say which. A
+/// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
+/// trusts the peer, drops the pending entry, and says "accepted" only in the event
+/// this window may never get. So the verdict is read from what the same snapshot
+/// positively asserts — the node is now a paired peer — rather than inferred from
+/// an absence, which would tell a user who has just paired successfully that it
+/// failed while the Devices list beside it shows the machine paired.
 function adoptPendingPairing(status) {
   const pending = status?.pairings || [];
   if (
@@ -294,11 +302,14 @@ function adoptPendingPairing(status) {
     store.pairing.adopted &&
     !pending.some((p) => p.node === store.pairing.node)
   ) {
+    const paired = Boolean(
+      status?.peers?.some((p) => p.node === store.pairing.node && p.paired)
+    );
     store.pairing = {
       ...store.pairing,
       finished: true,
-      accepted: false,
-      error: "The pairing ended before it was confirmed.",
+      accepted: paired,
+      error: paired ? null : "The pairing ended before it was confirmed.",
     };
   }
   if (livePairing()) return;
