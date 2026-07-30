@@ -587,9 +587,8 @@ The alpha is Linux/Wayland. Roughly in order of value:
    clipboard, so "it arrived on the *other* machine" is not separable on one host;
    the clipboard has still never crossed between machines. Display enumeration,
    input injection, input capture and clipboard sync all work on Wayland now, so a
-   Linux machine can be either end of a mesh. Wayland input is
-   the standing gap in every tool in this space, and it is the strongest reason to
-   prefer this one.
+   Linux machine can be either end of a mesh. Wayland input is the standing gap in
+   every tool in this space, and it is the strongest reason to prefer this one.
 2. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
    toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu). What
    is left is the first-run walkthrough on a clean machine, which needs two of
