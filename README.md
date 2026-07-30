@@ -53,16 +53,31 @@ layout editor.
 >   only the `RemoteDesktop` half has a restore token to suppress its own.
 >   X11 is a **driven target only**: it enumerates its screens over RandR and
 >   accepts injected input over XTEST, with no consent dialog, but it cannot
->   capture and so cannot drive. macOS and evdev are further back than either:
->   compiling skeletons, documented down to the exact syscall sequences and
->   implemented no further. On those two the agent starts and does nothing.
-> - **It has never moved a cursor — or a clipboard — between two physical
->   machines.** Every test runs in a single process. The QUIC handshake and session
->   tests are real, but they are loopback. Clipboard sync is the best-covered of
+>   capture and so cannot drive — capture and local suppression were deliberately
+>   not implemented, so an X11 machine receives the cursor and is never the machine
+>   you type at. It has now done exactly that on a real machine at the far end of a
+>   live mesh — its display enumerated into the shared layout, its cursor arriving
+>   over the network — which is the only part of the X11 backend watched working
+>   rather than only tested. Its clipboard is a skeleton: all four operations return
+>   a not-implemented error, so an X11 machine advertises no clipboard capability at
+>   all. macOS and evdev are further back than either: compiling skeletons,
+>   documented down to the exact syscall sequences and implemented no further. On
+>   those two the agent starts and does nothing.
+> - **A cursor has crossed between two physical machines exactly once. A clipboard
+>   never has.** On 2026-07-30 the cursor moved over a real network between a
+>   Wayland machine doing the driving and an X11 machine being driven, both running
+>   `1844307` installed from a package built from that commit. That is one session
+>   of one person moving a mouse: it shows the path exists end to end, and it is
+>   not sustained validation of anything. Nothing in the automated suite changed
+>   with it — every test still runs in a single process, and the QUIC handshake and
+>   session tests are real but loopback. Clipboard sync is the best-covered of
 >   these: its end-to-end tests drive two agents with genuinely separate clipboards
 >   across two real QUIC endpoints, so the exchange is proven without the
 >   single-host confound — but still on loopback. The live desktop run was two
->   agents sharing one physical clipboard. Issue #11 is the two-machine test.
+>   agents sharing one physical clipboard. Issue #11 is the two-machine test, and
+>   only its cursor half has been performed: the clipboard half has not been
+>   attempted between two machines, and cannot be with an X11 machine at either
+>   end, because X11 has no clipboard implementation to attempt it with.
 > - **Screen streaming is not connected.** `wx-video` compiles and its tests
 >   pass, but nothing depends on it and the agent hardcodes a refusal in the
 >   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
@@ -214,16 +229,22 @@ for what the next release is about.
 **Linux/X11 is a driven target and nothing more.** It enumerates its screens and
 accepts injected input, so a machine you control *to* — a remote workhorse running
 an X session — takes its place in the layout and answers the cursor, with no consent
-dialog now or ever. It cannot *drive*: capture needs an exclusive `XIGrabDevice`
-whose worst failure leaves the local desktop apparently frozen, so it is a separate
-piece of work rather than half of this one. Two further limits are stated where they
-bite: a character the receiving layout cannot produce is refused rather than
-mistyped (there is no scratch-keycode remap yet), and X11 has no per-monitor DPI, so
+dialog now or ever. That has happened for real once: on 2026-07-30 an X11 workhorse
+took the cursor from a Wayland machine over a real network. It cannot *drive*:
+capture and local suppression were deliberately left out, because capture needs an
+exclusive `XIGrabDevice` whose worst failure leaves the local desktop apparently
+frozen, so it is a separate piece of work rather than half of this one. An X11
+machine is therefore never the machine you type at. Three further limits are stated
+where they bite: the clipboard is unimplemented — all four operations return a
+not-implemented error and no clipboard capability is advertised, so clipboard sync
+with an X11 machine at either end is not merely untested but impossible today; a
+character the receiving layout cannot produce is refused with a log line rather than
+mistyped (there is no scratch-keycode remap yet); and X11 has no per-monitor DPI, so
 screens are reported at raw pixel size with a scale of 1.0.
 
 | Feature | State |
 |---|---|
-| Cursor transitions, multi-monitor, split edges | ✅ |
+| Cursor transitions, multi-monitor, split edges | ✅ heavily tested in-process, and moved between two physical machines over a real network once, on 2026-07-30 (Wayland driving, X11 driven). One session of one person: enough to say the path works, not enough to call it validated |
 | QUIC transport, unreliable/reliable split | ✅ |
 | mDNS auto-discovery | ✅ |
 | ed25519 identity + PIN pairing | ✅ |
@@ -231,13 +252,13 @@ screens are reported at raw pixel size with a scale of 1.0.
 | Visual layout editor | ✅ |
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
-| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. Not yet installed on a clean machine |
-| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes, so the `.deb`'s own copy under `/usr/lib/systemd/user` is still the untested one |
+| Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. It has installed from no prior version on two machines — one of them with no Rust toolchain and none of the `-dev` packages on it — and worked on both. Neither was a pristine OS install, and an existing GNOME desktop had already supplied the WebKitGTK runtime, so the declared dependencies have never had to pull anything onto a machine that lacked them |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes: on both installed machines `systemctl --user show winxtend.service -p FragmentPath` reports that copy, so the `.deb`'s own copy under `/usr/lib/systemd/user` is the untested one by check rather than by presumption |
 | Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
-| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and clipboard sync have landed; two-machine validation and a clean-machine first run are what is left of the alpha, and Wayland input is the standing gap in every other tool in this space |
+| Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and clipboard sync have landed; a Wayland machine has now driven the cursor onto a second physical machine once, over a real network, which leaves clipboard sync across machines, a clean-machine first run, and any validation beyond that single session as what is left of the alpha. Wayland input is the standing gap in every other tool in this space |
 
 ## Installing on Ubuntu
 
@@ -559,18 +580,24 @@ module, which is gated the same way — the Linux total rises with them.
 
 The alpha is Linux/Wayland. Roughly in order of value:
 
-1. **Validate between two physical Linux machines** over a real network. Nothing
-   here is trustworthy until a cursor actually crosses one; every test today runs
-   in a single process, and two agents on one desktop share one physical clipboard,
-   so "it arrived on the *other* machine" is not separable on one host. Display
-   enumeration, input injection, input capture and clipboard sync all work on
-   Wayland now, so a Linux machine can be either end of a mesh. Wayland input is
-   the standing gap in every tool in this space, and it is the strongest reason to
-   prefer this one.
+1. **Validate between two physical Linux machines** over a real network. A cursor
+   has crossed one, once, on 2026-07-30 — Wayland driving, X11 driven — which is
+   where the trust in this starts rather than where it ends. Every test today still
+   runs in a single process, and two agents on one desktop share one physical
+   clipboard, so "it arrived on the *other* machine" is not separable on one host;
+   the clipboard has still never crossed between machines. Display enumeration,
+   input injection, input capture and clipboard sync all work on Wayland now, so a
+   Linux machine can be either end of a mesh. Wayland input is the standing gap in
+   every tool in this space, and it is the strongest reason to prefer this one.
 2. **Packaging for Linux.** The `.deb`, the systemd user unit and the autostart
-   toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu). What
-   is left is the first-run walkthrough on a clean machine, which needs two of
-   them.
+   toggle have landed — see [Installing on Ubuntu](#installing-on-ubuntu) — and
+   the package has installed from no prior version on the two machines above and
+   worked on both, one of them with no Rust toolchain on it. That is not the same
+   as validated packaging: neither machine was a clean one, so the declared
+   dependencies have never had to pull anything onto a system missing them, and
+   the unit that loaded on both was the `--install` copy rather than the `.deb`'s
+   own. What is left is the first-run walkthrough on a clean machine, which needs
+   two of them.
 3. **A UI control for the per-peer clipboard switch.** The setting is honoured
    today but only reachable by editing `config.toml` — see
    [Sharing the clipboard](#sharing-the-clipboard).
