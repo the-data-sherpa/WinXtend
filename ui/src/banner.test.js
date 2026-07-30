@@ -139,13 +139,23 @@ describe("what the banner is allowed to claim", () => {
     // the one failure a user cannot see.
     expect(banner.headline).toMatch(/not receiving live updates/i);
     expect(banner.detail).toContain(ACL);
-    // And does not wave it away. Pairing is driven entirely by these events, so a
-    // window without them cannot show an incoming request or finish an outgoing
-    // one; "sharing is unaffected" would send the user to try pairing and watch it
-    // hang. Nor does it promise a refresh it offers no button for.
+    // And does not wave it away: a window without events cannot finish a pairing it
+    // started, so "sharing is unaffected" would send the user to try pairing and
+    // watch it hang. Nor does it promise a refresh it offers no button for.
     expect(words(banner)).toMatch(/pairing/i);
     expect(words(banner)).not.toMatch(/unaffected/i);
     expect(words(banner)).not.toMatch(/refresh/i);
+    // But pairing is *not* driven entirely by these events, and saying so was the
+    // half of this sentence that went stale: `adoptPendingPairing` raises an
+    // incoming request out of `StatusSnapshot.pairings`, so it does appear here —
+    // on the next status read, which an eventless window still makes on attach, on
+    // focus and on the Status-tab poll. The hint has to place it there rather than
+    // deny it, and without implying it arrives as the request is made.
+    expect(banner.hint).not.toMatch(/will not appear here/i);
+    expect(banner.hint).toMatch(/status tab/i);
+    // The outgoing half stays: adoption resolves only cards flagged `adopted`,
+    // never one `beginPairing` raised in this window.
+    expect(banner.hint).toMatch(/sit on its code/i);
     expect(banner.actions).toEqual([]);
   });
 });
