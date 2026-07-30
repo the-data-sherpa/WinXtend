@@ -405,11 +405,12 @@ describe("pairing prompts", () => {
     expect(store.pairing.finished).toBeUndefined();
   });
 
-  // Where events do arrive, `pairingFinished` is the verdict and it is the better
-  // one: it carries the agent's reason, where an absence can only say the exchange
-  // ended. A status read landing first must not announce a vaguer version of the
-  // same outcome beside it.
-  it("leaves the verdict to the agent in a window that can hear it", async () => {
+  // The recovery runs in a healthy window too. Gating it on a refused event
+  // subscription would have left the one state no event can ever announce — a
+  // pairing the agent no longer knows it is in — with nothing to end it, which is
+  // the latch again. The agent's own verdict still arrives and still wins: it
+  // carries the reason, where an absence can only say the exchange ended.
+  it("ends a card the snapshot has dropped even where events work", async () => {
     let pairings = [{ node: "aa", name: "workhorse", initiatedLocally: false, pin: null }];
     tauri.invoke.mockImplementation((command) => {
       switch (command) {
@@ -427,11 +428,11 @@ describe("pairing prompts", () => {
     await attachToRunningAgent();
     expect(store.pairing.node).toBe("aa");
 
-    // The agent has dropped the entry; its event is on its way.
+    // The agent has dropped the entry, and the window says so rather than waiting
+    // for an event that may describe nothing it knows about.
     pairings = [];
     await refreshStatus();
-    expect(store.pairing.finished).toBeUndefined();
-    expect(store.journal.some((line) => /ended before/.test(line.text))).toBe(false);
+    expect(store.pairing).toMatchObject({ finished: true, accepted: false });
 
     applyEvent({
       kind: "pairingFinished",

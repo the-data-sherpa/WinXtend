@@ -292,12 +292,13 @@ function livePairing() {
 /// session exists, so the wait is one status read long and no card is left
 /// unreconcilable by it.
 ///
-/// The expiry is what a window without events has *instead of*
-/// `pairingFinished`, so it only runs in one. Where events work, the agent's own
-/// announcement is the verdict and it is the better one — it carries the reason
-/// the pairing failed, where an absence can only say that it ended — and running
-/// both would put two voices in the journal for one outcome, the vaguer one
-/// standing beside the accurate one.
+/// It runs in every window, not only one whose events were refused. A window
+/// that can hear the agent usually hears `pairingFinished` first and never
+/// reaches the expiry at all, and where it does not, this is the only thing that
+/// can end the card: no event is coming for a state the agent does not know it is
+/// in. Where both do speak the journal carries the agent's line as well as this
+/// one, which is a repetition rather than a loss — the agent's carries the reason
+/// the pairing failed, and it is the one that corrects the card.
 ///
 /// Over is not the same as failed, and the disappearance does not say which. A
 /// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
@@ -314,7 +315,7 @@ function adoptPendingPairing(status) {
       if (!card.seen) store.pairing = { ...card, seen: true };
       return;
     }
-    if (!card.seen || !store.eventsProblem) return;
+    if (!card.seen) return;
     const paired = Boolean(status?.peers?.some((p) => p.node === card.node && p.paired));
     store.pairing = {
       ...card,

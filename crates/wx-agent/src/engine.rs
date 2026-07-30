@@ -722,8 +722,17 @@ impl OfferedPins {
     }
 
     /// Take the code for a session that has just come up.
+    ///
+    /// Only a code that is still waiting for its own dial, which is the same test
+    /// [`OfferedPins::discard_awaiting_dial`] makes and for the same reason. A code
+    /// left behind by an exchange that has already ended is not the one the user is
+    /// reading off the screen, and opening a pairing with it would ask the other
+    /// machine for digits nobody is being shown.
     fn claim(&mut self, node: NodeId) -> Option<Pin> {
-        self.awaiting_dial.remove(&node);
+        if self.awaiting_dial.remove(&node).is_none() {
+            self.pins.remove(&node);
+            return None;
+        }
         self.pins.remove(&node)
     }
 
@@ -2337,7 +2346,7 @@ impl Engine {
         // caller's own copy wins where there is any: a peer the user disabled
         // or unpaired themselves did not lose its connection, and saying so sends
         // them looking for a network fault they do not have.
-        end_pending_pairing(
+        let ended_a_pairing = end_pending_pairing(
             &mut self.pending,
             &self.events,
             node,
@@ -2355,7 +2364,18 @@ impl Engine {
         // Not unconditionally: a code generated for a dial that is still in flight
         // belongs to the *next* connection, not the one that just died. See
         // [`OfferedPins`] — clearing it here broke every restarted pairing.
-        self.offered_pins.on_session_ended(node);
+        //
+        // Unless the exchange that code belongs to is the one that just ended, in
+        // which case nothing is left to claim it and a code that outlives its own
+        // pairing is published as a pairing still under way. `begin_pairing`'s
+        // restart is not this case: it takes its entry out of `pending` before
+        // closing the session, so the teardown ends nothing and the code survives
+        // for the redial exactly as before.
+        if ended_a_pairing {
+            self.offered_pins.discard(node);
+        } else {
+            self.offered_pins.on_session_ended(node);
+        }
         self.state
             .on_disconnected(node, reason.clone(), Instant::now());
         tracing::info!(peer = %node, reason = ?reason, "session ended");
@@ -2473,6 +2493,11 @@ impl Engine {
         let Some(pending) = self.pending.remove(&node) else {
             return;
         };
+        // The exchange is over, so no code for it may outlive it: one still held
+        // here is published as a pairing under way, and there is nothing left that
+        // could ever take it back out of the list. Matches `abandon_pairing`, which
+        // is the same transition with the other outcome.
+        self.offered_pins.discard(node);
         {
             let mut trust = self.trust.lock().expect("trust store lock");
             trust.trust(node, pending.name.clone());
@@ -6829,6 +6854,54 @@ mod tests {
         let snapshots = pending_pairing_snapshots(&pending, &pins);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].node, node(3).to_hex());
+    }
+
+    #[test]
+    fn a_code_that_outlived_its_exchange_would_be_a_pairing_nothing_can_end() {
+        // Why every terminal transition now clears the code as `abandon_pairing`
+        // always did. A code can be left with no dial of its own outstanding — the
+        // other machine's session got in first, so nothing claimed it — and while
+        // the exchange runs, its `pending` entry hides that. Once the exchange ends,
+        // a code still held here is published as a pairing under way that no later
+        // snapshot can ever drop: the window raises a card for a machine it has just
+        // been shown as paired, and that card suppresses every later request.
+        let now = Instant::now();
+        let mut pins = OfferedPins::default();
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            now,
+        );
+        let mut pending = HashMap::new();
+        pending.insert(node(2), pending_pairing(node(2), false, now));
+        assert_eq!(pending_pairing_snapshots(&pending, &pins).len(), 1);
+
+        // The exchange ends: `finish_pairing` on success, `on_peer_gone` when the
+        // session drops, `abandon_pairing` on a refusal.
+        pending.remove(&node(2));
+        pins.discard(node(2));
+
+        assert!(
+            pending_pairing_snapshots(&pending, &pins).is_empty(),
+            "a pairing that is over is still being advertised as under way"
+        );
+    }
+
+    #[test]
+    fn a_code_no_dial_is_waiting_on_is_never_turned_into_a_pair_request() {
+        // The other half of the same leak: a code with no dial of its own left to
+        // claim it is not the code on the user's screen, and opening a pairing with
+        // it would ask the other machine for digits nobody is being shown.
+        let mut pins = OfferedPins::default();
+        pins.pins
+            .insert(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+
+        assert!(pins.claim(node(2)).is_none());
+        assert!(
+            pins.claim(node(2)).is_none(),
+            "the stale code was left behind to be found again"
+        );
     }
 
     #[test]

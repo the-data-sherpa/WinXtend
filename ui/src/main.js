@@ -178,8 +178,8 @@ async function main() {
     // banner says as much. Polling it only in that state keeps the promise true
     // where it is made, without redrawing a healthy window's device list on a
     // timer it does not need.
-    // Skipped rather than redrawn over: this poll's own redraw would take away a
-    // field the user is typing into. The next tick picks it up.
+    // Skipped rather than redrawn over: this poll's own redraw would take away the
+    // rename editor and everything typed into it. The next tick picks it up.
     if (active === "devices" && devices.editing()) return;
     const pollingHere = active === "status" || (store.eventsProblem && active === "devices");
     if (pollingHere) {
