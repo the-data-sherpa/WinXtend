@@ -540,6 +540,25 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub pairings: Vec<PendingPairingSnapshot>,
     pub monitors: Vec<MonitorSpec>,
+    /// Why `monitors` may be missing screens this machine actually has.
+    ///
+    /// `None` means the last enumeration succeeded, so an empty `monitors` really
+    /// is a machine with no screens. `Some` means the platform backend could not
+    /// answer, and the list is the last one that was readable — possibly empty,
+    /// and in that case saying nothing about the hardware at all.
+    ///
+    /// The two were indistinguishable until this field existed, and the cost was
+    /// concrete: a machine with a 3440x1440 monitor attached reported itself as
+    /// `displays none (headless)` because its backend returned `Unsupported`, and
+    /// that reading went on to misdirect a piece of planning. "There are none" and
+    /// "I cannot tell you" call for different responses from whoever reads it, so
+    /// they are different answers here.
+    ///
+    /// Carried on the snapshot rather than only logged for the same reason
+    /// `firewall` is: a condition the user has to act on must survive a window that
+    /// attaches after the moment it happened.
+    #[serde(default)]
+    pub displays_error: Option<String>,
     pub cursor: CursorSnapshot,
     pub layout: LayoutSpec,
     pub peers: Vec<PeerSnapshot>,
@@ -741,6 +760,7 @@ pub fn status_snapshot(
     firewall: Option<&str>,
     autostart: bool,
     pairings: Vec<PendingPairingSnapshot>,
+    displays_error: Option<&str>,
 ) -> StatusSnapshot {
     let owner = state.cursor_owner();
     let owner_name = if owner == state.local() {
@@ -772,6 +792,7 @@ pub fn status_snapshot(
         firewall: firewall.map(str::to_string),
         pairings,
         monitors: state.local_monitors().iter().map(MonitorSpec::of).collect(),
+        displays_error: displays_error.map(str::to_string),
         cursor: CursorSnapshot {
             owner: owner.to_hex(),
             owner_name,
@@ -1468,6 +1489,7 @@ mod tests {
             None,
             false,
             Vec::new(),
+            None,
         );
 
         assert_eq!(snapshot.capabilities, granted.0);
@@ -1490,6 +1512,7 @@ mod tests {
             None,
             false,
             Vec::new(),
+            None,
         );
         assert_eq!(revoked.capabilities, wx_proto::Capabilities::HAS_DISPLAYS.0);
     }
@@ -1525,6 +1548,7 @@ mod tests {
                 scale: 1.5,
                 primary: true,
             }],
+            displays_error: None,
             cursor: CursorSnapshot {
                 owner: NodeId([1u8; 32]).to_hex(),
                 owner_name: "desk".into(),
@@ -1607,6 +1631,7 @@ mod tests {
                 firewall,
                 false,
                 Vec::new(),
+                None,
             )
             .firewall
         };
@@ -1649,6 +1674,7 @@ mod tests {
             None,
             false,
             Vec::new(),
+            None,
         );
         assert!(
             !snapshot.autostart,
@@ -1685,6 +1711,7 @@ mod tests {
             None,
             false,
             Vec::new(),
+            None,
         );
         assert_eq!(snapshot.capabilities, advertised.0);
         assert_ne!(

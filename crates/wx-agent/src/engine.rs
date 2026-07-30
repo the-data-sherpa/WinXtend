@@ -1143,6 +1143,15 @@ pub struct Engine {
     /// life of the run. Held rather than recomputed per status request because
     /// changing it means the user ran `ufw` since, at which point they know.
     firewall: Option<String>,
+    /// Why the last display enumeration failed, or `None` if it worked.
+    ///
+    /// Kept so that an empty monitor list can be told apart from a backend that
+    /// could not answer — see [`ipc::StatusSnapshot::displays_error`], which is
+    /// where it is reported and where the reasoning lives. Held on the engine
+    /// rather than re-derived per status request because the failing call is the
+    /// housekeeping poll, and asking the backend again to answer a status request
+    /// would be a second chance to succeed and a second chance to hang.
+    displays_error: Option<String>,
     shutting_down: bool,
 }
 
@@ -1266,13 +1275,20 @@ impl Engine {
         // Moved out of the backend at once, because from here on the clipboard is
         // only ever touched by the worker thread. See [`spawn_clipboard_worker`].
         let clipboard_jobs = spawn_clipboard_worker(platform.take_clipboard(), wake.clone())?;
-        let monitors = platform.displays.monitors().unwrap_or_else(|e| {
-            // Not fatal. A node with no readable displays still forwards input to
-            // its peers, and taking the whole machine out of the mesh over a
-            // transient enumeration failure would be worse.
-            tracing::warn!(error = %e, "could not enumerate displays");
-            Vec::new()
-        });
+        // Not fatal. A node with no readable displays still forwards input to its
+        // peers, and taking the whole machine out of the mesh over a transient
+        // enumeration failure would be worse. But the failure is *kept*, not
+        // collapsed into an empty list: "there are no displays" and "I cannot tell
+        // you about displays" are different answers, and reporting the second as
+        // the first is how a machine with a monitor attached came to describe
+        // itself as headless.
+        let (monitors, displays_error) = match platform.displays.monitors() {
+            Ok(monitors) => (monitors, None),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not enumerate displays");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
 
         let now = Instant::now();
         let mut state = AgentState::new(local, config.node.name.clone(), now);
@@ -1374,6 +1390,7 @@ impl Engine {
             // differ when the config asks for port 0, and advice naming a port
             // nothing is listening on is worse than none.
             firewall: crate::firewall::warning(port),
+            displays_error,
             shutting_down: false,
         };
         engine.pairing_open.store(
@@ -2794,7 +2811,31 @@ impl Engine {
         let now = Instant::now();
 
         // Displays come and go with docks and lids.
-        if let Ok(monitors) = self.platform.displays.monitors() {
+        let monitors = match self.platform.displays.monitors() {
+            Ok(monitors) => {
+                if self.displays_error.take().is_some() {
+                    tracing::info!("display enumeration is answering again");
+                }
+                Some(monitors)
+            }
+            Err(e) => {
+                // Recorded once per distinct reason rather than on every tick. A
+                // backend that cannot enumerate generally stays that way, and this
+                // poll runs on a timer — the same unbounded-warning shape that made
+                // suppression's refusal fill the log.
+                let reason = e.to_string();
+                if self.displays_error.as_deref() != Some(reason.as_str()) {
+                    tracing::warn!(error = %e, "could not enumerate displays");
+                    self.displays_error = Some(reason);
+                }
+                // The monitor list is deliberately left as it was. "I cannot tell
+                // you" is not "there are none", and clearing it would drop this
+                // machine out of every peer's layout over one failed poll — taking
+                // the cursor with it if it happened to be here.
+                None
+            }
+        };
+        if let Some(monitors) = monitors {
             if self.state.set_local_monitors(monitors.clone()) {
                 tracing::info!(count = monitors.len(), "local displays changed");
                 {
@@ -2993,6 +3034,7 @@ impl Engine {
                     self.firewall.as_deref(),
                     self.autostart_registered(),
                     pending_pairing_snapshots(&self.pending, &self.offered_pins),
+                    self.displays_error.as_deref(),
                 )),
             },
             Request::ListPeers => Response::Peers {

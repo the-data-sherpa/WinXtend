@@ -69,6 +69,7 @@ fn snapshot() -> StatusSnapshot {
         firewall: None,
         pairings: Vec::new(),
         monitors: Vec::new(),
+        displays_error: None,
         cursor: CursorSnapshot {
             owner: "903ebcf9".repeat(8),
             owner_name: "cowen-ubuntu".into(),

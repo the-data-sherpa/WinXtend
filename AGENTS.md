@@ -161,6 +161,43 @@ first two with a stub alongside them because the backend is assembled from them 
 every target — so this crate compiles and tests on all three platforms with no
 session. Keep that division.
 
+## Testing the Linux/X11 backend without risking the desktop you are on
+
+`crates/wx-platform/src/linux_x11/` is a **driven target only** — RandR displays and
+XTEST injection, no capture and no suppression — and the reasoning for stopping
+there is in its module docs. Three things about working on it are not obvious.
+
+- **Never point an injection test at a session.** `cargo test` must not be able to
+  type into the windows of whoever is at the machine, so the end-to-end test
+  (`crates/wx-platform/tests/x11_injection.rs`) does not read `DISPLAY` at all: it
+  runs only when `WINXTEND_X11_TEST_DISPLAY` names a server and uses that name.
+  `Xvfb :77 -screen 0 1920x1080x24 &` is enough — it offers RANDR, XTEST, XFIXES
+  and XInputExtension — and `Xephyr` works the same way if you want to watch.
+  Everything else about the backend is exercised through a recording sink, so a
+  plain `cargo test` needs no server and touches nothing.
+
+- **The X server is its own oracle, and it is two connections away.** `QueryPointer`
+  and `QueryKeymap` report the pointer, the held buttons and every key that is down,
+  so "the injection landed" and "`release_all` really let go" are assertions rather
+  than inferences — no toolkit window needed. But X promises **nothing** about the
+  order it services two clients in, so a read on the observing connection can be
+  answered before the XTEST request written first. Force a round trip on the
+  *injecting* connection in between; without it the test passes about half the time.
+
+- **A long-lived X connection must be drained or the whole desktop suffers.**
+  `MappingNotify` is sent to every client with no way to opt out, so a client that
+  only writes will have events pile up until the server's write to it blocks — and a
+  server blocked on one client stops servicing the others. `Server::drain` runs on
+  every request this backend makes, and it is also where a keyboard remap is
+  noticed.
+
+Two limits are deliberate and documented where they bite rather than worked around:
+X11 has no per-monitor DPI, so screens are reported at raw pixel size with
+`scale = 1.0` — the same panel a Wayland session calls `3072x1728 scale=2.0` — and a
+character the receiving layout cannot produce is refused rather than mistyped,
+because the `ChangeKeyboardMapping` scratch-keycode remap that would fix it corrupts
+the user's keyboard until logout if it is ever left unrestored.
+
 ## Wayland input needs two portals, and they are not interchangeable
 
 `org.freedesktop.portal.RemoteDesktop` **drives** a desktop and cannot capture from
@@ -197,8 +234,18 @@ hardware, and every one of those failures is silent.
 `crates/wx-platform/src/linux_wayland/keymap.rs` answers both "which key produces
 this character" (injection) and "what does this key produce" (capture) from one
 parse, so the two cannot disagree. It is hand-written rather than bound to
-`libxkbcommon`, and the reason is in its module docs — it applies to the X11
-backend too, which should reuse it rather than link the C library.
+`libxkbcommon`, and the reason is in its module docs.
+
+**That reasoning applies to X11 and the code does not.** The X11 backend has its
+own reverse map in `crates/wx-platform/src/linux_x11/keymap.rs`, built from the
+`GetKeyboardMapping` and `GetModifierMapping` *core* requests, because X11 hands
+the same information over directly and needs no keymap text at all. An earlier note
+here and in the X11 skeleton said to reuse the Wayland parser by way of
+`xkb_x11_get_keymap_as_string`; that symbol does not exist and the API it gestures
+at lives in `libxkbcommon-x11`, so following it would have linked the very C
+library the sentence was avoiding. What the two backends *do* share is
+`linux_wayland/keys.rs` — evdev codes and X11 keysyms are constants of Linux rather
+than of a display server, and both read them from there.
 
 Keymaps arrive in more than one legal spelling and the differences fail *silently*.
 mutter writes `map[Shift]= 2` and numeric keysyms; `xkbcomp -xkb` writes

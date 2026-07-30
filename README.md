@@ -51,9 +51,11 @@ layout editor.
 >   clipboards over real QUIC — though never yet between two physical machines.
 >   Two `xdg-desktop-portal` consent dialogs appear per launch, one per portal;
 >   only the `RemoteDesktop` half has a restore token to suppress its own.
->   macOS, X11, and evdev are further back than Wayland now is: compiling
->   skeletons, documented down to the exact syscall sequences and implemented no
->   further. On those platforms the agent starts and does nothing.
+>   X11 is a **driven target only**: it enumerates its screens over RandR and
+>   accepts injected input over XTEST, with no consent dialog, but it cannot
+>   capture and so cannot drive. macOS and evdev are further back than either:
+>   compiling skeletons, documented down to the exact syscall sequences and
+>   implemented no further. On those two the agent starts and does nothing.
 > - **It has never moved a cursor — or a clipboard — between two physical
 >   machines.** Every test runs in a single process. The QUIC handshake and session
 >   tests are real, but they are loopback. Clipboard sync is the best-covered of
@@ -119,8 +121,17 @@ keyboard has `[`; forward the scancode and the receiver types `[`.
 WinXtend resolves keystrokes to **characters** on the sending machine, using the
 sender's own layout, and transmits those. The receiver's job is only "produce this
 codepoint", which every OS can do — `KEYEVENTF_UNICODE` on Windows,
-`CGEventKeyboardSetUnicodeString` on macOS, a remapped scratch keysym on X11. Dead
-keys compose on the sender and arrive as one finished character.
+`CGEventKeyboardSetUnicodeString` on macOS, the receiver's own keymap on Linux.
+Dead keys compose on the sender and arrive as one finished character.
+
+Linux is the platform where "produce this codepoint" is not a single call, and the
+two backends differ in how far they can go. Both find the character on the
+receiving desktop's own layout, so the Norwegian `å` really does arrive as `å`. A
+character that layout cannot produce at any level is refused out loud rather than
+mistyped — permanently so on Wayland, where nothing in the portal or libei can
+remap a key, and for now on X11, where `ChangeKeyboardMapping` could remap a
+scratch keycode but a remap left unrestored would corrupt the user's keyboard until
+they log out.
 
 This idea is taken wholesale from hydra, which deserves the credit for it.
 
@@ -191,13 +202,24 @@ for what the next release is about.
 
 | | Windows | macOS | Linux/X11 | Linux/Wayland | Linux headless |
 |---|---|---|---|---|---|
-| Display enumeration | ✅ | ⚠️ | ⚠️ | ✅ `wl_output`/`xdg_output` | n/a |
-| Input capture | ✅ | ⚠️ | ⚠️ | ✅ libei via the InputCapture portal | ⚠️ |
-| Input injection | ✅ | ⚠️ | ⚠️ | ✅ libei via the RemoteDesktop portal | ⚠️ |
+| Display enumeration | ✅ | ⚠️ | ✅ RandR outputs and CRTCs | ✅ `wl_output`/`xdg_output` | n/a |
+| Input capture | ✅ | ⚠️ | ⛔ | ✅ libei via the InputCapture portal | ⚠️ |
+| Input injection | ✅ | ⚠️ | ✅ XTEST | ✅ libei via the RemoteDesktop portal | ⚠️ |
 | Clipboard | ✅ text/HTML/PNG/files | ⚠️ | ⚠️ | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
 | Screen capture | ✅ GDI | ⚠️ | ⚠️ | ⚠️ | n/a |
 
-✅ implemented · ⚠️ compiling skeleton, requirements documented, no implementation
+✅ implemented · ⚠️ compiling skeleton, requirements documented, no implementation ·
+⛔ deliberately not implemented
+
+**Linux/X11 is a driven target and nothing more.** It enumerates its screens and
+accepts injected input, so a machine you control *to* — a remote workhorse running
+an X session — takes its place in the layout and answers the cursor, with no consent
+dialog now or ever. It cannot *drive*: capture needs an exclusive `XIGrabDevice`
+whose worst failure leaves the local desktop apparently frozen, so it is a separate
+piece of work rather than half of this one. Two further limits are stated where they
+bite: a character the receiving layout cannot produce is refused rather than
+mistyped (there is no scratch-keycode remap yet), and X11 has no per-monitor DPI, so
+screens are reported at raw pixel size with a scale of 1.0.
 
 | Feature | State |
 |---|---|

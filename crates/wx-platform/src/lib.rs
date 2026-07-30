@@ -10,7 +10,7 @@
 //! |---|---|---|---|
 //! | Windows | `WH_KEYBOARD_LL` / `WH_MOUSE_LL` | `SendInput` | implemented |
 //! | macOS | `CGEventTap` | `CGEventPost` | skeleton |
-//! | Linux/X11 | XInput2 raw events | XTEST | skeleton |
+//! | Linux/X11 | not implemented, deliberately | XTEST | displays and injection implemented; a driven target only |
 //! | Linux/Wayland | libei via the InputCapture portal | libei via the RemoteDesktop portal | capture, injection, displays and clipboard implemented; locking still a skeleton |
 //! | Linux headless | evdev | uinput | skeleton |
 //!
