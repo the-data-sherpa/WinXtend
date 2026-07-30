@@ -264,25 +264,6 @@ function livePairing() {
   return Boolean(store.pairing) && !store.pairing.finished;
 }
 
-/// The journal line a snapshot wrote for a pairing it found was over, and which
-/// node it was about, or null.
-///
-/// An absence can only say the exchange ended; `pairingFinished` says why it did.
-/// Where both reach the same window the agent's sentence is the one worth having,
-/// and the vaguer one must not stand above it as if they were two things that
-/// happened.
-let snapshotVerdict = null;
-
-/// Take back the snapshot's line about `node`, now that the agent has said what
-/// actually happened. Does nothing if the snapshot never spoke, or spoke about
-/// another machine, or if its line has already aged out of the journal.
-function withdrawSnapshotVerdict(node) {
-  if (snapshotVerdict?.node !== node) return;
-  const at = store.journal.indexOf(snapshotVerdict.line);
-  if (at !== -1) store.journal.splice(at, 1);
-  snapshotVerdict = null;
-}
-
 /// Take up a pairing the agent already has under way.
 ///
 /// The events are the live path and this is the recovery one: `pairingRequested`
@@ -315,8 +296,14 @@ function withdrawSnapshotVerdict(node) {
 /// that can hear the agent usually hears `pairingFinished` first and never
 /// reaches the expiry at all, and where it does not, this is the only thing that
 /// can end the card: no event is coming for a state the agent does not know it is
-/// in. Where both do speak, the agent's line is the one that stays — see
-/// `withdrawSnapshotVerdict`.
+/// in.
+///
+/// The card is corrected everywhere; only the journal line is not. An absence can
+/// say the exchange ended and no more, while `pairingFinished` says why — so in a
+/// window the agent can still reach, the vaguer sentence has no reason to be
+/// written at all, and in one it cannot reach there is no event for it to
+/// duplicate. Written or not written, rather than written and then taken back: an
+/// activity log that rewrites itself is not a record of what happened.
 ///
 /// Over is not the same as failed, and the disappearance does not say which. A
 /// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
@@ -341,13 +328,14 @@ function adoptPendingPairing(status) {
       accepted: paired,
       error: paired ? null : "The pairing ended before it was confirmed.",
     };
-    log(
-      paired ? "info" : "warning",
-      paired
-        ? `Pairing with ${card.name} succeeded`
-        : `Pairing with ${card.name} ended before it was confirmed`
-    );
-    snapshotVerdict = { node: card.node, line: store.journal[0] };
+    if (store.eventsProblem) {
+      log(
+        paired ? "info" : "warning",
+        paired
+          ? `Pairing with ${card.name} succeeded`
+          : `Pairing with ${card.name} ended before it was confirmed`
+      );
+    }
     // The verdict has to reach the screen before anything replaces it. Adopting
     // the next pending pairing in this same call would overwrite a card the user
     // has never seen, and in the one window that gets here nothing else would
@@ -368,9 +356,6 @@ function adoptPendingPairing(status) {
     // construction and the rule above may end it.
     seen: true,
   };
-  // A new card, so any earlier line is about a pairing that is done with: a
-  // verdict arriving now belongs to this one and must not take that line away.
-  snapshotVerdict = null;
   log(
     "info",
     next.initiatedLocally
@@ -420,7 +405,6 @@ export function applyEvent(event) {
           pin: "",
           error: null,
         };
-        snapshotVerdict = null;
       }
       log("info", `${event.name} wants to pair`);
       break;
@@ -434,7 +418,6 @@ export function applyEvent(event) {
           error: event.accepted ? null : event.message || "pairing was refused",
         };
       }
-      withdrawSnapshotVerdict(event.node);
       log(
         event.accepted ? "info" : "warning",
         `Pairing with ${peerName(event.node)} ${event.accepted ? "succeeded" : `failed: ${event.message || "refused"}`}`

@@ -397,7 +397,9 @@ describe("pairing prompts", () => {
     // The verdict on the card the user was looking at, not the next pairing
     // silently overwriting it before it was ever drawn.
     expect(store.pairing).toMatchObject({ node: "bb", finished: true, accepted: false });
-    expect(store.journal.some((line) => /laptop/.test(line.text))).toBe(true);
+    // And the journal says so: this window hears nothing from the agent, so if the
+    // snapshot does not write the line nothing ever will.
+    expect(store.journal[0].text).toMatch(/Pairing with laptop ended before it was confirmed/);
 
     // And the request waiting behind it gets through on the next read.
     await refreshStatus();
@@ -428,14 +430,14 @@ describe("pairing prompts", () => {
     await attachToRunningAgent();
     expect(store.pairing.node).toBe("aa");
 
-    // The agent has dropped the entry, and the window says so rather than waiting
-    // for an event that may describe nothing it knows about.
+    // The agent has dropped the entry, and the window says so on the card rather
+    // than waiting for an event that may describe nothing it knows about. The
+    // journal keeps quiet here: this window can hear the agent, and what the agent
+    // has to say about it is both truer and on its way.
     pairings = [];
     await refreshStatus();
     expect(store.pairing).toMatchObject({ finished: true, accepted: false });
-    expect(store.journal.some((line) => /ended before it was confirmed/.test(line.text))).toBe(
-      true
-    );
+    expect(store.journal.some((line) => /^Pairing with /.test(line.text))).toBe(false);
 
     applyEvent({
       kind: "pairingFinished",
@@ -447,8 +449,8 @@ describe("pairing prompts", () => {
       finished: true,
       error: "the pairing code did not match",
     });
-    // One outcome, told once, in the agent's words: an absence can only say the
-    // exchange ended, and that vaguer sentence must not stand beside the reason.
+    // One outcome, told once, in the agent's words — and never written and then
+    // unwritten: the activity log only ever grows.
     expect(store.journal.filter((line) => /^Pairing with /.test(line.text))).toHaveLength(1);
     expect(store.journal[0].text).toMatch(/the pairing code did not match/);
   });
