@@ -2365,12 +2365,29 @@ impl Engine {
         // belongs to the *next* connection, not the one that just died. See
         // [`OfferedPins`] — clearing it here broke every restarted pairing.
         //
-        // Unless the exchange that code belongs to is the one that just ended, in
-        // which case nothing is left to claim it and a code that outlives its own
-        // pairing is published as a pairing still under way. `begin_pairing`'s
-        // restart is not this case: it takes its entry out of `pending` before
-        // closing the session, so the teardown ends nothing and the code survives
-        // for the redial exactly as before.
+        // Unless the exchange that code belongs to is the one that just ended: a
+        // code that outlives its own pairing is published as a pairing still under
+        // way, and nothing can ever take it back out of the list again — the card
+        // the window raises from it then blocks every later request. That is the
+        // failure this trade buys off. `begin_pairing`'s restart is not this case:
+        // it takes its entry out of `pending` before closing the session, so the
+        // teardown ends nothing and the code survives for the redial as before.
+        //
+        // The trade, stated honestly, because a future change will read this: the
+        // discard is keyed on a pairing having ended, which is not the same as this
+        // code having no owner left, and one path can still have an owner. When the
+        // peer's own session lands first — the cross-initiation case
+        // [`OfferedPins`] calls normal — `on_session` clears `dialing` and inserts a
+        // `pending` entry that never claims the code, because only the
+        // `initiated_locally` branch claims. Our dial is still working through its
+        // addresses. If that peer-initiated session then drops, this discards a code
+        // that dial would have claimed, and the session it eventually brings up
+        // abandons the pairing with "no pairing code was generated" after the user
+        // has already read the digits off the screen. It ends with a reason and the
+        // user can press Pair again, which is why it is preferred to a card nothing
+        // can end; telling the two apart needs a dial's own resolution tracked
+        // separately from session installation, which belongs with the deferred
+        // question of who owns a pairing card's lifetime rather than here.
         if ended_a_pairing {
             self.offered_pins.discard(node);
         } else {

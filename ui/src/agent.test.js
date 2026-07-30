@@ -433,6 +433,9 @@ describe("pairing prompts", () => {
     pairings = [];
     await refreshStatus();
     expect(store.pairing).toMatchObject({ finished: true, accepted: false });
+    expect(store.journal.some((line) => /ended before it was confirmed/.test(line.text))).toBe(
+      true
+    );
 
     applyEvent({
       kind: "pairingFinished",
@@ -444,6 +447,10 @@ describe("pairing prompts", () => {
       finished: true,
       error: "the pairing code did not match",
     });
+    // One outcome, told once, in the agent's words: an absence can only say the
+    // exchange ended, and that vaguer sentence must not stand beside the reason.
+    expect(store.journal.filter((line) => /^Pairing with /.test(line.text))).toHaveLength(1);
+    expect(store.journal[0].text).toMatch(/the pairing code did not match/);
   });
 
   // A pairing that worked leaves `pairings` by the same door as one that was
