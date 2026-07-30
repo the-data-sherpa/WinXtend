@@ -19,9 +19,30 @@ import {
 let root = null;
 /// Node id currently being renamed, so a redraw does not close the editor.
 let renaming = null;
+/// Node whose incoming prompt has already been given the caret.
+let prompted = null;
+/// The PIN field currently on screen, so a redraw can hand the caret back.
+let pinField = null;
 
 export function mount(element) {
   root = element;
+}
+
+/// Whether this screen is holding something a redraw would destroy.
+///
+/// `render` replaces the whole section, and the rename editor does not survive
+/// that: removing a focused element dispatches no `blur`, so a half-typed name is
+/// discarded rather than committed and the editor reopens empty. A poll that
+/// redraws on a timer therefore has to ask first — see `main.js`.
+///
+/// The pairing prompt is deliberately not covered, even though the user may be
+/// typing into it. Its value lives in `store.pairing` and is re-read by the
+/// rebuild, and the caret is handed back below, so it loses nothing — while
+/// treating it as busy would stop the poll for the whole time a prompt is on
+/// screen, which is precisely when that poll is the only thing that can tell the
+/// user the pairing they are answering has ended.
+export function editing() {
+  return renaming !== null;
 }
 
 async function attempt(what, action) {
@@ -35,6 +56,10 @@ async function attempt(what, action) {
 
 function pairingCard() {
   const pairing = store.pairing;
+  if (!pairing || pairing.finished || pairing.direction === "outgoing") {
+    prompted = null;
+    pinField = null;
+  }
   if (!pairing) return null;
 
   const close = () => {
@@ -92,6 +117,11 @@ function pairingCard() {
   }
 
   // Incoming: the other machine is showing a code and waiting for it here.
+  //
+  // Read before the new field is built, because this runs while the old one is
+  // still in the document: once `replace` has taken it out, nothing records where
+  // the caret was.
+  const hadCaret = Boolean(pinField) && document.activeElement === pinField;
   const input = h("input", {
     type: "text",
     inputMode: "numeric",
@@ -163,7 +193,13 @@ function pairingCard() {
     )
   );
   // Focus after the node is in the document, so typing can start immediately.
-  queueMicrotask(() => input.isConnected && input.focus());
+  // Then only to give back a caret this redraw has just taken away: a redraw the
+  // user did not cause must not pull them out of Refuse or Block, and must not
+  // leave them typing into a field that stopped listening either.
+  const takeCaret = prompted !== pairing.node || hadCaret;
+  prompted = pairing.node;
+  pinField = input;
+  if (takeCaret) queueMicrotask(() => input.isConnected && input.focus());
   return card;
 }
 

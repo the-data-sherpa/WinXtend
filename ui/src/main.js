@@ -28,10 +28,12 @@ import * as status from "./status.js";
 /// fast enough that starting the daemon from a terminal is noticed while the user is
 /// still looking at the window.
 const DISCOVER_INTERVAL_MS = 2500;
-/// How often to re-read the whole snapshot while the Status tab is open. Uptime and
-/// round-trip time are not pushed as events — they change continuously and would
-/// flood the channel — so they are polled while they are on screen and never
-/// otherwise.
+/// How often to re-read the whole snapshot while a screen that needs it is open.
+/// Uptime and round-trip time are not pushed as events — they change continuously
+/// and would flood the channel — so they are polled while the Status tab is on
+/// screen. The Devices tab joins in only while this window's event subscription is
+/// refused, where the snapshot is the only thing that can raise or end a pairing
+/// card; see the loop below.
 const STATUS_POLL_MS = 5000;
 
 const views = {
@@ -172,7 +174,17 @@ async function main() {
   }, DISCOVER_INTERVAL_MS);
 
   setInterval(() => {
-    if (active === "status" && connected()) {
+    if (!connected()) return;
+    // Devices draws the pairing card, and a window whose event subscription was
+    // refused learns about an incoming request only by reading the status — the
+    // banner says as much. Polling it only in that state keeps the promise true
+    // where it is made, without redrawing a healthy window's device list on a
+    // timer it does not need.
+    // Skipped rather than redrawn over: this poll's own redraw would take away the
+    // rename editor and everything typed into it. The next tick picks it up.
+    if (active === "devices" && devices.editing()) return;
+    const pollingHere = active === "status" || (store.eventsProblem && active === "devices");
+    if (pollingHere) {
       refreshStatus().catch(() => {
         /* the disconnect path reports this */
       });

@@ -37,7 +37,7 @@ export function bannerFor({ connected, busy, daemon, fault, eventsProblem }) {
       tone: "warning",
       headline: "Connected, but this window is not receiving live updates.",
       detail: `${eventsProblem}. What is on screen is a snapshot and will quietly stop matching the agent.`,
-      hint: "Pairing needs this: a request from another machine will not appear here, and a pairing started from this window will sit on its code without ever saying whether it was accepted.",
+      hint: "Pairing needs this: nothing arrives as it happens — a request from another machine, and the answer to one started here, both surface when this window next reads the agent's status, such as when you bring it to the front or while the Devices or Status tab is open.",
       actions: [],
     };
   }

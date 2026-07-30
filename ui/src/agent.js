@@ -23,7 +23,10 @@ export const store = {
   status: null,
   /// Last connection-level failure, as an AgentError-shaped object.
   fault: null,
-  /// In-flight pairing, in either direction. See devices.js.
+  /// The pairing card, in either direction, or null when there is none. Outlives
+  /// the exchange it describes: once `finished` is set it is a receipt rather than
+  /// a prompt, and stops standing in the way of the next request. See
+  /// `livePairing` for that distinction and devices.js for what is drawn.
   pairing: null,
   /// Newest-first activity lines for the Status screen.
   journal: [],
@@ -171,6 +174,10 @@ export async function startAgent() {
 export async function disconnect() {
   await hostCall("disconnect_agent");
   store.status = null;
+  // Dropped with the link that would have ended it: no further agent event can
+  // reach this window, so a card left live here would outlive its own pairing and
+  // go on suppressing every later prompt. Matches the involuntary case below.
+  store.pairing = null;
   log("info", "Detached from the agent. It keeps running.");
   changed();
 }
@@ -179,6 +186,7 @@ export async function disconnect() {
 export async function refreshStatus() {
   const response = await callOk({ kind: "status" });
   store.status = response.status;
+  adoptPendingPairing(store.status);
   changed();
   return store.status;
 }
@@ -249,6 +257,124 @@ function upsertPeer(peer) {
   status.peers = peers;
 }
 
+/// Whether a pairing is still in progress here, as opposed to over and on screen.
+///
+/// The card outlives the exchange on purpose: "the connection was lost" is what
+/// explains to the user why the code they were shown stopped working, and a card
+/// that simply vanished would leave them retrying a machine they think is fine.
+/// It just no longer stands in the way of anything.
+function livePairing() {
+  return Boolean(store.pairing) && !store.pairing.finished;
+}
+
+/// Take up a pairing the agent already has under way.
+///
+/// The events are the live path and this is the recovery one: `pairingRequested`
+/// is a moment, and a window is routinely not listening at that moment — the
+/// agent emits it within microseconds of the session coming up, long before a
+/// window started from the desktop has attached, and a reload throws away
+/// everything the previous one heard. Without this, the machine being asked to
+/// pair shows nothing at all and the user has no way to reach the prompt.
+///
+/// It also ends a card the agent is no longer holding, and does so by one rule
+/// that does not care how the card was created: the first snapshot that lists the
+/// card's node latches `seen` on it, and once a card carries `seen`, a snapshot
+/// that no longer lists it is the exchange being over. Keying this on how the
+/// card was raised instead left the outgoing case latched — a window whose event
+/// subscription was refused (`store.eventsProblem`) hears no `pairingFinished` at
+/// all, so a card it started itself stood for the life of the window and
+/// suppressed every later request, which is the exact failure this path exists to
+/// undo.
+///
+/// A card never seen in `pairings` is never expired, and that is deliberate: the
+/// absence is not evidence when the agent may not have the entry *yet*.
+/// `beginPairing` answers before the agent has dialled the other machine, so an
+/// outgoing card exists for a moment before the agent has published anything
+/// about it, and a status read landing in that window must not take it down. The
+/// agent lists a pairing from the moment it shows a code rather than only once a
+/// session exists, so the wait is one status read long and no card is left
+/// unreconcilable by it.
+///
+/// It runs in every window, not only one whose events were refused. A window
+/// that can hear the agent usually hears `pairingFinished` first and never
+/// reaches the expiry at all, and where it does not, this is the only thing that
+/// can end the card: no event is coming for a state the agent does not know it is
+/// in.
+///
+/// The card is corrected everywhere; only the journal line is not. An absence can
+/// say the exchange ended and no more, while `pairingFinished` says why, so the
+/// line is written only where no event can arrive to say it better — and where
+/// one cannot, there is nothing for it to duplicate either.
+///
+/// That gate is not airtight, and the case it misses is the one named above: a
+/// window whose events work, holding a card the agent has stopped listing and
+/// will never send an event about, because it does not know it is in that state.
+/// There the card silently turns into "Pairing failed: The pairing ended before
+/// it was confirmed" and the activity log beside it says nothing about the
+/// pairing at all. Accepted, because the alternative on offer was to write the
+/// vaguer line everywhere and delete it again whenever the agent's own verdict
+/// turned up, and an activity log that retroactively rewrites itself is worth
+/// less than one with a gap in it.
+///
+/// Over is not the same as failed, and the disappearance does not say which. A
+/// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
+/// trusts the peer, drops the pending entry, and says "accepted" only in the event
+/// this window may never get. So the verdict is read from what the same snapshot
+/// positively asserts — the node is now a paired peer — rather than inferred from
+/// an absence, which would tell a user who has just paired successfully that it
+/// failed while the Devices list beside it shows the machine paired.
+function adoptPendingPairing(status) {
+  const pending = status?.pairings || [];
+  if (livePairing()) {
+    const card = store.pairing;
+    if (pending.some((p) => p.node === card.node)) {
+      if (!card.seen) store.pairing = { ...card, seen: true };
+      return;
+    }
+    if (!card.seen) return;
+    const paired = Boolean(status?.peers?.some((p) => p.node === card.node && p.paired));
+    store.pairing = {
+      ...card,
+      finished: true,
+      accepted: paired,
+      error: paired ? null : "The pairing ended before it was confirmed.",
+    };
+    if (store.eventsProblem) {
+      log(
+        paired ? "info" : "warning",
+        paired
+          ? `Pairing with ${card.name} succeeded`
+          : `Pairing with ${card.name} ended before it was confirmed`
+      );
+    }
+    // The verdict has to reach the screen before anything replaces it. Adopting
+    // the next pending pairing in this same call would overwrite a card the user
+    // has never seen, and in the one window that gets here nothing else would
+    // ever mention it. The next status read raises that pairing.
+    return;
+  }
+  const next = pending[0];
+  if (!next) return;
+  store.pairing = {
+    direction: next.initiatedLocally ? "outgoing" : "incoming",
+    node: next.node,
+    name: next.name,
+    // The initiator's card shows the code; the responder's holds what the user
+    // types, and starts empty.
+    pin: next.initiatedLocally ? next.pin || "" : "",
+    error: null,
+    // Adopted straight out of the pending list, so it has been seen by
+    // construction and the rule above may end it.
+    seen: true,
+  };
+  log(
+    "info",
+    next.initiatedLocally
+      ? `Still waiting for ${next.name} to accept the pairing code`
+      : `${next.name} wants to pair`
+  );
+}
+
 /// Apply one agent event to the store. Exported for the event listener only.
 export function applyEvent(event) {
   const status = store.status;
@@ -274,7 +400,15 @@ export function applyEvent(event) {
       // The other machine started this and is showing a code. Only one prompt at a
       // time: a second request while one is open would replace the code the user is
       // halfway through typing.
-      if (!store.pairing) {
+      //
+      // "Open" means unfinished, which is the whole of what this guard used to get
+      // wrong. `store.pairing` was written by this branch and cleared by nothing
+      // except the user, so the first pairing to end — dropped session, refusal,
+      // even a success nobody dismissed — left a card standing that silently
+      // swallowed every later request, on both machines, until the window was
+      // reloaded. A finished card is a receipt, not a prompt in progress, and must
+      // give way to the next request. See `pairingFinished` for what ends one.
+      if (!livePairing()) {
         store.pairing = {
           direction: "incoming",
           node: event.node,
