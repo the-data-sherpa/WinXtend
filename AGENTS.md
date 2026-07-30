@@ -4,6 +4,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Add durable project-specific notes here as they are discovered through real work.
 
+## A change that falsifies the README's status section corrects it in the same PR
+
+The [Project status](README.md#project-status-pre-alpha-and-the-alpha-target-is-linuxwayland)
+blockquote at the top of the README and the
+[Current status](README.md#current-status) tables are the project's claims about what
+has and has not been made to work; when a change makes one of them false, the
+correction belongs in that change's pull request, not a follow-up. It has been left
+for later twice — the systemd-user-manager row and the cursor-lock hotkey row — and
+both were wrong in the meantime. Correct only what the change disproves: those
+sentences are hedged deliberately, and a limitation that still holds stays.
+
 ## There are two Cargo workspaces, not one
 
 `ui/src-tauri` is its own workspace on purpose (the reasoning is in its `Cargo.toml`).
