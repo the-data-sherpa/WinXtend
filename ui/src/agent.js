@@ -286,8 +286,18 @@ function livePairing() {
 /// A card never seen in `pairings` is never expired, and that is deliberate: the
 /// absence is not evidence when the agent may not have the entry *yet*.
 /// `beginPairing` answers before the agent has dialled the other machine, so an
-/// outgoing card exists for a moment while the agent has nothing pending, and a
-/// status read landing in that window must not take it down.
+/// outgoing card exists for a moment before the agent has published anything
+/// about it, and a status read landing in that window must not take it down. The
+/// agent lists a pairing from the moment it shows a code rather than only once a
+/// session exists, so the wait is one status read long and no card is left
+/// unreconcilable by it.
+///
+/// The expiry is what a window without events has *instead of*
+/// `pairingFinished`, so it only runs in one. Where events work, the agent's own
+/// announcement is the verdict and it is the better one — it carries the reason
+/// the pairing failed, where an absence can only say that it ended — and running
+/// both would put two voices in the journal for one outcome, the vaguer one
+/// standing beside the accurate one.
 ///
 /// Over is not the same as failed, and the disappearance does not say which. A
 /// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
@@ -304,7 +314,7 @@ function adoptPendingPairing(status) {
       if (!card.seen) store.pairing = { ...card, seen: true };
       return;
     }
-    if (!card.seen) return;
+    if (!card.seen || !store.eventsProblem) return;
     const paired = Boolean(status?.peers?.some((p) => p.node === card.node && p.paired));
     store.pairing = {
       ...card,

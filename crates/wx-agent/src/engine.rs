@@ -700,14 +700,25 @@ impl DrivenBy {
 struct OfferedPins {
     pins: HashMap<NodeId, Pin>,
     /// Peers whose code belongs to a connection that has not been made yet.
-    awaiting_dial: HashSet<NodeId>,
+    awaiting_dial: HashMap<NodeId, AwaitingDial>,
+}
+
+/// A pairing that exists only as a code on screen so far.
+///
+/// Carried because such an exchange is in no session and in no `pending` entry,
+/// and a window still has to be able to draw it and to tell when it is over: see
+/// [`pending_pairing_snapshots`].
+struct AwaitingDial {
+    name: String,
+    since: Instant,
 }
 
 impl OfferedPins {
     /// Record a code for a connection that is about to be dialled.
-    fn offer(&mut self, node: NodeId, pin: Pin) {
+    fn offer(&mut self, node: NodeId, pin: Pin, name: String, since: Instant) {
         self.pins.insert(node, pin);
-        self.awaiting_dial.insert(node);
+        self.awaiting_dial
+            .insert(node, AwaitingDial { name, since });
     }
 
     /// Take the code for a session that has just come up.
@@ -726,7 +737,7 @@ impl OfferedPins {
     /// there was one. Narrower than [`OfferedPins::discard`] on purpose: only a
     /// code still waiting for its dial can belong to a dial that just failed.
     fn discard_awaiting_dial(&mut self, node: NodeId) -> bool {
-        if !self.awaiting_dial.remove(&node) {
+        if self.awaiting_dial.remove(&node).is_none() {
             return false;
         }
         self.pins.remove(&node);
@@ -736,7 +747,7 @@ impl OfferedPins {
     /// A session for `node` ended. Keeps a code whose own connection has not
     /// happened yet; see the type's documentation for why that matters.
     fn on_session_ended(&mut self, node: NodeId) {
-        if !self.awaiting_dial.contains(&node) {
+        if !self.awaiting_dial.contains_key(&node) {
             self.pins.remove(&node);
         }
     }
@@ -816,31 +827,73 @@ fn end_undialled_pairing(
 ///
 /// Free for the same reason as [`end_pending_pairing`]: it is the whole of what
 /// [`ipc::StatusSnapshot::pairings`] is, and it is reachable from a test.
+///
+/// Every pairing this agent is holding, not only those that reached a session.
+/// `begin_pairing` answers with a code and dials, and until that dial lands the
+/// exchange lives in [`OfferedPins::awaiting_dial`] alone — a window told about
+/// the code but not about this would have a card the snapshot never mentions,
+/// and so no way to tell that a dial which never landed is over. That is the
+/// reported symptom seen from the initiator's side, and it is the one thing the
+/// list has to describe for a window without events to reconcile against.
 fn pending_pairing_snapshots(
     pending: &HashMap<NodeId, PendingPairing>,
+    offered: &OfferedPins,
 ) -> Vec<ipc::PendingPairingSnapshot> {
-    let mut by_age: Vec<&PendingPairing> = pending.values().collect();
+    let mut by_age: Vec<(Instant, NodeId, ipc::PendingPairingSnapshot)> = pending
+        .values()
+        .map(|p| {
+            (
+                p.started,
+                p.node,
+                ipc::PendingPairingSnapshot {
+                    node: p.node.to_hex(),
+                    name: p.name.clone(),
+                    initiated_locally: p.initiated_locally,
+                    // Only for the side that generated it. The responder also holds
+                    // a `PairingSession` once the user has typed something, and that
+                    // is the user's own guess — echoing it back as "the code" would
+                    // show a second window a number nobody should be typing
+                    // anywhere.
+                    pin: p
+                        .pairing
+                        .as_ref()
+                        .filter(|_| p.initiated_locally)
+                        .map(|s| s.pin().as_str().to_string()),
+                },
+            )
+        })
+        .collect();
+    by_age.extend(
+        offered
+            .awaiting_dial
+            .iter()
+            // A session for that peer got in first, and its entry is the same
+            // exchange one step further on. Listing both would offer a window two
+            // cards for one pairing.
+            .filter(|(node, _)| !pending.contains_key(node))
+            .map(|(node, dial)| {
+                (
+                    dial.since,
+                    *node,
+                    ipc::PendingPairingSnapshot {
+                        node: node.to_hex(),
+                        name: dial.name.clone(),
+                        // Only this machine puts a code into `awaiting_dial`; the
+                        // responder never has one before a session exists.
+                        initiated_locally: true,
+                        pin: offered.pins.get(node).map(|p| p.as_str().to_string()),
+                    },
+                )
+            }),
+    );
     // Oldest first, so a window that attaches late adopts the same pairing the
-    // events would have offered it first, and so two windows agree. `started` can
-    // tie between two sessions admitted in the same instant; the node id breaks it
-    // only to keep the order stable across status requests.
-    by_age.sort_by(|a, b| a.started.cmp(&b.started).then_with(|| a.node.cmp(&b.node)));
+    // events would have offered it first, and so two windows agree. The instants
+    // can tie between two exchanges admitted in the same moment; the node id
+    // breaks it only to keep the order stable across status requests.
+    by_age.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     by_age
         .into_iter()
-        .map(|p| ipc::PendingPairingSnapshot {
-            node: p.node.to_hex(),
-            name: p.name.clone(),
-            initiated_locally: p.initiated_locally,
-            // Only for the side that generated it. The responder also holds a
-            // `PairingSession` once the user has typed something, and that is the
-            // user's own guess — echoing it back as "the code" would show a second
-            // window a number nobody should be typing anywhere.
-            pin: p
-                .pairing
-                .as_ref()
-                .filter(|_| p.initiated_locally)
-                .map(|s| s.pin().as_str().to_string()),
-        })
+        .map(|(_, _, snapshot)| snapshot)
         .collect()
 }
 
@@ -2897,7 +2950,7 @@ impl Engine {
                     self.state.uptime(Instant::now()),
                     self.firewall.as_deref(),
                     self.autostart_registered(),
-                    pending_pairing_snapshots(&self.pending),
+                    pending_pairing_snapshots(&self.pending, &self.offered_pins),
                 )),
             },
             Request::ListPeers => Response::Peers {
@@ -3090,6 +3143,7 @@ impl Engine {
             );
         }
         let addresses = peer.addresses.clone();
+        let name = peer.display_name().to_string();
         if addresses.is_empty() {
             return Response::error(
                 ErrorCode::NotConnected,
@@ -3104,7 +3158,7 @@ impl Engine {
         // Offered against the dial below rather than against whatever session
         // exists now, so the teardown of the session this is about to close cannot
         // take the code with it. See [`OfferedPins`].
-        self.offered_pins.offer(node, pin);
+        self.offered_pins.offer(node, pin, name, Instant::now());
         // A stale session from a previous attempt would carry the wrong nonces, so
         // the exchange always starts from a fresh connection.
         if let Some(link) = self.sessions.remove(&node) {
@@ -5455,7 +5509,12 @@ mod tests {
         // abandoned the pairing with "no pairing code was generated", after the user
         // had already read the code off the screen.
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
         pins.on_session_ended(node(2));
         assert!(
             pins.claim(node(2)).is_some(),
@@ -5469,7 +5528,12 @@ mod tests {
         // teardown must leave nothing behind for an unrelated future session to
         // claim and quietly show a peer a code the user cannot see any more.
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
         assert!(pins.claim(node(2)).is_some());
         pins.on_session_ended(node(2));
         assert!(pins.claim(node(2)).is_none());
@@ -5481,7 +5545,12 @@ mod tests {
         // code must go whatever the dial is doing, or the next connection would
         // resurrect a pairing that has already been refused.
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
         pins.discard(node(2));
         assert!(pins.claim(node(2)).is_none());
     }
@@ -5489,9 +5558,19 @@ mod tests {
     #[test]
     fn a_teardown_for_one_peer_does_not_touch_another_peers_code() {
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("111111").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("111111").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
         pins.discard(node(2));
-        pins.offer(node(3), Pin::parse("222222").expect("six digits is a PIN"));
+        pins.offer(
+            node(3),
+            Pin::parse("222222").expect("six digits is a PIN"),
+            "laptop".to_string(),
+            Instant::now(),
+        );
         pins.on_session_ended(node(2));
         assert!(pins.claim(node(3)).is_some());
     }
@@ -6618,7 +6697,12 @@ mod tests {
         // window, which is the reported symptom read from the other side.
         let (events, mut rx) = broadcast::channel(8);
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
 
         let ended =
             end_undialled_pairing(&mut pins, &events, node(2), "could not reach that machine");
@@ -6650,7 +6734,12 @@ mod tests {
         // fail a card the user is still typing into.
         let (events, mut rx) = broadcast::channel(8);
         let mut pins = OfferedPins::default();
-        pins.offer(node(2), Pin::parse("123456").expect("six digits is a PIN"));
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            Instant::now(),
+        );
         assert!(pins.claim(node(2)).is_some());
 
         assert!(!end_undialled_pairing(
@@ -6673,7 +6762,7 @@ mod tests {
         pending.insert(node(2), pending_pairing(node(2), false, now));
         pending.insert(node(3), pending_pairing(node(3), true, older));
 
-        let snapshots = pending_pairing_snapshots(&pending);
+        let snapshots = pending_pairing_snapshots(&pending, &OfferedPins::default());
 
         assert_eq!(snapshots.len(), 2);
         // Oldest first, so every window adopts the same one.
@@ -6690,5 +6779,78 @@ mod tests {
             snapshots[1].pin, None,
             "a code was offered to the side that is supposed to type it"
         );
+    }
+
+    #[test]
+    fn a_code_shown_before_its_dial_lands_is_in_the_snapshot() {
+        // The captain's own symptom, from the initiating side: a code on screen and
+        // a machine that never answers. Nothing is in `pending` until a session
+        // exists, so a snapshot describing only `pending` never mentioned that
+        // pairing at all — and a window with no events, which reconciles its card
+        // against this list and against nothing else, could neither draw it after a
+        // reload nor tell when it was over.
+        let now = Instant::now();
+        let mut pins = OfferedPins::default();
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            now - Duration::from_secs(5),
+        );
+        let mut pending = HashMap::new();
+        pending.insert(node(3), pending_pairing(node(3), false, now));
+
+        let snapshots = pending_pairing_snapshots(&pending, &pins);
+
+        assert_eq!(snapshots.len(), 2);
+        // Ordered against the sessions by the same clock, not appended after them.
+        assert_eq!(snapshots[0].node, node(2).to_hex());
+        assert_eq!(snapshots[0].name, "workhorse");
+        assert!(
+            snapshots[0].initiated_locally,
+            "only this machine offers a code before a connection exists"
+        );
+        assert_eq!(
+            snapshots[0].pin.as_deref(),
+            Some("123456"),
+            "a window that reloaded cannot show the user what to type"
+        );
+        assert_eq!(snapshots[1].node, node(3).to_hex());
+
+        // And once the dial has failed the entry goes, which is how a window
+        // without events learns the exchange is over.
+        let (events, _rx) = broadcast::channel(8);
+        assert!(end_undialled_pairing(
+            &mut pins,
+            &events,
+            node(2),
+            "could not reach that machine"
+        ));
+        let snapshots = pending_pairing_snapshots(&pending, &pins);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].node, node(3).to_hex());
+    }
+
+    #[test]
+    fn a_pairing_that_reached_a_session_is_listed_once() {
+        // The cross-initiation case: this machine has shown a code and dialled while
+        // the other machine's dial lands first, so the same exchange is in both
+        // places for a moment. The session's entry is the same pairing further on,
+        // and two entries would offer a window two cards for one pairing.
+        let now = Instant::now();
+        let mut pins = OfferedPins::default();
+        pins.offer(
+            node(2),
+            Pin::parse("123456").expect("six digits is a PIN"),
+            "workhorse".to_string(),
+            now,
+        );
+        let mut pending = HashMap::new();
+        pending.insert(node(2), pending_pairing(node(2), true, now));
+
+        let snapshots = pending_pairing_snapshots(&pending, &pins);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].node, node(2).to_hex());
     }
 }

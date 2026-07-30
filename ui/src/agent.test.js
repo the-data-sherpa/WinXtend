@@ -405,6 +405,46 @@ describe("pairing prompts", () => {
     expect(store.pairing.finished).toBeUndefined();
   });
 
+  // Where events do arrive, `pairingFinished` is the verdict and it is the better
+  // one: it carries the agent's reason, where an absence can only say the exchange
+  // ended. A status read landing first must not announce a vaguer version of the
+  // same outcome beside it.
+  it("leaves the verdict to the agent in a window that can hear it", async () => {
+    let pairings = [{ node: "aa", name: "workhorse", initiatedLocally: false, pin: null }];
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({ kind: "status", status: { ...SNAPSHOT, pairings } });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    expect(await listenToAgent()).toBe(true);
+    await attachToRunningAgent();
+    expect(store.pairing.node).toBe("aa");
+
+    // The agent has dropped the entry; its event is on its way.
+    pairings = [];
+    await refreshStatus();
+    expect(store.pairing.finished).toBeUndefined();
+    expect(store.journal.some((line) => /ended before/.test(line.text))).toBe(false);
+
+    applyEvent({
+      kind: "pairingFinished",
+      node: "aa",
+      accepted: false,
+      message: "the pairing code did not match",
+    });
+    expect(store.pairing).toMatchObject({
+      finished: true,
+      error: "the pairing code did not match",
+    });
+  });
+
   // A pairing that worked leaves `pairings` by the same door as one that was
   // abandoned — the agent trusts the peer, drops the entry, and says "accepted"
   // only in the event this window cannot receive. Reading the disappearance as a

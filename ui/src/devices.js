@@ -19,9 +19,25 @@ import {
 let root = null;
 /// Node id currently being renamed, so a redraw does not close the editor.
 let renaming = null;
+/// Node whose incoming prompt has already been given the caret.
+let prompted = null;
 
 export function mount(element) {
   root = element;
+}
+
+/// Whether this screen is holding something a redraw would destroy.
+///
+/// `render` replaces the whole section, and a field the user is typing into does
+/// not survive that: removing a focused element dispatches no `blur`, so a
+/// half-typed rename is discarded rather than committed and the editor reopens
+/// empty. A poll that redraws on a timer therefore has to ask first — see
+/// `main.js`. Only text fields count, because a button keeps focus after it is
+/// clicked and treating that as busy would stop the poll for good.
+export function editing() {
+  if (renaming !== null) return true;
+  const focused = document.activeElement;
+  return Boolean(focused && focused.tagName === "INPUT" && root?.contains(focused));
 }
 
 async function attempt(what, action) {
@@ -35,6 +51,7 @@ async function attempt(what, action) {
 
 function pairingCard() {
   const pairing = store.pairing;
+  if (!pairing || pairing.finished || pairing.direction === "outgoing") prompted = null;
   if (!pairing) return null;
 
   const close = () => {
@@ -162,8 +179,14 @@ function pairingCard() {
       )
     )
   );
-  // Focus after the node is in the document, so typing can start immediately.
-  queueMicrotask(() => input.isConnected && input.focus());
+  // Focus after the node is in the document, so typing can start immediately —
+  // but once per prompt, not once per redraw. Every redraw builds a new input,
+  // and taking the caret back on each one holds the user in this field: they
+  // could never reach Refuse or Block while the card was on screen.
+  if (prompted !== pairing.node) {
+    prompted = pairing.node;
+    queueMicrotask(() => input.isConnected && input.focus());
+  }
   return card;
 }
 

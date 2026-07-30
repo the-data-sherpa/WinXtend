@@ -531,6 +531,12 @@ pub struct StatusSnapshot {
     /// A list rather than one entry because the agent really can have several,
     /// and picking one here would be this file guessing at a policy the UI
     /// already has: it shows one prompt at a time and chooses which itself.
+    ///
+    /// Every exchange the agent is holding, including one whose connection has
+    /// not been made yet — a code was shown for it and a window is drawing it, so
+    /// leaving it out would make this list say a pairing the user can see is not
+    /// happening, and a window with nothing but this list could never tell that a
+    /// dial which never landed is over.
     #[serde(default)]
     pub pairings: Vec<PendingPairingSnapshot>,
     pub monitors: Vec<MonitorSpec>,
