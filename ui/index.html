@@ -11,6 +11,12 @@
         <div class="identity">
           <span class="wordmark">WinXtend</span>
           <span id="local-name" class="local-name"></span>
+          <!-- In the chrome rather than on a tab: which machine has the cursor is
+               the one thing a user looks up while looking at the other machine's
+               screen, and the Status tab is not what is on screen when they do.
+               `role="status"` so the change is announced when ownership moves,
+               which happens without the user touching this window. -->
+          <span id="cursor" class="cursor-badge" role="status" aria-live="polite"></span>
         </div>
         <nav class="tabs" id="tabs" role="tablist">
           <button type="button" role="tab" data-view="devices">Devices</button>

@@ -345,6 +345,49 @@ later snapshot that omits it ends the card, whichever side raised it — see
 `adoptPendingPairing`, which is what a window whose event subscription was
 refused has instead of `pairingFinished`.
 
+## Cursor ownership is reported, but never retracted
+
+`CursorSnapshot::owner` is the last thing the engine settled on, and nothing
+revises it when the owning peer drops: no event says "the machine holding the
+cursor went away". So anything that *presents* ownership has to check the owner
+against its `PeerSnapshot` — a peer that is missing or not `connected` means the
+field is the last thing known and not where the cursor is. `ui/src/cursor.js`
+is where that judgement lives and carries the argument; it derives everything
+from the existing snapshot, which is why nothing was added to `StatusSnapshot`
+for it.
+
+`CursorSnapshot::locked` is **this machine's own router flag** and does not
+cross the wire (`Router::is_locked`, `crates/wx-core/src/router.rs`; the
+`cursor.rs` one is `VirtualCursor::is_locked`). What it pins is the virtual
+cursor's *current* monitor, whosever that monitor is: `VirtualCursor::move_by`
+consults `locked` before resolving a crossing and refuses it wherever the cursor
+happens to be, and `Request::SetCursorLock` sets the flag regardless of who owns
+the cursor. So locking while a peer holds the cursor keeps input flowing to that
+peer instead of clawing control back — see
+`locking_keeps_input_flowing_to_the_peer_that_already_owns_it` in
+`crates/wx-core/src/router.rs`, which pins exactly that. Two things follow, and
+they are easy to confuse. The lock a machine sets is in effect immediately, even
+when the cursor is elsewhere, and copy must not describe it as dormant or
+promise the cursor will come back. But the flag still says nothing about the
+*peer's* own lock, so a machine that does not have the cursor must not report
+the peer's cursor as locked — that would be a claim about somewhere else.
+
+What the lock stops is the *crossing*, and only the crossing.
+`VirtualCursor::warp_to` never consults `locked` and says in its own doc comment
+why: the lock is there to stop accidental edge crossings, and an explicit
+handoff is not accidental. So `Request::WarpCursor` moves the cursor while
+locked — which the Layout tab offers as "Move the cursor here" — and copy must
+not tell anyone that unlocking is the only way to move it. That is not a
+loophole to be closed; it is the reason someone locked out of their own cursor
+is not stranded.
+
+`Request::LockAll` is a different thing entirely: it is screensaver sync, not
+the cursor lock.
+
+There is no machine in charge in this mesh. Do not describe one as a master or a
+slave in code, copy, or comments; ownership moves to whichever machine the user
+is driving from, and the words have to say who *has* the cursor.
+
 ## A transport error string is never user-facing copy
 
 `wx_net::TransportError` renders things like "reading from a stream: connection

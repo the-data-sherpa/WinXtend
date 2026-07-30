@@ -19,6 +19,7 @@ import {
   store,
 } from "./agent.js";
 import { bannerFor } from "./banner.js";
+import { cursorBadge, cursorStateFor } from "./cursor.js";
 import { h, replace } from "./dom.js";
 import * as devices from "./devices.js";
 import * as layout from "./layout.js";
@@ -46,10 +47,49 @@ let active = "devices";
 let bannerEl = null;
 let connectionEl = null;
 let localNameEl = null;
+let cursorEl = null;
+/// What `renderCursor` last put on screen, so it can leave the live region
+/// alone when nothing has changed. Starts `undefined` rather than `null`, which
+/// is the key of a window with no snapshot and a state that has to be drawn.
+let cursorKey;
+
+/// Who has the keyboard and mouse, in the header, on every tab.
+///
+/// Redrawn by the same `renderAll` every other part of the chrome is, which is
+/// driven by `store` changing — `cursorOwnerChanged` and `cursorLockChanged`
+/// patch the snapshot and the store announces it. There is no timer here: the
+/// Status tab's existing poll keeps uptime and round-trip fresh, and adding a
+/// second one for a field the agent already pushes would be inventing a
+/// heartbeat to watch something that already speaks.
+///
+/// Redrawn only when the words actually change. `#cursor` is
+/// `aria-live="polite"`, and re-inserting an identical text node into a live
+/// region is still a mutation a screen reader announces — so an unguarded
+/// redraw would read "Cursor here" aloud every five seconds under the Status
+/// tab's poll, drowning the one announcement the region exists for.
+function renderCursor() {
+  const state = cursorStateFor(store.status);
+  // The full sentence on hover: the badge is abbreviated to fit a header, and
+  // "Cursor was on cowen-ubuntu" needs the rest of it to be read the way it is
+  // meant.
+  const title = state ? [state.headline, state.detail].filter(Boolean).join(" ") : null;
+  const key = state ? `${state.tone}|${state.node}|${state.badge}|${title}` : null;
+  if (key === cursorKey) return;
+  cursorKey = key;
+
+  if (!state) {
+    cursorEl.hidden = true;
+    replace(cursorEl);
+    return;
+  }
+  cursorEl.hidden = false;
+  replace(cursorEl, cursorBadge(state, { title }));
+}
 
 function renderChrome() {
   const daemon = store.daemon;
   const online = connected();
+  renderCursor();
   replace(
     connectionEl,
     h("span", { class: `dot ${online ? "good" : "bad"}` }),
@@ -148,6 +188,7 @@ function wire() {
   bannerEl = document.getElementById("banner");
   connectionEl = document.getElementById("connection");
   localNameEl = document.getElementById("local-name");
+  cursorEl = document.getElementById("cursor");
   for (const [name, view] of Object.entries(views)) {
     view.section = document.getElementById(`view-${name}`);
     view.tab = document.querySelector(`#tabs button[data-view="${name}"]`);

@@ -578,6 +578,8 @@ pub struct CursorSnapshot {
     /// Monitor within that node, absent before any layout exists.
     #[serde(default)]
     pub monitor: Option<u32>,
+    /// Narrower than it looks — see "Cursor ownership is reported, but never
+    /// retracted" in `AGENTS.md` before presenting or acting on this.
     pub locked: bool,
     /// Whether the owner is this machine. Derivable from `owner`, included
     /// because it is what the UI actually branches on.
