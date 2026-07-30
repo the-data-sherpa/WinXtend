@@ -7,6 +7,7 @@
 // copy of the agent's own log file, and it says so.
 
 import { callOk, changed, disconnect, log, refreshStatus, store } from "./agent.js";
+import { cursorStateFor } from "./cursor.js";
 import { h, replace } from "./dom.js";
 import {
   capabilitiesText,
@@ -150,20 +151,35 @@ function localPanel() {
 
 function cursorPanel() {
   const status = store.status;
-  const cursor = status.cursor;
-  const where = Number.isInteger(cursor.monitor)
-    ? `display ${cursor.monitor}`
-    : "no display yet";
+  // Defaulted for the same reason `cursorStateFor` tolerates a missing cursor: the
+  // button below must still render on a snapshot that carries no ownership, since
+  // locking is exactly what someone reaches for when it is not clear where the
+  // cursor went.
+  const cursor = status.cursor || {};
+  // Same decision as the window header draws, from the same function, so the two
+  // cannot end up describing the machine differently on one screen.
+  const state = cursorStateFor(status);
   return h(
     "section",
     { class: "panel" },
-    h("header", {}, h("h1", {}, "Cursor")),
+    h(
+      "header",
+      {},
+      h("h1", {}, "Cursor"),
+      h(
+        "span",
+        { class: `pill ${state.tone}` },
+        state.node
+          ? h("span", { class: "swatch small", style: { background: nodeColor(state.node) } })
+          : null,
+        state.badge
+      )
+    ),
     h(
       "p",
-      { class: "cursor-owner" },
-      h("strong", {}, cursor.ownerName || shortId(cursor.owner)),
-      ` has the keyboard and mouse (${where})`,
-      cursor.local ? " — this machine" : ""
+      { class: `cursor-owner${state.certain ? "" : " uncertain"}` },
+      h("strong", {}, state.headline),
+      state.detail ? h("span", { class: "muted small" }, state.detail) : null
     ),
     h(
       "div",
@@ -193,12 +209,13 @@ function cursorPanel() {
         "Lock every machine"
       )
     ),
+    // What the control is for. Whether the lock is currently on, and what that
+    // means for this machine right now, is `state.detail`'s job above — saying it
+    // twice on one panel is how the two sentences come to disagree.
     h(
       "p",
       { class: "muted small" },
-      cursor.locked
-        ? "The cursor is pinned to this machine: it will not cross an edge until it is unlocked."
-        : "Locking pins the cursor to one machine, which is what a full-screen game or a virtual machine needs."
+      "Locking pins the cursor to one machine, which is what a full-screen game or a virtual machine needs."
     )
   );
 }

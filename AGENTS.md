@@ -345,6 +345,28 @@ later snapshot that omits it ends the card, whichever side raised it — see
 `adoptPendingPairing`, which is what a window whose event subscription was
 refused has instead of `pairingFinished`.
 
+## Cursor ownership is reported, but never retracted
+
+`CursorSnapshot::owner` is the last thing the engine settled on, and nothing
+revises it when the owning peer drops: no event says "the machine holding the
+cursor went away". So anything that *presents* ownership has to check the owner
+against its `PeerSnapshot` — a peer that is missing or not `connected` means the
+field is the last thing known and not where the cursor is. `ui/src/cursor.js`
+is where that judgement lives and carries the argument; it derives everything
+from the existing snapshot, which is why nothing was added to `StatusSnapshot`
+for it.
+
+`CursorSnapshot::locked` is **this machine's own router flag** and does not
+cross the wire (`Router::is_locked`, `wx-core/src/cursor.rs`). It pins the
+cursor only while this machine is the one holding it, so a machine that does not
+have the cursor must not report the cursor as locked — that would be a claim
+about somewhere else. `Request::LockAll` is a different thing entirely: it is
+screensaver sync, not the cursor lock.
+
+There is no machine in charge in this mesh. Do not describe one as a master or a
+slave in code, copy, or comments; ownership moves to whichever machine the user
+is driving from, and the words have to say who *has* the cursor.
+
 ## A transport error string is never user-facing copy
 
 `wx_net::TransportError` renders things like "reading from a stream: connection

@@ -21,12 +21,14 @@ import { bannerFor } from "./banner.js";
 const CSS = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 const HTML = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 
-/// The banner as `index.html` actually writes it, in one of its two states.
-function bannerElement({ hidden }) {
-  const tag = HTML.match(/<([a-z]+)([^>]*\bid="banner"[^>]*)>/i);
+/// An element as `index.html` actually writes it, in one of its two states.
+function elementById(id, { hidden }) {
+  const tag = HTML.match(new RegExp(`<([a-z]+)([^>]*\\bid="${id}"[^>]*)>`, "i"));
   const classes = tag[2].match(/class="([^"]*)"/)?.[1].split(/\s+/).filter(Boolean) ?? [];
-  return { tag: tag[1], id: "banner", classes, hidden };
+  return { tag: tag[1], id, classes, hidden };
 }
+
+const bannerElement = (state) => elementById("banner", state);
 
 /// Every rule in the sheet, innermost first bodies only, so rules inside a
 /// `@media` block are read as if the query matched: a `display` that hides the
@@ -101,5 +103,18 @@ describe("the banner on screen", () => {
 
   it("is still laid out as a row when it has something to say", () => {
     expect(computedDisplay(bannerElement({ hidden: false }))).toBe("flex");
+  });
+});
+
+describe("the cursor badge in the chrome", () => {
+  // The same trap as the banner's, and worse to get wrong: the sentence left on
+  // screen would name a machine as holding the cursor after this window stopped
+  // being able to know that.
+  it("is gone when the window has no snapshot to draw it from", () => {
+    expect(computedDisplay(elementById("cursor", { hidden: true }))).toBe("none");
+  });
+
+  it("is laid out beside the machine name when there is an owner to show", () => {
+    expect(computedDisplay(elementById("cursor", { hidden: false }))).toBe("flex");
   });
 });

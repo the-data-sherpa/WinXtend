@@ -103,11 +103,15 @@ body {
   background: var(--panel);
 }
 
+/* Equal flexible sides rather than a matched `min-width`, so the tabs stay
+   centred whatever the cursor badge and the connection line happen to say —
+   a peer name is arbitrarily long and used to be able to shove them off centre. */
 .identity {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  min-width: 190px;
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .wordmark {
@@ -151,8 +155,30 @@ body {
   align-items: center;
   gap: 6px;
   color: var(--ink-muted);
-  min-width: 190px;
+  flex: 1 1 0;
+  min-width: 0;
   justify-content: flex-end;
+}
+
+.cursor-badge {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+/* Spelled out for the same reason the banner's is: the rule above sets
+   `display`, which outranks the user-agent `[hidden]` rule, so a badge the code
+   hides would otherwise stay on screen still naming the machine that had the
+   cursor before the window detached. */
+.cursor-badge[hidden] {
+  display: none;
+}
+
+.cursor-badge .pill {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dot {
@@ -797,7 +823,16 @@ button:focus-visible,
 }
 
 .cursor-owner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   margin: 0 0 10px;
+}
+
+/* Ownership that could not be confirmed reads as a report and not as a fact. */
+.cursor-owner.uncertain strong {
+  font-weight: 500;
+  color: var(--ink-muted);
 }
 
 table.peers {
