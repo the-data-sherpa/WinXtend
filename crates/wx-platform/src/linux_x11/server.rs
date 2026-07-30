@@ -269,6 +269,25 @@ impl Server {
         Ok(raw)
     }
 
+    /// Whether this connection still has a server on the other end of it.
+    ///
+    /// A round trip rather than a reading of the last error, because x11rb reports
+    /// "the server raised a protocol error against that one request" and "the socket
+    /// has closed" through the same `Result`, and only the first of those leaves a
+    /// connection that can still inject. `GetInputFocus` is the request to ask with:
+    /// it takes no arguments, cannot fail on its own merits, and is what X clients
+    /// have always used to force a synchronisation.
+    ///
+    /// Only called after something else has already failed, so its cost is paid on a
+    /// path that is not working anyway.
+    pub(super) fn is_reachable(&self) -> bool {
+        self.conn
+            .get_input_focus()
+            .map_err(ReplyError::from)
+            .and_then(|c| c.reply())
+            .is_ok()
+    }
+
     /// Read everything the server has sent us, without waiting for more.
     ///
     /// See the module docs: an X connection that is never read from eventually
@@ -530,9 +549,12 @@ mod tests {
         let Some(monitors) = session_monitors() else {
             return;
         };
-        let bounds = super::super::X11Displays::new(super::super::Session::connect())
-            .virtual_bounds()
-            .expect("a server that just enumerated");
+        let bounds = super::super::X11Displays::new(
+            super::super::Session::connect(),
+            crate::LiveCapabilities::fixed(wx_proto::Capabilities::NONE),
+        )
+        .virtual_bounds()
+        .expect("a server that just enumerated");
         for m in monitors {
             assert!(bounds.x <= m.local_bounds.x);
             assert!(bounds.y <= m.local_bounds.y);

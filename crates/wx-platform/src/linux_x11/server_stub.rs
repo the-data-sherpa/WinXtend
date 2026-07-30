@@ -34,6 +34,12 @@ impl Server {
     pub(super) fn outputs(&self) -> Result<Vec<RawOutput>> {
         unsupported("display enumeration")
     }
+
+    /// Unreachable in both senses: [`connect`] never hands one of these out, so
+    /// nothing can ask, and a stub has no server behind it to answer.
+    pub(super) fn is_reachable(&self) -> bool {
+        false
+    }
 }
 
 impl Sink for Server {

@@ -55,6 +55,7 @@
 //! would put a C toolchain on every machine that builds this crate, CI included,
 //! and no part of this backend needs one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use wx_proto::{
@@ -102,6 +103,17 @@ fn todo_err(operation: &'static str) -> PlatformError {
 pub struct Session {
     server: Option<Arc<server::Server>>,
     reason: Arc<str>,
+    /// Whether the connection still has a server on the other end.
+    ///
+    /// Shared with every clone, because the displays and the injector are two views
+    /// of one socket and the one that notices it has gone is not the one that has to
+    /// stop making promises about it.
+    ///
+    /// Latched: it starts true and can only fall. There is no reconnect path here on
+    /// purpose, so a connection that has died stays dead until the agent is
+    /// restarted, and this must not flicker back on the strength of a request that
+    /// happened not to fail.
+    alive: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -112,10 +124,12 @@ impl Session {
             Ok(server) => Self {
                 server: Some(server),
                 reason: Arc::from(""),
+                alive: Arc::new(AtomicBool::new(true)),
             },
             Err(e) => Self {
                 server: None,
                 reason: Arc::from(e.to_string().as_str()),
+                alive: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -131,6 +145,23 @@ impl Session {
         Self {
             server: None,
             reason: Arc::from(reason),
+            alive: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A session whose connection was made and has since gone.
+    ///
+    /// The state a real one reaches when the X server restarts under a running agent
+    /// — a logout, an `Xorg` crash, `systemctl restart display-manager` — which is
+    /// otherwise only reproducible by killing a server out from under a test. A
+    /// probe with no socket to ask down cannot come back, which is precisely the
+    /// answer this stands for.
+    #[cfg(test)]
+    fn lost(reason: &str) -> Self {
+        Self {
+            server: None,
+            reason: Arc::from(reason),
+            alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -142,13 +173,56 @@ impl Session {
 
     /// Whether this backend can inject right now.
     ///
-    /// The question [`Capabilities::INJECT_INPUT`] is a promise about. On X11 it is
-    /// answered once and does not change: there is no grant to be given or
-    /// withdrawn, so a connection that was made at startup is one that lasts as
-    /// long as the session the agent runs in.
+    /// The question [`Capabilities::INJECT_INPUT`] is a promise about. X11 has no
+    /// grant to be given or withdrawn, so the permission half of the answer really
+    /// is settled at startup — but the connection is not. An X server restarts on a
+    /// logout, a crash or a `systemctl restart display-manager` while an agent
+    /// running as a user service carries on, and from that moment this socket
+    /// delivers nothing. See [`Session::went_away`].
     fn can_inject(&self) -> bool {
-        self.server.is_some()
+        self.server.is_some() && self.alive.load(Ordering::Relaxed)
     }
+
+    /// Notice, from a request that just failed, that the connection itself has gone.
+    ///
+    /// Returns whether this is the call that noticed, so the caller withdraws and
+    /// logs once rather than on every tick that follows.
+    fn went_away(&self, error: &PlatformError) -> bool {
+        // Also the guard against there having been no connection in the first place:
+        // `alive` starts true only for a session that opened one. A headless runner
+        // fails this way on every tick forever and must withdraw nothing and log
+        // nothing.
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !is_connection_loss(error, || {
+            self.server
+                .as_ref()
+                .is_some_and(|server| server.is_reachable())
+        }) {
+            return false;
+        }
+        self.alive.store(false, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Whether a failed request means there is no longer a server to talk to.
+///
+/// Two things this deliberately does not do. It does not read the answer out of the
+/// error, because x11rb reports "the server raised a protocol error against that one
+/// request" and "the socket has closed" through the same `Result`, and only the
+/// first of those leaves a connection that can still be injected into; a round trip
+/// is the only thing that tells them apart. And it does not probe at all for a
+/// refusal this backend makes for its own reasons — a server with no RandR answers
+/// `Unsupported` on every tick forever while injecting perfectly well, and probing
+/// it would be a round trip a second in exchange for an answer that cannot change.
+///
+/// Split out from [`Session::went_away`] so the rule is tested on the machines that
+/// have no X server to disagree with it, which is the same division the rest of this
+/// backend keeps.
+fn is_connection_loss(error: &PlatformError, reachable: impl FnOnce() -> bool) -> bool {
+    !matches!(error, PlatformError::Unsupported { .. }) && !reachable()
 }
 
 /// Display enumeration over RandR.
@@ -159,11 +233,46 @@ impl Session {
 /// count are [`display`]; the requests are `server`.
 pub struct X11Displays {
     session: Session,
+    /// What this node advertises, so a connection found dead here stops the node
+    /// claiming things that connection was the whole basis of. See
+    /// [`X11Displays::withdraw_if_gone`].
+    live: LiveCapabilities,
 }
 
 impl X11Displays {
-    fn new(session: Session) -> Self {
-        Self { session }
+    fn new(session: Session, live: LiveCapabilities) -> Self {
+        Self { session, live }
+    }
+
+    /// Stop advertising a connection that has gone.
+    ///
+    /// This is the only place a dead X connection is noticed, and it is enough: the
+    /// engine polls `monitors` on its housekeeping tick and reads
+    /// [`crate::PlatformBackend::current_capabilities`] on the same one, so a
+    /// withdrawal made here reaches peers within a tick with no thread to shut down.
+    ///
+    /// It matters because of what the alternative looks like from the other end. A
+    /// node still claiming `INJECT_INPUT` and a monitor list — the engine keeps the
+    /// last list rather than dropping the machine out of every layout over one bad
+    /// poll — is a node peers go on routing the cursor into, where every event fails
+    /// and is swallowed at debug level, and which the reachability reclaim does not
+    /// rescue because the QUIC session is perfectly healthy. The cursor is simply
+    /// gone. Everything is withdrawn rather than injection alone: displays came off
+    /// the same connection.
+    ///
+    /// Nothing is reconnected. That is deliberately out of scope, and it is why
+    /// [`Session::alive`] latches: this backend's answer to a dead X server is to
+    /// say so honestly and let the agent be restarted with the session.
+    fn withdraw_if_gone(&self, error: &PlatformError) {
+        if !self.session.went_away(error) {
+            return;
+        }
+        if self.live.set(capabilities(false, false)) {
+            tracing::warn!(
+                error = %error,
+                "the X connection is gone; this machine no longer accepts injected input"
+            );
+        }
     }
 }
 
@@ -174,7 +283,13 @@ impl DisplayEnumerator for X11Displays {
         // are tested on machines with no X server to disagree with them. It also
         // keeps those rules referenced from a path that compiles on every target,
         // so they cannot rot behind a `cfg`.
-        Ok(display::to_monitors(self.session.require()?.outputs()?))
+        match self.session.require().and_then(|server| server.outputs()) {
+            Ok(outputs) => Ok(display::to_monitors(outputs)),
+            Err(e) => {
+                self.withdraw_if_gone(&e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -328,7 +443,12 @@ pub fn backend() -> Result<PlatformBackend> {
 }
 
 fn assemble(session: Session) -> PlatformBackend {
-    let displays = X11Displays::new(session.clone());
+    // Made before the first enumeration rather than after it, because that
+    // enumeration is itself the liveness check and it needs somewhere to publish a
+    // connection that died between `connect` and here. It carries nothing until the
+    // real set is put in below.
+    let live = LiveCapabilities::fixed(Capabilities::NONE);
+    let displays = X11Displays::new(session.clone(), live.clone());
     // A failed enumeration is not fatal: the node can still be told about peers,
     // and it can still inject into whatever it does have. Taking a whole machine
     // out of the mesh over a server that happens to lack RandR would be worse. It
@@ -344,7 +464,11 @@ fn assemble(session: Session) -> PlatformBackend {
         }
     };
 
+    // Read after the enumeration, not before: if that enumeration is what found the
+    // connection gone, `can_inject` already knows and this must not put the promise
+    // back.
     let caps = capabilities(has_displays, session.can_inject());
+    live.set(caps);
     let sink: Arc<dyn inject::Sink> = match session.require() {
         Ok(server) => Arc::clone(server) as Arc<dyn inject::Sink>,
         Err(e) => Arc::new(inject::NoServer::new(e.to_string())),
@@ -356,12 +480,13 @@ fn assemble(session: Session) -> PlatformBackend {
             display_server: DisplayServer::X11,
             capabilities: caps,
         },
-        // Fixed, and that is the honest answer rather than a shortcut: X11 has no
-        // consent dialog and no revocable grant, so nothing this backend advertises
-        // can be taken away while the process runs. `HAS_DISPLAYS` does change with
-        // hotplug, and the engine recomputes it from the monitor list on every tick
-        // — see `with_displays` there, which is the one place that rule lives.
-        live_capabilities: LiveCapabilities::fixed(caps),
+        // X11 has no consent dialog and no revocable grant, so unlike Wayland
+        // nothing here is taken away by a decision the user makes. What can still go
+        // is the connection everything hangs off — see `withdraw_if_gone`, which is
+        // the only writer after this point. `HAS_DISPLAYS` also changes with hotplug,
+        // and the engine recomputes that from the monitor list on every tick; see
+        // `with_displays` there, which is the one place that rule lives.
+        live_capabilities: live,
         displays: Box::new(displays),
         capture: Box::new(X11Capture),
         injector: Box::new(X11Injector {
@@ -435,6 +560,76 @@ mod tests {
             .info
             .capabilities
             .contains(Capabilities::HAS_DISPLAYS));
+    }
+
+    #[test]
+    fn a_refusal_this_backend_makes_itself_never_costs_a_round_trip() {
+        // A server with no RandR answers `Unsupported` on every housekeeping tick
+        // for as long as the agent runs, and it injects perfectly well throughout.
+        // Probing it would buy a round trip a second for an answer that cannot
+        // change — and, worse, a probe that ever failed spuriously would withdraw
+        // injection from a machine whose connection is fine.
+        assert!(!is_connection_loss(
+            &todo_err("display enumeration"),
+            || panic!("a refusal this backend made itself must not be probed"),
+        ));
+    }
+
+    #[test]
+    fn injection_is_withdrawn_only_when_the_server_stops_answering() {
+        // The distinction the probe exists for: x11rb reports a protocol error the
+        // server raised against one request and a socket that has closed through the
+        // same `Result`, and only the second means nothing can be injected again.
+        let failed = PlatformError::Other("asking randr for the current screen resources".into());
+        assert!(!is_connection_loss(&failed, || true));
+        assert!(is_connection_loss(&failed, || false));
+    }
+
+    #[test]
+    fn a_connection_that_died_stops_advertising_what_it_can_no_longer_do() {
+        // What a peer must see. A node that keeps claiming `INJECT_INPUT` into a
+        // dead X connection has peers route the cursor into it, every event fails
+        // and is swallowed at debug level, and the reachability reclaim never fires
+        // because the QUIC session is healthy — the cursor is simply gone.
+        let session = Session::lost("the X server went away");
+        let live = LiveCapabilities::fixed(capabilities(true, true));
+        let displays = X11Displays::new(session.clone(), live.clone());
+
+        assert!(displays.monitors().is_err());
+        assert_eq!(live.get(), Capabilities::NONE);
+        assert!(!session.can_inject());
+
+        // And it stays gone. There is no reconnect path, so nothing may put the
+        // promise back — and the same failing poll every tick must not re-announce
+        // it either.
+        assert!(
+            !session.went_away(&PlatformError::Other("the next tick".into())),
+            "a connection already known to be gone was reported gone again"
+        );
+    }
+
+    #[test]
+    fn a_failed_enumeration_with_no_connection_behind_it_withdraws_nothing() {
+        // Every non-Linux target and every headless runner enumerates and fails on
+        // every tick. There was never a connection to lose, the advertised set is
+        // already the empty one, and this must not become a warning per tick.
+        let live = LiveCapabilities::fixed(capabilities(false, false));
+        let session = Session::absent("no display server available");
+        let displays = X11Displays::new(session.clone(), live.clone());
+        assert!(displays.monitors().is_err());
+        assert!(!session.went_away(&PlatformError::Other("anything".into())));
+        assert_eq!(live.get(), capabilities(false, false));
+    }
+
+    #[test]
+    fn what_the_backend_advertises_at_startup_is_what_it_publishes_live() {
+        // The two are read by different callers — the handshake takes `info`, the
+        // engine's tick takes `current_capabilities` — and a node whose first
+        // advertisement disagreed with its second would re-advertise on the first
+        // tick for no reason.
+        for backend in [offline(), backend().unwrap()] {
+            assert_eq!(backend.info.capabilities, backend.current_capabilities());
+        }
     }
 
     #[test]

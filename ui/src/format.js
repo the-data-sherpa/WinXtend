@@ -122,6 +122,31 @@ export function capabilitiesText(bits, connected = false) {
   return connected ? "Reports it can do nothing" : "Nothing reported yet";
 }
 
+/// What a machine's screens are, or why this build cannot say.
+///
+/// "There are none" and "I cannot tell you" are different answers, and reading them
+/// as one is what had a desktop with a 3440x1440 monitor attached describing itself
+/// as headless — a reading that then went on to misdirect a piece of planning.
+/// `StatusSnapshot::displays_error` in crates/wx-agent/src/ipc.rs is the field that
+/// separates them, and `describe_displays` there is the same four cases in the
+/// terminal's wording. An agent older than this UI sends no such field, which is the
+/// `undefined` case and reads exactly as it always did.
+///
+/// The reason is quoted rather than summarised: it is the backend's own sentence —
+/// "no display server available", "display enumeration is not supported by the
+/// linux-x11 backend" — and each of them sends the reader somewhere different.
+export function displaysText(monitors, error) {
+  const listed = (Array.isArray(monitors) ? monitors : [])
+    .map((m) => `${m.name} ${m.w}x${m.h}${m.primary ? " (primary)" : ""}`)
+    .join(", ");
+  const reason = typeof error === "string" && error.trim() ? error.trim() : null;
+  if (!reason) return listed || "none reported";
+  // A readable list and a failing read at once: the list is the last one that
+  // worked, so it is still shown, with a note that it may have moved on since.
+  if (listed) return `${listed} — last known; screens could not be read: ${reason}`;
+  return `Could not be read: ${reason}`;
+}
+
 /// Human form of a peer's connection state, plus the class the pill is styled with.
 export function connectionState(status) {
   const state = status && typeof status === "object" ? status.state : undefined;

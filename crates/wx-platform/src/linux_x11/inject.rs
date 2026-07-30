@@ -544,11 +544,14 @@ impl Injector {
     /// finger, so a missing release strands button 4 down and every later click
     /// arrives as a drag.
     fn click_wheel(&mut self, detents: i32, positive: u8, negative: u8) -> Result<()> {
-        let (button, count) = if detents >= 0 {
-            (positive, detents)
-        } else {
-            (negative, -detents)
-        };
+        let button = if detents >= 0 { positive } else { negative };
+        // `unsigned_abs` and not a negation: `ScrollAccumulator::take` clamps into
+        // `i32`, so `i32::MIN` is a value a peer can actually produce, and it has no
+        // positive counterpart to negate to. Negating it panics in a debug build and
+        // wraps back to `i32::MIN` in a release one — where the bound below would
+        // then pass it through as an empty range and drop the scroll entirely, at
+        // exactly the input the bound exists to catch.
+        let count = detents.unsigned_abs();
         // A peer sending an absurd delta would otherwise hold this loop — and the
         // engine thread it runs on — for as long as it liked.
         for _ in 0..count.min(MAX_SCROLL_CLICKS) {
@@ -992,7 +995,7 @@ impl Injector {
 /// A liveness bound rather than a policy: injection runs inline on the agent's
 /// engine loop, so a peer sending a delta of ten million must not be able to hold
 /// that thread while a hundred thousand round trips go out.
-const MAX_SCROLL_CLICKS: i32 = 64;
+const MAX_SCROLL_CLICKS: u32 = 64;
 
 /// A character's place on the loaded layout, with the desktop's own state already
 /// worked around.
@@ -1336,18 +1339,35 @@ mod tests {
         // Injection runs inline on the thread that also forwards input and answers
         // heartbeats, so a hostile peer must not be able to buy a hundred thousand
         // round trips with one datagram.
-        let sink = Recording::new();
-        let mut inj = injector(&sink);
-        inj.inject(
-            &monitor(),
-            &InputEvent::Pointer(PointerEvent::Scroll {
-                dx: 0.0,
-                dy: 1e9,
-                unit: ScrollUnit::Lines,
-            }),
-        )
-        .unwrap();
-        assert_eq!(sink.take().len(), MAX_SCROLL_CLICKS as usize * 2);
+        //
+        // Both directions, and at a magnitude that saturates the accumulator's clamp
+        // rather than merely a large one: downward lands on `i32::MIN`, the value
+        // with no positive counterpart, and a plain negation there would panic in a
+        // debug build and silently drop the whole scroll in a release one.
+        for (dy, button) in [
+            (1e9, BUTTON_SCROLL_UP),
+            (-1e9, BUTTON_SCROLL_DOWN),
+            (-3e9, BUTTON_SCROLL_DOWN),
+        ] {
+            let sink = Recording::new();
+            let mut inj = injector(&sink);
+            inj.inject(
+                &monitor(),
+                &InputEvent::Pointer(PointerEvent::Scroll {
+                    dx: 0.0,
+                    dy,
+                    unit: ScrollUnit::Lines,
+                }),
+            )
+            .unwrap();
+            let sent = sink.take();
+            assert_eq!(sent.len(), MAX_SCROLL_CLICKS as usize * 2, "dy {dy}");
+            assert!(
+                sent.iter()
+                    .all(|r| matches!(r, Request::Button { button: b, .. } if *b == button)),
+                "dy {dy} scrolled the wrong way: {sent:?}"
+            );
+        }
     }
 
     #[test]

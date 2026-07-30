@@ -13,6 +13,7 @@ import {
   clockTime,
   connectionState,
   displayServerLabel,
+  displaysText,
   latency,
   nodeColor,
   platformLabel,
@@ -74,11 +75,17 @@ function localPanel() {
     ["Can do", capabilitiesText(status.capabilities, true)],
     [
       "Displays",
-      status.monitors.length
-        ? status.monitors
-            .map((m) => `${m.name} ${m.w}x${m.h}${m.primary ? " (primary)" : ""}`)
-            .join(", ")
-        : "none reported",
+      // Marked as well as worded, because this is the row the reader takes at a
+      // glance: a machine that cannot enumerate its screens owns no part of the
+      // shared space, so the cursor can never reach it, and every other field on
+      // this panel looks perfectly healthy while that is happening.
+      status.displaysError
+        ? h(
+            "span",
+            { class: "warning-text" },
+            displaysText(status.monitors, status.displaysError)
+          )
+        : displaysText(status.monitors, status.displaysError),
     ],
   ];
 
