@@ -172,7 +172,14 @@ async function main() {
   }, DISCOVER_INTERVAL_MS);
 
   setInterval(() => {
-    if (active === "status" && connected()) {
+    if (!connected()) return;
+    // Devices draws the pairing card, and a window whose event subscription was
+    // refused learns about an incoming request only by reading the status — the
+    // banner says as much. Polling it only in that state keeps the promise true
+    // where it is made, without redrawing a healthy window's device list on a
+    // timer it does not need.
+    const pollingHere = active === "status" || (store.eventsProblem && active === "devices");
+    if (pollingHere) {
       refreshStatus().catch(() => {
         /* the disconnect path reports this */
       });

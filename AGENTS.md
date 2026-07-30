@@ -339,11 +339,11 @@ event that ends it. `store.pairing` in `ui/src/agent.js` had none, so the first
 pairing to end left a card standing that suppressed every later prompt. Every
 removal of a pending pairing therefore goes through `end_pending_pairing` in
 `engine.rs`, so that the announcement cannot be forgotten; its doc comment owns
-that rule and names the only two removals exempt from it. A card the window
-adopted from a snapshot rather than from an event is the other half of the same
-rule, and ends when the snapshot stops listing it — see `adoptPendingPairing`,
-which is what a window whose event subscription was refused has instead of
-`pairingFinished`.
+that rule and names the only two removals exempt from it. The snapshot is the
+other half of the same rule: once a card's node has appeared in `pairings`, a
+later snapshot that omits it ends the card, whichever side raised it — see
+`adoptPendingPairing`, which is what a window whose event subscription was
+refused has instead of `pairingFinished`.
 
 ## A transport error string is never user-facing copy
 

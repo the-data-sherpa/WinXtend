@@ -153,9 +153,12 @@ describe("what the banner is allowed to claim", () => {
     // deny it, and without implying it arrives as the request is made.
     expect(banner.hint).not.toMatch(/will not appear here/i);
     expect(banner.hint).toMatch(/status tab/i);
-    // The outgoing half stays: adoption resolves only cards flagged `adopted`,
-    // never one `beginPairing` raised in this window.
-    expect(banner.hint).toMatch(/sit on its code/i);
+    // Nor does the outgoing half deny it any more: `adoptPendingPairing` ends any
+    // card the agent has stopped holding, whichever side raised it, so a code
+    // shown here does get an answer — on a status read rather than as the other
+    // machine replies.
+    expect(banner.hint).not.toMatch(/sit on its code/i);
+    expect(banner.hint).toMatch(/started here/i);
     expect(banner.actions).toEqual([]);
   });
 });

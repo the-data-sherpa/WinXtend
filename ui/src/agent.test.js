@@ -358,6 +358,53 @@ describe("pairing prompts", () => {
     expect(store.pairing.finished).toBeUndefined();
   });
 
+  // The same latch reached from the other direction: the card was raised here by
+  // `beginPairing`, not adopted, and in a window with no events nothing else can
+  // ever end it. Ending is keyed on the card having been seen in `pairings`, not
+  // on which side raised it, so this one goes the same way.
+  it("takes down a locally started card the agent no longer has pending", async () => {
+    tauri.listen.mockRejectedValue("Command plugin:event|listen not allowed by ACL");
+    let pairings = [];
+    tauri.invoke.mockImplementation((command) => {
+      switch (command) {
+        case "agent_state":
+        case "connect_agent":
+          return Promise.resolve({ ...FOUND, connected: true });
+        case "agent_request":
+          return Promise.resolve({ kind: "status", status: { ...SNAPSHOT, pairings } });
+        default:
+          return Promise.reject(new Error(`unexpected command ${command}`));
+      }
+    });
+
+    expect(await listenToAgent()).toBe(false);
+    await attachToRunningAgent();
+    // What `beginPairing` writes: the agent has answered with a code, and has not
+    // necessarily dialled the other machine yet.
+    store.pairing = { direction: "outgoing", node: "bb", name: "laptop", pin: "123456" };
+
+    // A status read landing in that gap must not take the code away.
+    await refreshStatus();
+    expect(store.pairing).toMatchObject({ node: "bb", pin: "123456" });
+    expect(store.pairing.finished).toBeUndefined();
+
+    // The agent has it pending, and then the exchange ends.
+    pairings = [{ node: "bb", name: "laptop", initiatedLocally: true, pin: "123456" }];
+    await refreshStatus();
+    pairings = [{ node: "aa", name: "workhorse", initiatedLocally: false, pin: null }];
+    await refreshStatus();
+
+    // The verdict on the card the user was looking at, not the next pairing
+    // silently overwriting it before it was ever drawn.
+    expect(store.pairing).toMatchObject({ node: "bb", finished: true, accepted: false });
+    expect(store.journal.some((line) => /laptop/.test(line.text))).toBe(true);
+
+    // And the request waiting behind it gets through on the next read.
+    await refreshStatus();
+    expect(store.pairing).toMatchObject({ direction: "incoming", node: "aa", name: "workhorse" });
+    expect(store.pairing.finished).toBeUndefined();
+  });
+
   // A pairing that worked leaves `pairings` by the same door as one that was
   // abandoned — the agent trusts the peer, drops the entry, and says "accepted"
   // only in the event this window cannot receive. Reading the disappearance as a

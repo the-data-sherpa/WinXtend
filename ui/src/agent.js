@@ -273,20 +273,21 @@ function livePairing() {
 /// everything the previous one heard. Without this, the machine being asked to
 /// pair shows nothing at all and the user has no way to reach the prompt.
 ///
-/// Never takes down a card *this window created*. A snapshot that does not
-/// mention such a card is not evidence the pairing is gone: `beginPairing`
-/// answers before the agent has dialled the other machine, so the outgoing card
-/// exists for a moment while the agent has nothing pending, and a card raised by
-/// `pairingRequested` belongs to a window whose events work and which will
-/// therefore hear the end of it. Ending those is the agent's to announce, and it
-/// does — see `pairingFinished`.
+/// It also ends a card the agent is no longer holding, and does so by one rule
+/// that does not care how the card was created: the first snapshot that lists the
+/// card's node latches `seen` on it, and once a card carries `seen`, a snapshot
+/// that no longer lists it is the exchange being over. Keying this on how the
+/// card was raised instead left the outgoing case latched — a window whose event
+/// subscription was refused (`store.eventsProblem`) hears no `pairingFinished` at
+/// all, so a card it started itself stood for the life of the window and
+/// suppressed every later request, which is the exact failure this path exists to
+/// undo.
 ///
-/// A card adopted here is the exception, and needs one. It came out of a
-/// snapshot, so its absence from a later snapshot is the exchange being over and
-/// nothing else; and `pairingFinished` may never arrive, because a window whose
-/// event subscription was refused (`store.eventsProblem`) still polls status and
-/// hears no events at all. Without this it would latch that card for good and
-/// drop every later request — the failure this whole path exists to undo.
+/// A card never seen in `pairings` is never expired, and that is deliberate: the
+/// absence is not evidence when the agent may not have the entry *yet*.
+/// `beginPairing` answers before the agent has dialled the other machine, so an
+/// outgoing card exists for a moment while the agent has nothing pending, and a
+/// status read landing in that window must not take it down.
 ///
 /// Over is not the same as failed, and the disappearance does not say which. A
 /// pairing that *succeeded* leaves `pairings` by exactly the same door: the agent
@@ -297,22 +298,32 @@ function livePairing() {
 /// failed while the Devices list beside it shows the machine paired.
 function adoptPendingPairing(status) {
   const pending = status?.pairings || [];
-  if (
-    livePairing() &&
-    store.pairing.adopted &&
-    !pending.some((p) => p.node === store.pairing.node)
-  ) {
-    const paired = Boolean(
-      status?.peers?.some((p) => p.node === store.pairing.node && p.paired)
-    );
+  if (livePairing()) {
+    const card = store.pairing;
+    if (pending.some((p) => p.node === card.node)) {
+      if (!card.seen) store.pairing = { ...card, seen: true };
+      return;
+    }
+    if (!card.seen) return;
+    const paired = Boolean(status?.peers?.some((p) => p.node === card.node && p.paired));
     store.pairing = {
-      ...store.pairing,
+      ...card,
       finished: true,
       accepted: paired,
       error: paired ? null : "The pairing ended before it was confirmed.",
     };
+    log(
+      paired ? "info" : "warning",
+      paired
+        ? `Pairing with ${card.name} succeeded`
+        : `Pairing with ${card.name} ended before it was confirmed`
+    );
+    // The verdict has to reach the screen before anything replaces it. Adopting
+    // the next pending pairing in this same call would overwrite a card the user
+    // has never seen, and in the one window that gets here nothing else would
+    // ever mention it. The next status read raises that pairing.
+    return;
   }
-  if (livePairing()) return;
   const next = pending[0];
   if (!next) return;
   store.pairing = {
@@ -323,8 +334,16 @@ function adoptPendingPairing(status) {
     // types, and starts empty.
     pin: next.initiatedLocally ? next.pin || "" : "",
     error: null,
-    adopted: true,
+    // Adopted straight out of the pending list, so it has been seen by
+    // construction and the rule above may end it.
+    seen: true,
   };
+  log(
+    "info",
+    next.initiatedLocally
+      ? `Still waiting for ${next.name} to accept the pairing code`
+      : `${next.name} wants to pair`
+  );
 }
 
 /// Apply one agent event to the store. Exported for the event listener only.

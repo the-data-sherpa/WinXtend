@@ -2281,7 +2281,7 @@ impl Engine {
         self.last_heard.remove(&node);
         // Announced, not merely dropped: the exchange is over for the UI too, and
         // it has no other way to find that out. See [`end_pending_pairing`]. The
-        // caller's own copy wins where there is any: a peer the user switched off
+        // caller's own copy wins where there is any: a peer the user disabled
         // or unpaired themselves did not lose its connection, and saying so sends
         // them looking for a network fault they do not have.
         end_pending_pairing(
@@ -3050,7 +3050,7 @@ impl Engine {
                     self.on_peer_gone(
                         parsed,
                         Some("disabled".into()),
-                        Some("that machine was switched off here"),
+                        Some("that machine was disabled here"),
                     )
                     .await;
                 }
