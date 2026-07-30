@@ -11,10 +11,11 @@
 //!
 //! Each OS backend does the layout part — `ToUnicodeEx` on Windows,
 //! `UCKeyTranslate` on macOS, and on Wayland the compositor's own xkb keymap,
-//! read in pure Rust by [`crate::linux_wayland::keymap`], which the X11 backend is
-//! to reuse rather than link `libxkbcommon` — and hands the result over as a
-//! [`RawKey`]. Everything after that is platform-independent and lives here, so
-//! the composition rules cannot drift between backends.
+//! read in pure Rust by [`crate::linux_wayland::keymap`] — and hands the result
+//! over as a [`RawKey`]. Everything after that is platform-independent and lives
+//! here, so the composition rules cannot drift between backends. X11 is not on
+//! that list because it does not capture; its own reverse map, and why it shares
+//! nothing with the Wayland parser, are in [`crate::linux_x11::keymap`].
 //!
 //! The one thing here that runs on the *receiving* side is [`decompose`], the
 //! inverse of [`compose`]: an injector whose layout has no single key for `é` types

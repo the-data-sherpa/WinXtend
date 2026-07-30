@@ -113,7 +113,7 @@ export function capabilityLabels(bits) {
 /// has completed a handshake — is what tells them apart. A peer that has only been
 /// discovered has claimed nothing yet; one that has introduced itself and claimed
 /// no bits is reporting that it can do nothing, which is the ordinary case for a
-/// macOS, X11, or headless peer in this build rather than an oddity. `Capabilities`
+/// macOS or headless peer in this build rather than an oddity. `Capabilities`
 /// in crates/wx-proto/src/caps.rs draws the same distinction, describing an empty
 /// set as "nothing".
 export function capabilitiesText(bits, connected = false) {

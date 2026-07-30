@@ -552,7 +552,8 @@ absent on Linux and macOS alike. Everything else — `wx-proto`, `wx-core`,
 `wx-net`, and the rest of `wx-video` — runs the same tests on all three.
 
 The totals will never converge, because each platform's tests are gated to that
-platform; as the Wayland backend grows, the Linux total rises with it.
+platform; as the Linux backends grow — Wayland's, and now the X11 one's `server`
+module, which is gated the same way — the Linux total rises with them.
 
 ## Roadmap
 

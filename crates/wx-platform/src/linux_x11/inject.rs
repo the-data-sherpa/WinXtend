@@ -27,7 +27,8 @@
 //! A modifier can be wanted at once by a bare `SpecialKey::ShiftLeft` the sender
 //! forwarded, by the chord an event asks for, and by the keymap level a character
 //! needs — and each has to leave the key alone while another still wants it down.
-//! That is the same problem [`crate::linux_wayland::inject`] solves and the model
+//! That is the same problem the Wayland injector in
+//! `crates/wx-platform/src/linux_wayland/inject.rs` solves, and the model
 //! here is deliberately the same one, because every wrong answer is silent: press a
 //! key that is already down and the server sees a repeat, release one this injector
 //! never pressed and the user's own modifier goes up under them, trust a stale

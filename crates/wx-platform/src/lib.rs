@@ -44,9 +44,10 @@ pub mod traits;
 // Backend modules are declared unconditionally even though only one is ever used.
 // Compiling them everywhere stops the skeletons rotting: a change to `traits` breaks
 // them here and now rather than months later on a machine nobody has. Where a
-// backend has grown real platform dependencies — `linux_wayland` so far — the module
-// itself still compiles everywhere and only the submodule holding the OS types is
-// `cfg`-gated, so the interpretation around it stays unit-testable on any host.
+// backend has grown real platform dependencies — `linux_wayland` and `linux_x11` so
+// far — the module itself still compiles everywhere and only the submodule holding
+// the OS types is `cfg`-gated, so the interpretation around it stays unit-testable
+// on any host.
 pub mod linux_evdev;
 pub mod linux_wayland;
 pub mod linux_x11;
