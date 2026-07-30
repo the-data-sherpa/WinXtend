@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilitiesText, capabilityLabels } from "./format.js";
+import { capabilitiesText, capabilityLabels, displaysText } from "./format.js";
 
 // Mirrors `Capabilities` in crates/wx-proto/src/caps.rs. Written out here rather
 // than imported so that a bit renumbered on the Rust side fails this test instead
@@ -41,7 +41,7 @@ describe("what a machine says it can do", () => {
 
   it("separates a machine that has not answered from one that reports nothing", () => {
     // A connected peer advertising no bits has answered the question, and the
-    // answer is "nothing" — which a macOS, X11, or headless peer in this build gives.
+    // answer is "nothing" — which a macOS or headless peer in this build gives.
     // Showing it as though it had never reported hides a real, actionable fact.
     expect(capabilitiesText(0, true)).toBe("Reports it can do nothing");
     expect(capabilitiesText(undefined, true)).toBe("Reports it can do nothing");
@@ -72,5 +72,46 @@ describe("what a machine says it can do", () => {
     expect(capabilitiesText(CAPTURE_INPUT | INJECT_INPUT)).toBe(
       "Captures input  ·  Accepts input"
     );
+  });
+});
+
+describe("what a machine's screens are", () => {
+  const screens = [
+    { name: "DP-1", w: 3440, h: 1440, primary: true },
+    { name: "HDMI-1", w: 1920, h: 1080, primary: false },
+  ];
+
+  it("lists the screens it was told about", () => {
+    expect(displaysText(screens, null)).toBe("DP-1 3440x1440 (primary), HDMI-1 1920x1080");
+  });
+
+  it("says none only when the agent really found none", () => {
+    expect(displaysText([], null)).toBe("none reported");
+    expect(displaysText([], undefined)).toBe("none reported");
+  });
+
+  it("does not read a failed enumeration as a machine with no screens", () => {
+    // The whole reason `displaysError` exists. Collapsing these two is what had a
+    // desktop with a 3440x1440 monitor attached describing itself as headless, and
+    // the row the user reads must not repeat the mistake the CLI stopped making.
+    const failed = displaysText([], "no display server available");
+    expect(failed).not.toBe(displaysText([], null));
+    expect(failed).toContain("no display server available");
+  });
+
+  it("still shows the last screens it knew when a poll fails", () => {
+    // The agent deliberately keeps the last list rather than dropping the machine
+    // out of every layout over one bad poll, so the list is real — but it is the
+    // last answer that worked, and saying so is what stops it being read as current.
+    const stale = displaysText(screens, "asking randr for the current screen resources failed");
+    expect(stale).toContain("DP-1 3440x1440 (primary)");
+    expect(stale).toContain("last known");
+    expect(stale).toContain("asking randr for the current screen resources failed");
+  });
+
+  it("reads an agent that predates the field exactly as it always did", () => {
+    // `displaysError` is serde-default, so an older agent simply omits it.
+    expect(displaysText(screens, undefined)).toBe(displaysText(screens, null));
+    expect(displaysText(undefined, undefined)).toBe("none reported");
   });
 });

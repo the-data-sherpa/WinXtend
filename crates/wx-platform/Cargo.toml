@@ -36,3 +36,18 @@ reis = { version = "0.7.0", features = ["tokio"] }
 # over as a file descriptor, so `AsyncReadExt`/`AsyncWriteExt` are load-bearing.
 tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+# The X11 backend: RandR for displays, XTEST for injection, and the two core
+# requests the keysym reverse map is built from.
+#
+# `default-features = false` is load-bearing rather than tidiness. It leaves
+# `x11rb` as a pure-Rust implementation of the X11 wire protocol — the `libxcb`
+# route is opt-in behind `allow-unsafe-code`/`dl-libxcb`, and enabling either
+# would put a C toolchain and `libxcb-dev` on every machine that builds this
+# crate, CI runners included. That is the same cost `reis` and the hand-written
+# keymap parser were both chosen to avoid.
+x11rb = { version = "0.14.0", default-features = false, features = ["randr", "xtest"] }
+
+[target."cfg(target_os = \"linux\")".dev-dependencies]
+# `tests/x11_injection.rs` checks what actually reached the server, by reading the
+# pointer and the key state back. Same crate as above, so the graph is unchanged.
+x11rb = { version = "0.14.0", default-features = false }

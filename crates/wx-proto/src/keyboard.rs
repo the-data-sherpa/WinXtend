@@ -9,8 +9,11 @@
 //! has `[`; forward the scancode and the receiver types `[`. Forward the
 //! character `å` and the receiver's job is merely "produce this codepoint",
 //! which every OS can do regardless of installed layout — via a synthesised
-//! unicode event on Windows, `CGEventKeyboardSetUnicodeString` on macOS, or a
-//! remapped scratch keysym on X11.
+//! unicode event on Windows, `CGEventKeyboardSetUnicodeString` on macOS, or the
+//! receiver's own keymap on Linux. The Linux backends resolve against that keymap
+//! and refuse a character it cannot produce rather than mistyping it, which is a
+//! real limit of this scheme and is documented where it bites, in
+//! `wx-platform`'s `linux_wayland::keymap` and `linux_x11::keymap`.
 //!
 //! Keys with no textual meaning (arrows, F-keys, modifiers) can't go through
 //! that path, so they travel as the semantic [`SpecialKey`] enum instead.

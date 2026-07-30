@@ -262,19 +262,7 @@ async fn show_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
             ""
         }
     );
-    println!(
-        "displays  {}",
-        if status.monitors.is_empty() {
-            "none (headless)".to_string()
-        } else {
-            status
-                .monitors
-                .iter()
-                .map(|m| format!("{} {}x{}", m.name, m.w, m.h))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    );
+    println!("displays  {}", describe_displays(&status));
 
     // What this machine tells the mesh it can do. The agent now refuses features a
     // peer has not advertised, so the advertised set is the first thing to look at
@@ -321,6 +309,35 @@ async fn show_status(config_dir: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `displays` line, which has three things to say and not two.
+///
+/// "There are no screens" and "the backend could not tell me about the screens"
+/// are different facts and only the first is a property of the machine. Printing
+/// `none (headless)` for the second is what had a desktop with a 3440x1440 monitor
+/// attached describing itself as headless — a wrong answer that then misdirected a
+/// piece of planning, which is exactly the cost of a status line that reads more
+/// confidently than it knows.
+///
+/// The reason is quoted rather than summarised. It is the backend's own sentence —
+/// "display enumeration is not supported by the linux-x11 backend", "no display
+/// server available" — and each of them sends the reader somewhere different.
+fn describe_displays(status: &ipc::StatusSnapshot) -> String {
+    let listed = status
+        .monitors
+        .iter()
+        .map(|m| format!("{} {}x{}", m.name, m.w, m.h))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (&status.displays_error, status.monitors.is_empty()) {
+        (None, true) => "none (headless)".to_string(),
+        (None, false) => listed,
+        (Some(reason), true) => format!("unknown ({reason})"),
+        // A readable list and a failing poll at once: the list is the last answer
+        // that worked, so it is shown, with a note that it may have moved on.
+        (Some(reason), false) => format!("{listed} (last known; {reason})"),
+    }
 }
 
 /// How a peer's state reads in one line.
@@ -560,6 +577,96 @@ mod tests {
         assert_eq!(cli.port, Some(24801));
         assert_eq!(cli.name.as_deref(), Some("desk"));
         assert!(cli.no_discovery);
+    }
+
+    /// A snapshot with the two fields the display line reads and nothing else
+    /// meaningful set.
+    fn status_with(monitors: Vec<ipc::MonitorSpec>, error: Option<&str>) -> ipc::StatusSnapshot {
+        ipc::StatusSnapshot {
+            node_id: String::new(),
+            node_name: String::new(),
+            agent_version: String::new(),
+            protocol: 1,
+            port: 0,
+            uptime_secs: 0,
+            platform: "linux".into(),
+            display_server: "x11".into(),
+            capabilities: 0,
+            discovery: false,
+            autostart: false,
+            firewall: None,
+            pairings: Vec::new(),
+            monitors,
+            displays_error: error.map(str::to_string),
+            cursor: ipc::CursorSnapshot {
+                owner: String::new(),
+                owner_name: String::new(),
+                monitor: None,
+                locked: false,
+                local: true,
+            },
+            layout: wx_agent::config::SavedLayout::default(),
+            peers: Vec::new(),
+        }
+    }
+
+    fn screen(name: &str, w: u32, h: u32) -> ipc::MonitorSpec {
+        ipc::MonitorSpec {
+            id: 0,
+            name: name.into(),
+            x: 0,
+            y: 0,
+            w,
+            h,
+            scale: 1.0,
+            primary: true,
+        }
+    }
+
+    #[test]
+    fn a_machine_that_could_not_be_asked_is_not_reported_as_headless() {
+        // The defect this exists for: `cowen-workhorse` has a 3440x1440 monitor
+        // attached and reported `none (headless)`, because its backend returned
+        // `Unsupported` and the empty list that produced was indistinguishable from
+        // a machine with no screens. The wrong reading then misdirected a piece of
+        // planning, which is what a status line that reads more confidently than it
+        // knows costs.
+        let line = describe_displays(&status_with(
+            Vec::new(),
+            Some("display enumeration is not supported by the linux-x11 backend"),
+        ));
+        assert!(!line.contains("headless"), "{line}");
+        assert!(line.contains("linux-x11"), "{line}");
+    }
+
+    #[test]
+    fn a_machine_with_no_screens_still_says_headless() {
+        // The other half. A genuinely headless forwarder must not start reporting a
+        // problem it does not have.
+        assert_eq!(
+            describe_displays(&status_with(Vec::new(), None)),
+            "none (headless)"
+        );
+    }
+
+    #[test]
+    fn screens_that_were_read_are_listed_plainly() {
+        assert_eq!(
+            describe_displays(&status_with(vec![screen("DP-2", 3440, 1440)], None)),
+            "DP-2 3440x1440"
+        );
+    }
+
+    #[test]
+    fn a_list_that_has_since_gone_stale_is_shown_and_flagged() {
+        // The poll started failing after a good read. The last answer is still the
+        // most useful thing to print, but it must not be presented as current.
+        let line = describe_displays(&status_with(
+            vec![screen("DP-2", 3440, 1440)],
+            Some("no display server available"),
+        ));
+        assert!(line.starts_with("DP-2 3440x1440"), "{line}");
+        assert!(line.contains("last known"), "{line}");
     }
 
     #[test]
