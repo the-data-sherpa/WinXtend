@@ -149,11 +149,14 @@ export function cursorStateFor(status) {
       // monitor the cursor occupies, so locking from here pins it to the peer
       // instead of reclaiming it — pinned by
       // `locking_keeps_input_flowing_to_the_peer_that_already_owns_it` in
-      // `crates/wx-core/src/router.rs`. Said here rather than left to the
-      // button, because the button's label ("Unlock the cursor") is the only
-      // other sign of it and is not on this screen at all when the badge is.
+      // `crates/wx-core/src/router.rs`. What it stops is the crossing, and only
+      // the crossing: `VirtualCursor::warp_to` never consults `locked`, by
+      // design and by its own doc comment — the lock is there to stop
+      // *accidental* edge crossings, and an explicit handoff is not accidental.
+      // So both ways out are named, and named as the two deliberate acts they
+      // are rather than as a rule and a way around it.
       cursor.locked
-        ? "This machine has the cursor locked, which is what is keeping it there; it will not come back until you unlock it on the Status screen."
+        ? "This machine has the cursor locked, which is what is keeping it there: it will not cross back over an edge on its own. Unlock it on the Status screen, or hand it over directly with “Move the cursor here” on the Layout tab."
         : null
     ),
     certain: true,

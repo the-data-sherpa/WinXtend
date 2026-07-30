@@ -102,9 +102,23 @@ describe("the lock", () => {
     expect(state.badge).toBe("Cursor on cowen-ubuntu");
     expect(state.detail).toContain("has the cursor locked");
     expect(state.detail).toContain("keeping it there");
-    expect(state.detail).toContain("will not come back until you unlock it");
+    expect(state.detail).toContain("will not cross back over an edge on its own");
     // The old copy said the lock was dormant and the cursor could still arrive.
     expect(state.detail).not.toMatch(/arrives back|comes back here|once it returns/);
+  });
+
+  // Scoped to the edge crossing, because that is all the lock stops:
+  // `VirtualCursor::warp_to` deliberately ignores `locked` — the lock is against
+  // *accidental* crossings and an explicit handoff is not accidental — so both
+  // deliberate ways to move the cursor are named. Claiming only unlocking would
+  // do it is an absolute this same window falsifies from its Layout tab.
+  it("names both deliberate ways to bring the cursor back", () => {
+    const state = cursorStateFor(
+      snapshot({ cursor: { ...THERE, locked: true }, peers: [peer("connected")] })
+    );
+    expect(state.detail).toContain("Unlock it on the Status screen");
+    expect(state.detail).toContain("Move the cursor here");
+    expect(state.detail).toContain("Layout tab");
   });
 });
 

@@ -371,6 +371,16 @@ when the cursor is elsewhere, and copy must not describe it as dormant or
 promise the cursor will come back. But the flag still says nothing about the
 *peer's* own lock, so a machine that does not have the cursor must not report
 the peer's cursor as locked — that would be a claim about somewhere else.
+
+What the lock stops is the *crossing*, and only the crossing.
+`VirtualCursor::warp_to` never consults `locked` and says in its own doc comment
+why: the lock is there to stop accidental edge crossings, and an explicit
+handoff is not accidental. So `Request::WarpCursor` moves the cursor while
+locked — which the Layout tab offers as "Move the cursor here" — and copy must
+not tell anyone that unlocking is the only way to move it. That is not a
+loophole to be closed; it is the reason someone locked out of their own cursor
+is not stranded.
+
 `Request::LockAll` is a different thing entirely: it is screensaver sync, not
 the cursor lock.
 
