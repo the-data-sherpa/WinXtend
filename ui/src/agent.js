@@ -23,7 +23,10 @@ export const store = {
   status: null,
   /// Last connection-level failure, as an AgentError-shaped object.
   fault: null,
-  /// In-flight pairing, in either direction. See devices.js.
+  /// The pairing card, in either direction, or null when there is none. Outlives
+  /// the exchange it describes: once `finished` is set it is a receipt rather than
+  /// a prompt, and stops standing in the way of the next request. See
+  /// `livePairing` for that distinction and devices.js for what is drawn.
   pairing: null,
   /// Newest-first activity lines for the Status screen.
   journal: [],

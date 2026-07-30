@@ -28,10 +28,12 @@ import * as status from "./status.js";
 /// fast enough that starting the daemon from a terminal is noticed while the user is
 /// still looking at the window.
 const DISCOVER_INTERVAL_MS = 2500;
-/// How often to re-read the whole snapshot while the Status tab is open. Uptime and
-/// round-trip time are not pushed as events — they change continuously and would
-/// flood the channel — so they are polled while they are on screen and never
-/// otherwise.
+/// How often to re-read the whole snapshot while a screen that needs it is open.
+/// Uptime and round-trip time are not pushed as events — they change continuously
+/// and would flood the channel — so they are polled while the Status tab is on
+/// screen. The Devices tab joins in only while this window's event subscription is
+/// refused, where the snapshot is the only thing that can raise or end a pairing
+/// card; see the loop below.
 const STATUS_POLL_MS = 5000;
 
 const views = {

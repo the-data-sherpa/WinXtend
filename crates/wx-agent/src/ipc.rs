@@ -1346,6 +1346,45 @@ mod tests {
         assert_eq!(text, r#"{"id":1,"request":{"kind":"listPeers"}}"#);
     }
 
+    /// A pending pairing reaches the window as these exact field names.
+    ///
+    /// The round-trip test above proves only that this file agrees with itself.
+    /// `adoptPendingPairing` in `ui/src/agent.js` reads `pairings`, `node`,
+    /// `name`, `initiatedLocally` and `pin` off the parsed JSON, and the Tauri
+    /// host passes the snapshot through without deserialising it — so a rename
+    /// on this side breaks the recovery path silently, with every Rust test and
+    /// every vitest still green. Spelled out here for the same reason the request
+    /// kinds are.
+    #[test]
+    fn a_pending_pairing_reaches_the_ui_under_the_names_it_reads() {
+        let showing_the_code = serde_json::to_string(&PendingPairingSnapshot {
+            node: NodeId([2u8; 32]).to_hex(),
+            name: "workhorse".into(),
+            initiated_locally: true,
+            pin: Some("418293".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            showing_the_code,
+            r#"{"node":"0202020202020202020202020202020202020202020202020202020202020202","name":"workhorse","initiatedLocally":true,"pin":"418293"}"#
+        );
+
+        // The side that must type the code never knows it, and the window has to
+        // be able to tell that apart from a code it simply has not been sent.
+        let typing_it = serde_json::to_string(&PendingPairingSnapshot {
+            node: NodeId([2u8; 32]).to_hex(),
+            name: "desk".into(),
+            initiated_locally: false,
+            pin: None,
+        })
+        .unwrap();
+        assert!(
+            typing_it.contains(r#""initiatedLocally":false"#),
+            "{typing_it}"
+        );
+        assert!(typing_it.contains(r#""pin":null"#), "{typing_it}");
+    }
+
     #[test]
     fn responses_and_events_are_distinguishable_without_looking_at_the_id() {
         let response = serde_json::to_string(&ServerMessage::Response {
