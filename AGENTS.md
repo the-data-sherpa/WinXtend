@@ -259,6 +259,15 @@ hold it together and each has a test:
 - **The push repeats on every layout and display change**, because a restart is
   not available — `InputCapture` has no restore token at the alpha target's
   version, so a new session means a new consent dialog.
+- **Applying it waits for the drive to end, and is owned in one place.** Moving
+  the barriers ends the current activation, and the engine does not watch for
+  that, so a layout edit made while someone is driving a peer would leave it
+  believing local input is still suppressed. `PendingRearm` in
+  `capture_driver.rs` holds the change and the top of the pump loop is the only
+  thing that applies it — every path that ends an activation comes back through
+  there, so no call site has to remember. It also owns the retry, because a
+  refused placement is otherwise permanent: every layer above has already
+  committed the new answer and never pushes it again.
 
 `RELEASE_PULLBACK` in `capture.rs` is no longer the routine path for a bad edge;
 it is the recovery for an activation that could not be attributed to a barrier.

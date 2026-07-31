@@ -1023,6 +1023,13 @@ fn begin_liveness_window(
 /// the same screens must not have the user's arrangement thrown away, but a
 /// newly plugged-in display that appears nowhere is unreachable until something
 /// places it.
+pub fn needs_placement(layout: &GlobalLayout, node: NodeId, monitors: &[Monitor]) -> bool {
+    monitors
+        .iter()
+        .filter(|m| !m.local_bounds.is_empty())
+        .any(|m| layout.rect(GlobalMonitorId::new(node, m.id)).is_none())
+}
+
 /// Which edges of this machine's own screens the cursor can leave by.
 ///
 /// The join between the two halves of the answer: the layout knows what is beyond
@@ -1044,13 +1051,6 @@ pub fn local_exits(
             edges: layout.exit_edges(GlobalMonitorId::new(node, m.id)),
         })
         .collect()
-}
-
-pub fn needs_placement(layout: &GlobalLayout, node: NodeId, monitors: &[Monitor]) -> bool {
-    monitors
-        .iter()
-        .filter(|m| !m.local_bounds.is_empty())
-        .any(|m| layout.rect(GlobalMonitorId::new(node, m.id)).is_none())
 }
 
 /// Whether an incoming layout should replace the one in use.
