@@ -52,7 +52,9 @@ use std::path::PathBuf;
 /// startup list.
 pub const ENTRY_NAME: &str = "WinXtend Agent";
 
-/// File name of the systemd user unit `--install` writes on Linux.
+/// File name of the systemd user unit on Linux — the packaged one, the local
+/// copy `--install` writes when it does not link the packaged one, and the
+/// enablement symlink, which all share it.
 pub const UNIT_NAME: &str = "winxtend.service";
 
 #[derive(Debug, thiserror::Error)]
@@ -323,7 +325,9 @@ pub mod linux_impl {
         root.join("systemd").join("user")
     }
 
-    /// Where `--install` writes the unit.
+    /// Where `--install` writes the local copy of the unit — the fallback
+    /// branch of [`install_in`], and the file it removes when it prefers
+    /// [`PACKAGED_UNIT`] instead.
     pub fn unit_path(root: &Path) -> PathBuf {
         unit_dir(root).join(UNIT_NAME)
     }
