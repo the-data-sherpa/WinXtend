@@ -71,6 +71,39 @@ impl ConnStatus {
     }
 }
 
+/// Motion datagrams discarded on the receiving side of one session.
+///
+/// **This is not network loss, and reading it as network loss inverts the
+/// diagnosis.** A datagram the network dropped never reaches
+/// [`wx_net::Session`] and cannot be counted anywhere; the only thing that
+/// increments the counter behind this is a datagram that *arrived*, decoded, and
+/// was thrown away because this machine's input queue was already full. Loss on
+/// the wire is the design working as intended — motion is `BestEffort` precisely
+/// so a lost position is superseded rather than retransmitted — whereas a
+/// non-zero figure here means the consumer has fallen behind, which is a defect.
+/// That is the whole reason the number is worth surfacing: it is the one signal
+/// that separates the two, and without it both present only as "feels laggy".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedDatagrams {
+    /// Total for the session that is up now.
+    ///
+    /// Not a lifetime figure: the counter lives on the session, so a reconnect
+    /// starts a new one at zero. Said plainly here because a total that silently
+    /// resets is worse than one that is known to.
+    pub total: u64,
+    /// How many of those arrived since the previous sample.
+    ///
+    /// The figure that answers "is this happening right now". A running total can
+    /// only ever say that something happened at some point, which is not a
+    /// question anyone asks while watching a test.
+    pub recent: u64,
+    /// The interval `recent` was counted over.
+    ///
+    /// Carried with the reading rather than assumed by whatever renders it, so a
+    /// sample taken on a different cadence cannot be read as a rate it is not.
+    pub window: Duration,
+}
+
 /// One peer, as the agent currently understands it.
 #[derive(Debug, Clone)]
 pub struct PeerState {
@@ -90,6 +123,14 @@ pub struct PeerState {
     /// Handshake details, once a session has been established.
     pub info: Option<NodeInfo>,
     pub rtt: Option<Duration>,
+    /// Motion datagrams from this peer that this machine took off the wire and
+    /// threw away, sampled once a tick. See [`DroppedDatagrams`] before drawing a
+    /// conclusion from it — it says nothing about the network.
+    ///
+    /// `None` while no session exists, for the same reason `rtt` is: the counter
+    /// belongs to a connection, and the figure from the last one says nothing
+    /// about a peer that is offline now.
+    pub dropped_datagrams: Option<DroppedDatagrams>,
     /// Consecutive failed dials, driving the backoff.
     pub dial_failures: u32,
     /// Earliest time another dial is worth attempting.
@@ -112,6 +153,7 @@ impl PeerState {
             addresses: Vec::new(),
             info: None,
             rtt: None,
+            dropped_datagrams: None,
             dial_failures: 0,
             next_dial: None,
             first_seen: now,
@@ -402,6 +444,10 @@ impl AgentState {
                 None => ConnStatus::Offline,
             };
             p.rtt = None;
+            // Cleared with the session it was counted on. Leaving the last
+            // reading behind would have a peer that is offline still reporting a
+            // window of drops, which reads as something happening now.
+            p.dropped_datagrams = None;
             p.dial_failures = p.dial_failures.saturating_add(1);
             p.next_dial = Some(now + backoff(p.dial_failures));
         }
@@ -411,6 +457,36 @@ impl AgentState {
         if let Some(p) = self.peers.get_mut(&node) {
             p.rtt = Some(rtt);
         }
+    }
+
+    /// Record a session's current discarded-datagram total, deriving the window
+    /// figure from the previous reading, and return what was recorded.
+    ///
+    /// Returned rather than only stored so the caller can log the change without
+    /// reading the peer back out; the log line is the half of this that is usable
+    /// while a test is running, and a snapshot field nobody is looking at is not.
+    ///
+    /// `saturating_sub` because the total legitimately goes backwards: a reconnect
+    /// replaces the session and its counter starts at zero. That reads as a window
+    /// of zero — one sample of understatement at the moment of a reconnect, which
+    /// is a moment the log is already describing — and every sample after it is
+    /// right again. Wrapping would instead invent an enormous window figure at
+    /// exactly the point someone is trying to read the log.
+    pub fn sample_dropped_datagrams(
+        &mut self,
+        node: NodeId,
+        total: u64,
+        window: Duration,
+    ) -> Option<DroppedDatagrams> {
+        let peer = self.peers.get_mut(&node)?;
+        let previous = peer.dropped_datagrams.map_or(0, |d| d.total);
+        let reading = DroppedDatagrams {
+            total,
+            recent: total.saturating_sub(previous),
+            window,
+        };
+        peer.dropped_datagrams = Some(reading);
+        Some(reading)
     }
 
     /// Peers that should be dialled now, with the addresses to try.
@@ -1027,6 +1103,88 @@ mod tests {
         config.peer_mut(&node(2)).name = Some("mac mini".into());
         state.sync_trust(&trust, &config, now);
         assert_eq!(state.peer(&node(2)).unwrap().display_name(), "mac mini");
+    }
+
+    const WINDOW: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn a_datagram_drop_count_is_reported_as_a_window_and_not_only_a_total() {
+        // The whole point of the field: a running total says something happened at
+        // some point, and someone watching a test needs to know whether it is
+        // happening now and whether it is getting worse.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![]), true, now);
+
+        let first = state.sample_dropped_datagrams(node(2), 4, WINDOW).unwrap();
+        assert_eq!((first.total, first.recent), (4, 4));
+
+        // Worse: the window grows even though the total merely climbed.
+        let second = state.sample_dropped_datagrams(node(2), 17, WINDOW).unwrap();
+        assert_eq!((second.total, second.recent), (17, 13));
+
+        // Over: the total stands still, and the window says so.
+        let third = state.sample_dropped_datagrams(node(2), 17, WINDOW).unwrap();
+        assert_eq!((third.total, third.recent), (17, 0));
+        assert_eq!(third.window, WINDOW);
+    }
+
+    #[test]
+    fn a_reconnect_counts_the_new_sessions_drops_from_zero() {
+        // The counter lives on the session, so a reconnect starts a new one at
+        // zero. The disconnect clears the reading, so the first sample on the new
+        // session is measured against nothing rather than against a total that
+        // belonged to a connection which no longer exists.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![]), true, now);
+        state.sample_dropped_datagrams(node(2), 900, WINDOW);
+
+        state.on_disconnected(node(2), None, now);
+        state.on_session(info(2, vec![]), true, now);
+
+        let after = state.sample_dropped_datagrams(node(2), 3, WINDOW).unwrap();
+        assert_eq!((after.total, after.recent), (3, 3));
+    }
+
+    #[test]
+    fn a_total_that_goes_backwards_understates_rather_than_wrapping() {
+        // The backstop for a session replaced without a disconnect being seen.
+        // Wrapping would report several billion drops in one tick at exactly the
+        // moment someone is reading the log to find out what just happened, so the
+        // reset costs one sample of understatement instead, and the sample after
+        // it is right again.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![]), true, now);
+        state.sample_dropped_datagrams(node(2), 900, WINDOW);
+
+        let reset = state.sample_dropped_datagrams(node(2), 3, WINDOW).unwrap();
+        assert_eq!((reset.total, reset.recent), (3, 0));
+
+        let next = state.sample_dropped_datagrams(node(2), 9, WINDOW).unwrap();
+        assert_eq!((next.total, next.recent), (9, 6));
+    }
+
+    #[test]
+    fn a_peer_that_went_away_stops_reporting_the_drops_of_a_dead_session() {
+        // A window figure left behind on an offline peer reads as loss happening
+        // now, on a connection that no longer exists.
+        let now = Instant::now();
+        let (mut state, _, _) = state_with_peer(1, 2, now);
+        state.on_session(info(2, vec![]), true, now);
+        state.sample_dropped_datagrams(node(2), 12, WINDOW);
+        assert!(state.peer(&node(2)).unwrap().dropped_datagrams.is_some());
+
+        state.on_disconnected(node(2), None, now);
+        assert!(state.peer(&node(2)).unwrap().dropped_datagrams.is_none());
+    }
+
+    #[test]
+    fn sampling_a_peer_that_is_not_known_reports_nothing() {
+        let now = Instant::now();
+        let mut state = AgentState::new(node(1), "me".into(), now);
+        assert!(state.sample_dropped_datagrams(node(9), 5, WINDOW).is_none());
     }
 
     #[test]

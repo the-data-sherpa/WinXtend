@@ -260,6 +260,13 @@ screens are reported at raw pixel size with a scale of 1.0.
 | Relay for cross-NAT / VPN | ❌ not started |
 | Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and clipboard sync have landed; a Wayland machine has now driven the cursor onto a second physical machine once, over a real network, which leaves clipboard sync across machines, a clean-machine first run, and any validation beyond that single session as what is left of the alpha. Wayland input is the standing gap in every other tool in this space |
 
+Everything above that has happened between two physical machines happened over wired
+Ethernet, and the pair available to test on has only one radio between them, so
+wireless is untested end to end: the jitter, the loss pattern and the address change
+a roam produces have never been put in front of this software, and no run on this
+hardware can close that — read any validation of the two-machine path as covering
+wired links only.
+
 ## Installing on Ubuntu
 
 The alpha ships as a `.deb` containing both halves — the UI and the `wx-agent`

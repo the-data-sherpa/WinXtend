@@ -185,6 +185,36 @@ export function latency(ms) {
   return `${ms} ms`;
 }
 
+/// Motion datagrams this machine threw away instead of injecting, for one peer.
+///
+/// Mirrors `describe_drops` in crates/wx-agent/src/main.rs, so the terminal and this
+/// window say the same thing about the same number.
+///
+/// The window count leads and the session total follows, because a monotonic total
+/// answers "did this ever happen" and the question in front of someone watching a
+/// live session is "is it happening now". `windowMs` comes from the agent rather
+/// than being assumed here, so a UI running against an agent with a different tick
+/// cannot render a rate that is not the one measured.
+///
+/// A peer with no session sends nothing, which is `undefined` here and is not the
+/// same as zero — it is "no connection to have dropped anything on".
+///
+/// The label deliberately does not say "packets lost": this counts input that
+/// arrived and could not be kept up with, never input the network lost. See
+/// `DroppedDatagrams` in crates/wx-agent/src/state.rs — the two have opposite causes.
+export function droppedText(drops) {
+  if (!drops || typeof drops !== "object") return "no session";
+  const total = Number.isFinite(drops.total) ? drops.total : 0;
+  const recent = Number.isFinite(drops.recent) ? drops.recent : 0;
+  if (total === 0) return "none";
+  if (recent > 0) {
+    const window = Number.isFinite(drops.windowMs) ? drops.windowMs / 1000 : null;
+    const per = window ? `${recent} in the last ${window.toFixed(1)}s` : `${recent} just now`;
+    return `${per} — ${total} this session`;
+  }
+  return `${total} this session`;
+}
+
 export function clockTime(date) {
   const d = date instanceof Date ? date : new Date();
   const pad = (n) => String(n).padStart(2, "0");

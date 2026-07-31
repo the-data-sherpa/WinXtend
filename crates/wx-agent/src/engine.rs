@@ -2934,14 +2934,18 @@ impl Engine {
 
         self.sync_capabilities().await;
 
-        // Round-trip times, for the UI and for diagnosing a slow link.
-        let rtts: Vec<(NodeId, Duration)> = self
+        // Round-trip times, for the UI and for diagnosing a slow link, and the
+        // discarded-datagram counters beside them: both are cheap reads off a live
+        // session, and sampling them together keeps the window they describe the
+        // same one.
+        let readings: Vec<(NodeId, Duration, u64)> = self
             .sessions
             .iter()
-            .map(|(node, link)| (*node, link.session.rtt()))
+            .map(|(node, link)| (*node, link.session.rtt(), link.session.dropped_datagrams()))
             .collect();
-        for (node, rtt) in rtts {
+        for (node, rtt, dropped) in readings {
             self.state.set_rtt(node, rtt);
+            self.note_dropped_datagrams(node, dropped);
         }
 
         // Pairings nobody finished. These hold a session from an untrusted peer
@@ -2984,6 +2988,51 @@ impl Engine {
                 tracing::info!(peer = %self.router.owner(), "cursor was on an unreachable machine");
                 self.execute(actions, Origin::Remote).await;
             }
+        }
+    }
+
+    /// Sample one session's discarded-datagram counter, and say so in the log for
+    /// as long as it is moving.
+    ///
+    /// The snapshot field alone would not do. A monotonic total tells a reader that
+    /// something happened at some point, and the question during a test run is
+    /// whether it is happening *now* and whether it is getting worse — which needs
+    /// either a delta or a rate, observed live. So this emits a line per tick while
+    /// drops are arriving and one when they stop, and is otherwise silent: an
+    /// episode has visible edges in a `journalctl -f` tail, and a quiet log means
+    /// no drops rather than nobody looking.
+    ///
+    /// The wording names this machine's input queue and not the network on purpose.
+    /// The counter cannot see network loss at all — see
+    /// [`crate::state::DroppedDatagrams`] — so a line that said "packets lost"
+    /// would point whoever read it at the opposite of the cause.
+    ///
+    /// `warn` rather than `info` because the condition is a defect by construction:
+    /// dropping motion because the wire lost it is the design, dropping motion that
+    /// already arrived is the input loop falling behind.
+    fn note_dropped_datagrams(&mut self, node: NodeId, total: u64) {
+        let was_dropping = self
+            .state
+            .peer(&node)
+            .and_then(|p| p.dropped_datagrams)
+            .is_some_and(|d| d.recent > 0);
+        let Some(now) = self.state.sample_dropped_datagrams(node, total, TICK) else {
+            return;
+        };
+        if now.recent > 0 {
+            tracing::warn!(
+                peer = %node,
+                dropped = now.recent,
+                window_ms = TICK.as_millis() as u64,
+                session_total = now.total,
+                "input datagrams from a peer are being discarded; this machine's input queue is full"
+            );
+        } else if was_dropping {
+            tracing::info!(
+                peer = %node,
+                session_total = now.total,
+                "input datagrams from a peer are no longer being discarded"
+            );
         }
     }
 

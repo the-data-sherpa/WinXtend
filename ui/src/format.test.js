@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilitiesText, capabilityLabels, displaysText } from "./format.js";
+import { capabilitiesText, capabilityLabels, displaysText, droppedText } from "./format.js";
 
 // Mirrors `Capabilities` in crates/wx-proto/src/caps.rs. Written out here rather
 // than imported so that a bit renumbered on the Rust side fails this test instead
@@ -113,5 +113,45 @@ describe("what a machine's screens are", () => {
     // `displaysError` is serde-default, so an older agent simply omits it.
     expect(displaysText(screens, undefined)).toBe(displaysText(screens, null));
     expect(displaysText(undefined, undefined)).toBe("none reported");
+  });
+});
+
+describe("input a machine could not keep up with", () => {
+  it("distinguishes loss happening now from loss that happened at some point", () => {
+    // The reason the agent sends a window count beside the total at all. Someone
+    // watching a live session needs "is this happening as I look at it", and a
+    // monotonic counter answers only "did it ever happen".
+    const live = droppedText({ total: 48, recent: 12, windowMs: 2000 });
+    expect(live).toContain("12 in the last 2.0s");
+    expect(live).toContain("48 this session");
+
+    const over = droppedText({ total: 48, recent: 0, windowMs: 2000 });
+    expect(over).toBe("48 this session");
+    expect(over).not.toContain("last");
+  });
+
+  it("separates a peer with nothing dropped from a peer with no session", () => {
+    // Zero drops on a live connection and no connection to have dropped anything
+    // on are different facts, and the counter is absent in the second case.
+    expect(droppedText({ total: 0, recent: 0, windowMs: 2000 })).toBe("none");
+    expect(droppedText(undefined)).toBe("no session");
+    expect(droppedText(null)).toBe("no session");
+  });
+
+  it("does not claim the network lost anything", () => {
+    // This counts input that arrived and was thrown away because the local queue
+    // was full; a datagram the wire dropped never reaches the counter. The two have
+    // opposite causes and opposite fixes, so the wording must not merge them.
+    const text = droppedText({ total: 48, recent: 12, windowMs: 2000 });
+    expect(text).not.toContain("lost");
+    expect(text).not.toContain("packet");
+  });
+
+  it("does not invent a rate when the agent did not send the window", () => {
+    // An agent older than this UI omits the field entirely; showing the count
+    // without a window beats showing a per-second figure that was never measured.
+    const text = droppedText({ total: 5, recent: 5 });
+    expect(text).toContain("5 just now");
+    expect(text).not.toContain("in the last");
   });
 });
