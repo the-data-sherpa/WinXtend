@@ -97,10 +97,12 @@ const SCROLL_DETENT: f64 = 120.0;
 ///
 /// The portal has no way for a client to ask to be activated: the compositor
 /// decides, when the pointer crosses an armed barrier. That is the right gesture,
-/// but it means capture can activate on an edge the layout has no peer beyond —
-/// and then the pointer is pinned, the engine never asks for suppression because
-/// the cursor never left this machine, and nothing in the trait would ever release
-/// it. A user cannot recover from that without killing the agent.
+/// but the crossing can still come to nothing — [`barriers_for`] arms only edges
+/// the layout has a machine beyond, and that machine can be offline, or the
+/// handoff can go unclaimed. Then the pointer is pinned, the engine never asks for
+/// suppression because the cursor never left this machine, and nothing in the
+/// trait would ever release it. A user cannot recover from that without killing
+/// the agent.
 ///
 /// So a pull-back releases: once the accumulated motion has travelled this far
 /// *away* from the barrier while nothing has claimed the cursor, the session lets
@@ -301,8 +303,11 @@ pub struct BarrierPlan {
 /// edges out of four grabbed a cursor they had nowhere to send.
 ///
 /// [`RELEASE_PULLBACK`] stays, and is now what it should always have been — the
-/// recovery for an activation this side did not ask for and cannot attribute,
-/// rather than the routine path.
+/// recovery for a crossing of an armed edge that then comes to nothing, rather
+/// than the routine path for an edge that should never have been armed. An
+/// activation the compositor *does* attribute to an edge the layout no longer has
+/// anything beyond is handed straight back instead, in
+/// [`CaptureState::activated`], at no cost to the user.
 ///
 /// A zone no entry in `exits` describes gets no barriers at all. That is the same
 /// judgement the router makes: a screen the layout does not place is one it
@@ -711,7 +716,9 @@ impl CaptureState {
         // pay a quarter-screen drag for it, so it goes straight back.
         //
         // Only where the compositor said which barrier fired. An unattributed
-        // activation has no edge to judge and is left to [`RELEASE_PULLBACK`].
+        // activation has no edge to judge, and none to measure a pull-back along
+        // either (see `Activation::pullback_limit`), so it is left to the engine's
+        // own release.
         if let Some((edge, zone)) = edge.zip(zone) {
             if !inner.is_live_exit(edge, zone) {
                 tracing::debug!(

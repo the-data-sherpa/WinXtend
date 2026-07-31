@@ -1023,7 +1023,9 @@ async fn obey(
                 return Ok(());
             }
             tracing::debug!("arming the pointer barriers");
-            live.portal.enable(&live.session, Default::default()).await?;
+            live.portal
+                .enable(&live.session, Default::default())
+                .await?;
             barriers.enabled = true;
             Ok(())
         }
@@ -1550,7 +1552,9 @@ mod tests {
         assert!(pending.due(now, false).is_some(), "the last attempt");
         pending.refused(now);
         assert!(
-            pending.due(now + Duration::from_secs(3600), false).is_none(),
+            pending
+                .due(now + Duration::from_secs(3600), false)
+                .is_none(),
             "a portal that has refused five times will not be talked round"
         );
         // A later layout change is a different answer and starts over, which is the

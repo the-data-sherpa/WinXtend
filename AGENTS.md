@@ -247,7 +247,7 @@ The backend cannot work it out. Zones and monitors describe *this* machine's
 screens and say nothing about what is placed beside them, so the answer is pushed
 down: `GlobalLayout::has_neighbour`/`exit_edges` (`crates/wx-core/src/layout.rs`)
 → `local_exits` (`crates/wx-agent/src/engine.rs`, which is also where the global
-and local coordinate spaces are joined) → `InputCapture::set_exits`. Three rules
+and local coordinate spaces are joined) → `InputCapture::set_exits`. Four rules
 hold it together and each has a test:
 
 - **`has_neighbour` is answered through `resolve_crossing`**, not by a second
@@ -270,7 +270,9 @@ hold it together and each has a test:
   committed the new answer and never pushes it again.
 
 `RELEASE_PULLBACK` in `capture.rs` is no longer the routine path for a bad edge;
-it is the recovery for an activation that could not be attributed to a barrier.
+it is the recovery for a crossing of a live edge that then comes to nothing —
+the machine beyond it is offline, or the handoff goes unclaimed. An activation on
+an edge that is no longer live is handed straight back instead.
 
 Everything measured about the capture side — that suppression is real and
 exclusive, that the compositor sends a capturing client no modifier state and no
