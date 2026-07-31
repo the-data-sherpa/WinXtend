@@ -496,17 +496,6 @@ pub mod linux_impl {
         Ok(())
     }
 
-    /// Whether the agent will start with the next session.
-    ///
-    /// The enablement symlink has to be there *and* has to resolve. A `.wants`
-    /// symlink with no unit behind it is a registration that cannot start
-    /// anything, so reporting it as registered would be the
-    /// silent-at-every-login failure in a different costume — but the unit it
-    /// resolves to need not be the one [`install_in`] wrote. `systemctl --user
-    /// enable winxtend.service` against the unit the `.deb` ships creates only
-    /// this link, pointing at `/usr/lib/systemd/user/winxtend.service`, and
-    /// writes nothing under the user's own config root; demanding a local unit
-    /// file would report that perfectly good registration as absent.
     /// The unit the registration actually names, for a message to the user.
     ///
     /// The enablement link is read rather than assumed, because since
@@ -520,6 +509,17 @@ pub mod linux_impl {
         std::fs::read_link(link_path(root)).unwrap_or_else(|_| unit_path(root))
     }
 
+    /// Whether the agent will start with the next session.
+    ///
+    /// The enablement symlink has to be there *and* has to resolve. A `.wants`
+    /// symlink with no unit behind it is a registration that cannot start
+    /// anything, so reporting it as registered would be the
+    /// silent-at-every-login failure in a different costume — but the unit it
+    /// resolves to need not be the one [`install_in`] wrote. `systemctl --user
+    /// enable winxtend.service` against the unit the `.deb` ships creates only
+    /// this link, pointing at `/usr/lib/systemd/user/winxtend.service`, and
+    /// writes nothing under the user's own config root; demanding a local unit
+    /// file would report that perfectly good registration as absent.
     pub fn is_registered_in(root: &Path) -> Result<bool, AutostartError> {
         let link = link_path(root);
         // `metadata` follows the link, which is the whole question — is there a

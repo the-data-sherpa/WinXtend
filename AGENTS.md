@@ -411,7 +411,9 @@ package built against a newer glibc installs cleanly on an older release and
 then does nothing at all when the app-grid entry is clicked, diagnosable only
 from a terminal nobody opened. Check the floor against the artefact rather than
 the config — `objdump -T usr/bin/wx-agent | grep -o 'GLIBC_[0-9.]*' | sort -uV |
-tail -1` — and raise both it and the README whenever the build's glibc rises.
+tail -1` — and whenever the build's glibc rises, raise it in three places:
+`tauri.conf.json`, the README's Installing section, and the fixed-string
+assertion in `.github/workflows/package.yml`.
 
 ## The window runs under a capability ACL, and only half of it is gated
 
