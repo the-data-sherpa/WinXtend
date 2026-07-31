@@ -253,7 +253,7 @@ screens are reported at raw pixel size with a scale of 1.0.
 | Cursor lock, reclaim, lock-all hotkeys | ✅ |
 | Capability negotiation, enforced before an optional feature is attempted | ✅ |
 | Ubuntu `.deb` with the agent bundled, and a systemd user unit | ✅ built; its contents are asserted by the `package` workflow, which runs on demand or on a release tag rather than on every push. It has installed from no prior version on two machines — one of them with no Rust toolchain and none of the `-dev` packages on it — and worked on both. Neither was a pristine OS install, and an existing GNOME desktop had already supplied the WebKitGTK runtime, so the declared dependencies have never had to pull anything onto a machine that lacked them |
-| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. The unit that loads there is the `~/.config/systemd/user` copy `--install` writes: on both installed machines `systemctl --user show winxtend.service -p FragmentPath` reports that copy, so the `.deb`'s own copy under `/usr/lib/systemd/user` is the untested one by check rather than by presumption |
+| Start with the session, from the UI or `--install` | ✅ Windows and Linux; macOS still says what to write by hand. On Linux `systemd-analyze verify` accepts the unit, the registration is tested against a scratch config root, and on an installed machine a systemd user manager has started the packaged `/usr/bin/wx-agent` as the graphical session came up, with the UI attaching to that externally-started agent. `--install` now prefers the `.deb`'s own copy under `/usr/lib/systemd/user`, linking it and removing any local one, whenever its `ExecStart` already names the agent doing the installing; the `~/.config/systemd/user` copy is written only when there is no packaged unit or it starts a different binary. Both branches are tested against a scratch config root, the preference included. The two machines already installed were registered before that change and still load their `~/.config` copy — `systemctl --user show winxtend.service -p FragmentPath` reports it — and will move to the packaged one the next time autostart is registered there, so the preference has been tested but not yet observed on an installed machine |
 | Clipboard sync across machines | ⚠️ implemented for text, HTML and PNG, on a QUIC stream of its own so a large image cannot stall the cursor. File lists are deliberately never synced: the paths do not exist on the receiving machine. Proven end to end between two agents with genuinely separate clipboards over two real QUIC endpoints — but on loopback; never yet *across machines*, which is issue #11 |
 | File transfer | ❌ not implemented, and no longer advertised |
 | Screen streaming | ❌ crate exists, not wired into the agent |
@@ -265,6 +265,12 @@ screens are reported at raw pixel size with a scale of 1.0.
 The alpha ships as a `.deb` containing both halves — the UI and the `wx-agent`
 daemon — because an installer with only the UI in it produces an application that
 cannot start anything.
+
+It needs **Ubuntu 24.04 or newer**. Both binaries are built against glibc 2.39,
+which 22.04 does not have, and the package says so: it declares
+`libc6 (>= 2.39)`, so an older release refuses the install with a message
+instead of installing cleanly and then doing nothing when the app-grid entry is
+clicked.
 
 ```bash
 sudo apt install ./WinXtend_0.1.0_amd64.deb
@@ -280,7 +286,7 @@ one itself if there is none. What the package puts where:
 |---|---|
 | `/usr/bin/winxtend-ui` | The UI. Also the app-grid entry. |
 | `/usr/bin/wx-agent` | The daemon. Beside the UI, which is the only place the UI trusts to hold an agent matching its protocol version, and on `PATH` for `wx-agent --status`. |
-| `/usr/lib/systemd/user/winxtend.service` | The autostart unit, installed but **not** enabled. See below. |
+| `/usr/lib/systemd/user/winxtend.service` | The autostart unit. Installed but **not** enabled: enabling it is what the UI toggle and `wx-agent --install` do, and on an installed machine this is the copy they enable. See below. |
 
 There is no build of this for other distributions yet, and the package is
 unsigned and in no repository: it is an alpha artefact to be downloaded and
@@ -305,9 +311,15 @@ reason, and `systemctl --user` needs no root. Lingering
 (`loginctl enable-linger`) is not wanted: with no graphical session there is
 nothing for the agent to capture or inject into.
 
-`--install` writes `~/.config/systemd/user/winxtend.service` naming the agent
-that installed it, which shadows the packaged copy. After a `.deb` install both
-name `/usr/bin/wx-agent`, so the two agree.
+On a machine with the `.deb` installed, this enables the unit the package
+ships — `/usr/lib/systemd/user/winxtend.service` — and writes nothing of its
+own, so there is one unit text on the machine and an upgrade of the package
+replaces it. Anywhere else, and on any machine whose packaged unit starts a
+different binary, `--install` writes `~/.config/systemd/user/winxtend.service`
+naming the agent that installed it, exactly as before; a user unit shadows a
+packaged one of the same name, which is what makes running from a checkout work.
+`--uninstall` removes whichever of the two the registration used, and never the
+package's own file.
 
 ### Ports and firewall
 

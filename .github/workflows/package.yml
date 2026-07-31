@@ -103,10 +103,20 @@ jobs:
           # the check that exists precisely to catch it. The `\(` arm allows a
           # version constraint after the name.
           for dep in libwebkit2gtk-4.1-0 libgtk-3-0 xdg-desktop-portal \
-                     xdg-desktop-portal-gnome; do
+                     xdg-desktop-portal-gnome libc6; do
             echo "$control" | grep -qE "(^|[ ,])${dep}([ ,(]|\$)" \
               || { echo "::error::$dep is not a declared dependency"; fail=1; }
           done
+          # `libc6` is the only one that needs a *version*, and it is why it is
+          # declared at all: Tauri's Debian bundler does not run
+          # `dpkg-shlibdeps`, so nothing derives a libc floor from the binaries.
+          # Without the constraint the package installs happily on a release too
+          # old to run it — the app-grid entry appears, clicking it does nothing
+          # whatever, and the only diagnosis is a missing-shared-library message
+          # on a terminal nobody opened. Matched as a fixed string, because the
+          # parentheses of a Debian version relation are not regex.
+          echo "$control" | grep -qF 'libc6 (>= 2.39)' \
+            || { echo "::error::libc6 is declared without the >= 2.39 floor the binaries need"; fail=1; }
           # The agent must be beside the UI *and* be the agent: an empty or
           # truncated sidecar would satisfy the path check above.
           size=$(dpkg-deb -c "$deb" | awk '$6 ~ /usr\/bin\/wx-agent$/ {print $3}')

@@ -403,6 +403,16 @@ bundler and must not be listed there as well, or they appear twice in `Depends`.
 `.github/workflows/package.yml` asserts the built `.deb`'s contents and dependency list,
 which is the only check that the package is complete.
 
+**Tauri's Debian bundler never runs `dpkg-shlibdeps`**, so nothing derives a
+dependency from what the binaries actually link — every entry in `Depends` is
+there because somebody wrote it down. That is why `libc6 (>= 2.39)` is declared
+by hand and is the project's minimum-Ubuntu statement (24.04); without it a
+package built against a newer glibc installs cleanly on an older release and
+then does nothing at all when the app-grid entry is clicked, diagnosable only
+from a terminal nobody opened. Check the floor against the artefact rather than
+the config — `objdump -T usr/bin/wx-agent | grep -o 'GLIBC_[0-9.]*' | sort -uV |
+tail -1` — and raise both it and the README whenever the build's glibc rises.
+
 ## The window runs under a capability ACL, and only half of it is gated
 
 Tauri refuses every `plugin:*` command the webview sends unless a file in
@@ -516,6 +526,17 @@ nothing, because neither has the interactive desktop — on Linux, the Wayland d
 the session bus, and `xdg-desktop-portal`. The module doc and
 `packaging/winxtend.service.in` carry the full argument; read them before proposing a
 system service again.
+
+On Linux there are **two** units of the same name and only one may be enabled.
+`--install` links the packaged `/usr/lib/systemd/user/winxtend.service` when its
+`ExecStart` already names the agent doing the installing, removing any
+`~/.config/systemd/user` copy as it goes, and writes that local copy only
+otherwise — a checkout, another prefix, an unreadable or hand-edited packaged
+unit. The reason is in `install_in`'s doc comment: a local unit shadows the
+packaged one permanently and is a snapshot of `current_exe()` no package upgrade
+can revise. Keep the invariant when touching any of it — exactly one unit is
+linked, `--uninstall` removes whatever was put in place, and the package's own
+file is never deleted.
 
 Three properties are easy to break and are tested: registration rewrites the recorded
 path every time, a registration whose target is gone reads as *not* registered, and the

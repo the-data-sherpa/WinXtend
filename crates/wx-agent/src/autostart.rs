@@ -34,8 +34,11 @@
 //! `packaging/winxtend.service.in`.
 //!
 //! Registering is a filesystem fact here, not a call into a daemon:
-//! [`install`] writes the unit and creates the same `.wants` symlink
-//! `systemctl --user enable` would, then asks systemd to reload as a courtesy.
+//! [`install`] creates the same `.wants` symlink `systemctl --user enable`
+//! would — against the unit the `.deb` ships where that one already starts this
+//! binary, and against a copy it writes under the user's own config root
+//! otherwise, which is the argument on [`linux_impl::install_in`] — then asks
+//! systemd to reload as a courtesy.
 //! That split is what lets the whole path be tested — including on a CI runner
 //! with no systemd user instance to talk to — and it is why the reload is
 //! best-effort rather than fatal. See [`linux_impl`].
@@ -111,7 +114,10 @@ pub fn install() -> Result<PathBuf, AutostartError> {
     }
     #[cfg(target_os = "linux")]
     {
-        let exe = linux_impl::install_in(&linux_impl::config_root()?)?;
+        let exe = linux_impl::install_in(
+            &linux_impl::config_root()?,
+            std::path::Path::new(linux_impl::PACKAGED_UNIT),
+        )?;
         // Best-effort, and after the files are on disk: systemd has to be told
         // to re-read the unit directory or the new unit is invisible until the
         // next login. It is not part of the registration, which is why its
@@ -147,12 +153,17 @@ pub fn uninstall() -> Result<(), AutostartError> {
 /// Where the registration lives, for a message that tells the user what was
 /// touched. `None` on a platform with no mechanism, and on any platform where
 /// the location cannot be determined.
+///
+/// On Linux this is the unit the enablement link actually resolves to, not the
+/// path [`install`] would have written: since `--install` prefers the packaged
+/// unit when it already starts this binary, naming the local copy would print a
+/// file that is not there.
 pub fn location() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         linux_impl::config_root()
             .ok()
-            .map(|r| linux_impl::unit_path(&r))
+            .map(|r| linux_impl::registered_unit(&r))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -198,6 +209,15 @@ pub mod linux_impl {
     /// `graphical-session.target` rather than `default.target`: the agent needs
     /// a session, not a boot. See the unit template.
     pub const WANTED_BY: &str = "graphical-session.target";
+
+    /// Where the `.deb` installs the unit it ships.
+    ///
+    /// Tauri's Debian bundler places it from `bundle.linux.deb.files` in
+    /// `ui/src-tauri/tauri.conf.json`, generated from the same template as the
+    /// text [`install_in`] would write (`ui/scripts/bundle-agent.mjs`). A
+    /// checkout, a tarball, or any other distribution simply has no file here,
+    /// which is the absent case [`install_in`] falls back from.
+    pub const PACKAGED_UNIT: &str = "/usr/lib/systemd/user/winxtend.service";
 
     /// The unit, with `exec_start` filled in.
     ///
@@ -330,6 +350,51 @@ pub mod linux_impl {
         }
     }
 
+    /// The single `ExecStart=` value in a unit's text, or `None` when there is
+    /// not exactly one.
+    ///
+    /// Not exactly one is deliberately an answer rather than a guess. systemd
+    /// treats an empty `ExecStart=` as resetting the ones before it, so a unit
+    /// with several has a meaning this cannot summarise; refusing to read it
+    /// costs nothing, because the only caller falls back to writing its own
+    /// copy.
+    ///
+    /// `trim_start` because systemd accepts leading whitespace on a directive
+    /// and strips it; `trim_end` for the same reason, and so a `\r\n` line
+    /// ending cannot make an identical unit read as a different one.
+    fn exec_start(text: &str) -> Option<&str> {
+        let mut found = None;
+        for line in text.lines() {
+            if let Some(value) = line.trim_start().strip_prefix("ExecStart=") {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(value.trim_end());
+            }
+        }
+        found
+    }
+
+    /// Whether the unit at `packaged` already starts exactly this binary.
+    ///
+    /// Compared against the rendering [`unit_text`] would produce rather than
+    /// against the raw path, because the rendering is the thing systemd reads:
+    /// the packaged unit comes from the same template through the same quoting
+    /// (`ui/scripts/bundle-agent.mjs`), so on an installed machine the two are
+    /// equal, and anything that is not equal — a hand-edited unit, a unit from
+    /// a different install prefix, an agent being run from a checkout — is a
+    /// unit that would start something else.
+    ///
+    /// Unreadable is not an error here, only a no: `/usr/lib` is root-owned,
+    /// and the honest response to "cannot tell" is to write the copy this user
+    /// certainly can.
+    fn packaged_starts(packaged: &Path, exe: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(packaged) else {
+            return false;
+        };
+        exec_start(&text).is_some_and(|value| value == quoted(exe))
+    }
+
     /// Write the unit and enable it, under an arbitrary config root.
     ///
     /// Parameterised on the root for the same reason `open_existing_at` is
@@ -337,20 +402,60 @@ pub mod linux_impl {
     /// can exercise the real code against a directory of their own instead of
     /// the developer's actual autostart configuration. Unlike `HKCU`, this one
     /// can be redirected completely, so the Linux tests touch nothing real.
-    pub fn install_in(root: &Path) -> Result<PathBuf, AutostartError> {
+    /// `packaged` is parameterised for the same reason, and is
+    /// [`PACKAGED_UNIT`] outside the tests.
+    ///
+    /// # Why the packaged unit is preferred
+    ///
+    /// Writing `~/.config/systemd/user/winxtend.service` unconditionally makes
+    /// it *shadow* the packaged copy for good — a user unit of the same name
+    /// wins the search path — and what it shadows it with is a snapshot of
+    /// `current_exe()` taken once. A user who enabled autostart from a checkout
+    /// and then installed the `.deb` autostarts `…/target/release/wx-agent` at
+    /// every login, silently, and no upgrade of the package can correct it,
+    /// because the package has no `postinst` and nothing else rewrites that
+    /// file. So where the shipped unit already starts this very binary,
+    /// registering means linking it and **removing** the local copy: one unit
+    /// text on the machine, owned by the package, replaced by every upgrade.
+    ///
+    /// The fallback is not a lesser path. A checkout, a tarball, an agent
+    /// installed somewhere else, an unreadable or hand-edited `/usr/lib` unit —
+    /// all of them write the local copy exactly as before, because a link to a
+    /// unit that starts a *different* binary is the silent-at-every-login
+    /// failure this module is written against.
+    pub fn install_in(root: &Path, packaged: &Path) -> Result<PathBuf, AutostartError> {
         let exe = std::env::current_exe().map_err(AutostartError::ExePath)?;
         // Rendered before anything is created, so that a path systemd cannot
         // name is a refusal and not a half-built registration: no directory, no
-        // unit, no link, and an error that says which character did it.
+        // unit, no link, and an error that says which character did it. It is
+        // rendered even when the packaged unit is preferred and the text goes
+        // unused, so that the refusal does not depend on which branch is taken.
         let text = unit_text(&exe)?;
         let dir = unit_dir(root);
         std::fs::create_dir_all(&dir).map_err(io("creating", &dir))?;
 
-        // Rewritten every time, not written only when absent: a unit whose
-        // ExecStart names a binary that has moved fails at every login and says
-        // nothing, which is worse than not being registered at all.
-        let unit = unit_path(root);
-        std::fs::write(&unit, text).map_err(io("writing", &unit))?;
+        let local = unit_path(root);
+        let unit = if packaged_starts(packaged, &exe) {
+            // Removed rather than left beside the link: while it is there
+            // systemd loads *it* and not the packaged unit, whatever this link
+            // points at, and it is exactly the stale snapshot described above.
+            // Absent is the state being aimed for, so its absence is not an
+            // error — and doing this before the link is repointed means an
+            // interruption leaves a dangling link, which reads as *not*
+            // registered rather than as a registration that starts nothing.
+            match std::fs::remove_file(&local) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io("removing", &local)(e)),
+            }
+            packaged.to_path_buf()
+        } else {
+            // Rewritten every time, not written only when absent: a unit whose
+            // ExecStart names a binary that has moved fails at every login and
+            // says nothing, which is worse than not being registered at all.
+            std::fs::write(&local, text).map_err(io("writing", &local))?;
+            local
+        };
 
         let link = link_path(root);
         let wants = link.parent().expect("the link path has a parent");
@@ -370,6 +475,14 @@ pub mod linux_impl {
     }
 
     /// Remove the unit and its enablement symlink. Absent is success.
+    ///
+    /// Both branches of [`install_in`] are undone by this one pair of removals,
+    /// and neither leaves anything else behind: the link is removed whichever
+    /// unit it resolves to, and the local copy is removed when there is one —
+    /// there is none when the packaged unit was preferred. The packaged unit
+    /// itself is deliberately never touched. It belongs to `dpkg`, it is not
+    /// this user's to delete, and removing it would disable WinXtend for every
+    /// other account on the machine; with the link gone it starts nothing.
     pub fn uninstall_in(root: &Path) -> Result<(), AutostartError> {
         for path in [link_path(root), unit_path(root)] {
             // `remove_file` on a symlink removes the link, never its target,
@@ -394,6 +507,19 @@ pub mod linux_impl {
     /// this link, pointing at `/usr/lib/systemd/user/winxtend.service`, and
     /// writes nothing under the user's own config root; demanding a local unit
     /// file would report that perfectly good registration as absent.
+    /// The unit the registration actually names, for a message to the user.
+    ///
+    /// The enablement link is read rather than assumed, because since
+    /// [`install_in`] prefers the packaged unit there are two answers: after
+    /// registering on an installed machine the only unit is
+    /// [`PACKAGED_UNIT`], and printing the local path would name a file that
+    /// does not exist. With no link to read — nothing registered — the honest
+    /// answer is where a registration *would* be written, which is what the
+    /// caller is about to be told about.
+    pub fn registered_unit(root: &Path) -> PathBuf {
+        std::fs::read_link(link_path(root)).unwrap_or_else(|_| unit_path(root))
+    }
+
     pub fn is_registered_in(root: &Path) -> Result<bool, AutostartError> {
         let link = link_path(root);
         // `metadata` follows the link, which is the whole question — is there a
@@ -825,6 +951,38 @@ mod tests {
         }
     }
 
+    /// A packaged-unit path that is certainly not there — the machine with no
+    /// `.deb` installed, which is what every test about writing the local copy
+    /// means by "no packaged unit".
+    ///
+    /// Inside the temporary root, and not merely a made-up absolute path,
+    /// because the developer running these tests may well have WinXtend
+    /// installed: naming the real `/usr/lib/systemd/user/winxtend.service`
+    /// would make these tests read a file whose presence depends on the
+    /// machine. Nothing creates this one.
+    #[cfg(target_os = "linux")]
+    fn no_packaged_unit(root: &std::path::Path) -> std::path::PathBuf {
+        root.join("no-packaged-unit.service")
+    }
+
+    /// A stand-in for `/usr/lib/systemd/user/winxtend.service` on an installed
+    /// machine: the unit the `.deb` ships, already naming the binary that is
+    /// registering.
+    ///
+    /// Written from [`linux_impl::unit_text`] because that is what
+    /// `ui/scripts/bundle-agent.mjs` does — the same template through the same
+    /// quoting — so a change that made the two renderings disagree would show
+    /// up here as the preference silently never being taken. `current_exe()` is
+    /// the test binary rather than `/usr/bin/wx-agent`, which is the point:
+    /// what is being asserted is "the packaged unit starts *this* binary".
+    #[cfg(target_os = "linux")]
+    fn packaged_unit_for_this_binary(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("usr-lib-winxtend.service");
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        std::fs::write(&path, linux_impl::unit_text(&exe).unwrap()).unwrap();
+        path
+    }
+
     #[test]
     fn a_platform_with_no_mechanism_says_what_to_do_instead() {
         // The point of the error text: an unsupported platform must tell the user
@@ -886,15 +1044,192 @@ mod tests {
             let root = TempRoot::new("idempotent");
             let root = root.path();
 
-            linux_impl::install_in(root).unwrap();
+            linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
             assert!(linux_impl::is_registered_in(root).unwrap());
-            linux_impl::install_in(root).unwrap();
+            linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
             assert!(linux_impl::is_registered_in(root).unwrap());
 
             linux_impl::uninstall_in(root).unwrap();
             assert!(!linux_impl::is_registered_in(root).unwrap());
             // Removing twice is not an error: the desired end state is reached.
             linux_impl::uninstall_in(root).unwrap();
+
+            // And the same three properties again on an installed machine,
+            // where registering links the packaged unit instead of writing a
+            // local one. Idempotence and removal are not free there — the
+            // branch removes a file rather than writing one, and `uninstall_in`
+            // has a link pointing outside the config root to take away — so
+            // they are asserted rather than assumed to carry over.
+            let root = TempRoot::new("idempotent-packaged");
+            let root = root.path();
+            let packaged = packaged_unit_for_this_binary(root);
+
+            linux_impl::install_in(root, &packaged).unwrap();
+            assert!(linux_impl::is_registered_in(root).unwrap());
+            linux_impl::install_in(root, &packaged).unwrap();
+            assert!(linux_impl::is_registered_in(root).unwrap());
+
+            linux_impl::uninstall_in(root).unwrap();
+            assert!(!linux_impl::is_registered_in(root).unwrap());
+            linux_impl::uninstall_in(root).unwrap();
+            assert!(
+                packaged.exists(),
+                "uninstalling must not delete the unit the package owns"
+            );
+        }
+    }
+
+    /// On an installed machine, registering links the packaged unit rather than
+    /// writing a copy that would shadow it.
+    ///
+    /// The point is not tidiness. A local unit is a snapshot of `current_exe()`
+    /// written once and never revisited, and it wins the search path over
+    /// `/usr/lib/systemd/user` for good; the packaged one is replaced by every
+    /// upgrade of the `.deb`. So where the shipped unit already starts this
+    /// binary, the registration that survives an upgrade is the link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_packaged_unit_that_already_starts_this_binary_is_preferred() {
+        let root = TempRoot::new("prefer-packaged");
+        let root = root.path();
+        let packaged = packaged_unit_for_this_binary(root);
+
+        linux_impl::install_in(root, &packaged).unwrap();
+
+        assert!(
+            !linux_impl::unit_path(root).exists(),
+            "no local copy is written when the packaged unit already serves"
+        );
+        assert_eq!(
+            std::fs::read_link(linux_impl::link_path(root)).unwrap(),
+            packaged,
+            "the enablement link names the packaged unit"
+        );
+        assert!(linux_impl::is_registered_in(root).unwrap());
+        // What the user is told has to be the unit that will actually start,
+        // or the follow-up they were pointed at reads a file that is not there.
+        assert_eq!(linux_impl::registered_unit(root), packaged);
+    }
+
+    /// A packaged unit that starts a *different* binary is not used, and the
+    /// local copy is written exactly as before.
+    ///
+    /// This is the case that must not be broken by the preference above: an
+    /// agent run from a checkout, from a tarball, or from any prefix other than
+    /// the package's own. Linking a unit that starts someone else's binary
+    /// would be the silent-at-every-login failure this module is written
+    /// against — the user would be told they are registered, and something else
+    /// would start.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_packaged_unit_naming_a_different_agent_is_not_used() {
+        let root = TempRoot::new("packaged-mismatch");
+        let root = root.path();
+
+        let packaged = root.join("usr-lib-winxtend.service");
+        std::fs::write(
+            &packaged,
+            linux_impl::unit_text(std::path::Path::new("/usr/bin/wx-agent")).unwrap(),
+        )
+        .unwrap();
+
+        linux_impl::install_in(root, &packaged).unwrap();
+
+        let local = linux_impl::unit_path(root);
+        assert!(local.exists(), "the local copy is still written");
+        assert_eq!(
+            std::fs::read_link(linux_impl::link_path(root)).unwrap(),
+            local,
+            "the enablement link names the copy that starts this binary"
+        );
+        assert!(linux_impl::is_registered_in(root).unwrap());
+        // The registration is only worth anything if it starts the agent that
+        // made it: the local unit names this binary, not `/usr/bin/wx-agent`.
+        let text = std::fs::read_to_string(&local).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            text.contains(&format!("ExecStart=\"{}\"", exe.display())),
+            "{text}"
+        );
+
+        // And it is fully removable from there, with nothing of either unit
+        // left enabled.
+        linux_impl::uninstall_in(root).unwrap();
+        assert!(!linux_impl::is_registered_in(root).unwrap());
+        assert!(!local.exists());
+        assert!(packaged.exists(), "the package's own file is not ours");
+    }
+
+    /// Registering removes a stale local unit that would shadow the packaged
+    /// one — the failure the preference exists to close.
+    ///
+    /// The state reproduced here is the one a real user reaches: autostart was
+    /// enabled from a checkout, so `~/.config/systemd/user/winxtend.service`
+    /// names `…/target/release/wx-agent`; then the `.deb` was installed. That
+    /// file shadows the packaged unit permanently and no upgrade rewrites it,
+    /// so every login starts a binary that may since have been `cargo clean`ed
+    /// — silently, while the UI goes on reporting the agent as registered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registering_clears_a_stale_local_unit_that_would_shadow_the_packaged_one() {
+        let root = TempRoot::new("stale-shadow");
+        let root = root.path();
+
+        // The stale registration, written the way an older `--install` from a
+        // checkout would have left it.
+        let local = linux_impl::unit_path(root);
+        std::fs::create_dir_all(linux_impl::unit_dir(root)).unwrap();
+        std::fs::write(
+            &local,
+            linux_impl::unit_text(std::path::Path::new(
+                "/home/someone/WinXtend/target/release/wx-agent",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let packaged = packaged_unit_for_this_binary(root);
+        linux_impl::install_in(root, &packaged).unwrap();
+
+        assert!(
+            !local.exists(),
+            "the stale copy is removed, not left to shadow the packaged unit"
+        );
+        assert_eq!(
+            std::fs::read_link(linux_impl::link_path(root)).unwrap(),
+            packaged
+        );
+        assert!(linux_impl::is_registered_in(root).unwrap());
+    }
+
+    /// A unit with no `ExecStart` at all, or with more than one, is not matched
+    /// against.
+    ///
+    /// Both are units this code did not write, and neither has an answer to
+    /// "does it start this binary" that is worth guessing at: systemd lets a
+    /// bare `ExecStart=` reset the ones before it, so a file with several means
+    /// something no single comparison captures. Falling back to the local copy
+    /// is the safe reading, and it is the same fallback as an unreadable file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unit_without_exactly_one_exec_start_is_not_matched() {
+        let exe = std::env::current_exe().unwrap();
+        let mine = linux_impl::unit_text(&exe).unwrap();
+
+        for (name, text) in [
+            ("none", mine.replace("ExecStart=", "#ExecStart=")),
+            ("two", format!("{mine}\nExecStart=\"{}\"\n", exe.display())),
+        ] {
+            let root = TempRoot::new(&format!("exec-start-{name}"));
+            let root = root.path();
+            let packaged = root.join("usr-lib-winxtend.service");
+            std::fs::write(&packaged, &text).unwrap();
+
+            linux_impl::install_in(root, &packaged).unwrap();
+            assert!(
+                linux_impl::unit_path(root).exists(),
+                "{name}: the local copy is written rather than trusting this unit"
+            );
         }
     }
 
@@ -1028,7 +1363,7 @@ mod tests {
     fn enabling_writes_the_wants_symlink_systemd_looks_for() {
         let root = TempRoot::new("wants");
         let root = root.path();
-        linux_impl::install_in(root).unwrap();
+        linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
 
         let link = linux_impl::link_path(root);
         assert!(
@@ -1055,7 +1390,7 @@ mod tests {
     fn a_dangling_enablement_link_does_not_count_as_registered() {
         let root = TempRoot::new("dangling");
         let root = root.path();
-        linux_impl::install_in(root).unwrap();
+        linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
         std::fs::remove_file(linux_impl::unit_path(root)).unwrap();
 
         assert!(
@@ -1064,7 +1399,7 @@ mod tests {
         );
         // And installing again must repair it rather than trip over the link
         // that is already there.
-        linux_impl::install_in(root).unwrap();
+        linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
         assert!(linux_impl::is_registered_in(root).unwrap());
     }
 
@@ -1117,7 +1452,7 @@ mod tests {
             !linux_impl::unit_dir(root).exists(),
             "the test starts from a root with no systemd directory"
         );
-        linux_impl::install_in(root).unwrap();
+        linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
         assert!(linux_impl::is_registered_in(root).unwrap());
     }
 
@@ -1160,7 +1495,7 @@ mod tests {
                 !linux_impl::is_registered_in(root).unwrap(),
                 "with nothing registered the answer is a plain no"
             );
-            linux_impl::install_in(root).unwrap();
+            linux_impl::install_in(root, &no_packaged_unit(root)).unwrap();
             assert!(linux_impl::is_registered_in(root).unwrap());
         }
         #[cfg(not(any(windows, target_os = "linux")))]
