@@ -2637,6 +2637,7 @@ impl Engine {
         if !self.state.is_reachable(node) {
             if let Some(link) = self.sessions.remove(&node) {
                 link.session.close(why);
+                self.state.clear_dropped_datagrams(node);
             }
             self.gates.remove(&node);
         }
@@ -2934,14 +2935,18 @@ impl Engine {
 
         self.sync_capabilities().await;
 
-        // Round-trip times, for the UI and for diagnosing a slow link.
-        let rtts: Vec<(NodeId, Duration)> = self
+        // Round-trip times, for the UI and for diagnosing a slow link, and the
+        // discarded-datagram counters beside them: both are cheap reads off a live
+        // session, and sampling them together keeps the window they describe the
+        // same one.
+        let readings: Vec<(NodeId, Duration, u64)> = self
             .sessions
             .iter()
-            .map(|(node, link)| (*node, link.session.rtt()))
+            .map(|(node, link)| (*node, link.session.rtt(), link.session.dropped_datagrams()))
             .collect();
-        for (node, rtt) in rtts {
+        for (node, rtt, dropped) in readings {
             self.state.set_rtt(node, rtt);
+            self.note_dropped_datagrams(node, dropped, now);
         }
 
         // Pairings nobody finished. These hold a session from an untrusted peer
@@ -2984,6 +2989,96 @@ impl Engine {
                 tracing::info!(peer = %self.router.owner(), "cursor was on an unreachable machine");
                 self.execute(actions, Origin::Remote).await;
             }
+        }
+    }
+
+    /// Sample one session's discarded-datagram counter, and say so in the log for
+    /// as long as it is moving.
+    ///
+    /// The snapshot field alone would not do. A monotonic total tells a reader that
+    /// something happened at some point, and the question during a test run is
+    /// whether it is happening *now* and whether it is getting worse — which needs
+    /// either a delta or a rate, observed live. So this emits a line per tick while
+    /// drops are arriving and one when they stop, and is otherwise silent: an
+    /// episode has visible edges in a `journalctl -f` tail, and a quiet log means
+    /// no drops rather than nobody looking.
+    ///
+    /// The wording names this machine's input queue and not the network on purpose.
+    /// The counter cannot see network loss at all — see
+    /// [`crate::state::DroppedDatagrams`] — so a line that said "packets lost"
+    /// would point whoever read it at the opposite of the cause.
+    ///
+    /// `warn` rather than `info` because the condition is a defect by construction:
+    /// dropping motion because the wire lost it is the design, dropping motion that
+    /// already arrived is the input loop falling behind.
+    ///
+    /// `window_ms` is the interval the state measured between this sample and the
+    /// last, not [`TICK`]. This loop is the one place the difference bites: a tick
+    /// is dispatched from the same serial wake channel as the peer events whose
+    /// backlog causes the drops, so the tick that finds a non-zero count is one
+    /// that queued behind that backlog and covers longer than `TICK`. Printing the
+    /// constant would report a rate up to half again what was measured, on the one
+    /// line somebody is reading as a measurement.
+    ///
+    /// The decision of *whether* to say anything lives in [`drop_report`] so it can
+    /// be tested without an Engine. What remains untested here is the emission
+    /// itself and the literal wording: constructing an Engine binds real endpoints
+    /// and platform backends, and this project captures log output nowhere. So
+    /// `drop_report`'s tests cover that a line is decided on at both edges and at
+    /// neither steady state; that the text below reads correctly to a person is
+    /// held by review, not by a test.
+    fn note_dropped_datagrams(&mut self, node: NodeId, total: u64, now: Instant) {
+        let was_dropping = self
+            .state
+            .peer(&node)
+            .and_then(|p| p.dropped_datagrams)
+            .is_some_and(|d| d.recent > 0);
+        let Some(reading) = self.state.sample_dropped_datagrams(node, total, now) else {
+            return;
+        };
+        // Both lines name the machine as well as the node id. A reader mapping
+        // `peer=b05a98b3` back to a hostname by hand is doing it at the one moment
+        // they are trying to read quickly; the hex stays for grepping and for the
+        // convention every other line here follows.
+        match drop_report(was_dropping, reading) {
+            DropReport::Dropping {
+                recent,
+                window,
+                per_second,
+                total,
+            } => {
+                // One message, two shapes. A window too short to divide by leaves
+                // the rate off the line rather than filling it with a placeholder
+                // or an infinity — the raw pair below it still says what happened.
+                const DROPPING: &str = "input datagrams from a peer are being discarded; this machine's input queue is full";
+                let window_ms = window.as_millis() as u64;
+                match per_second {
+                    Some(per_second) => tracing::warn!(
+                        peer = %node,
+                        machine = %self.peer_label(node),
+                        dropped = recent,
+                        per_second,
+                        window_ms,
+                        session_total = total,
+                        "{DROPPING}"
+                    ),
+                    None => tracing::warn!(
+                        peer = %node,
+                        machine = %self.peer_label(node),
+                        dropped = recent,
+                        window_ms,
+                        session_total = total,
+                        "{DROPPING}"
+                    ),
+                }
+            }
+            DropReport::Stopped { total } => tracing::info!(
+                peer = %node,
+                machine = %self.peer_label(node),
+                session_total = total,
+                "input datagrams from a peer are no longer being discarded"
+            ),
+            DropReport::Silent => {}
         }
     }
 
@@ -3318,6 +3413,11 @@ impl Engine {
         // the exchange always starts from a fresh connection.
         if let Some(link) = self.sessions.remove(&node) {
             link.session.close("restarting pairing");
+            // This path deliberately leaves the peer's status and backoff alone —
+            // the same pairing is starting again, not a connection ending — but the
+            // drop reading belonged to the session just closed, and left behind it
+            // reports a window of loss on a connection that is gone.
+            self.state.clear_dropped_datagrams(node);
         }
         // Silently, unlike every other removal: this is the same pairing starting
         // again, not one ending. A `PairingFinished` here would race the
@@ -4363,6 +4463,79 @@ fn capability_correction(peer: Capabilities, local: Capabilities) -> Option<Cont
             capabilities: local,
         })
 }
+
+/// What the log should say about one peer's discarded-datagram reading.
+///
+/// See [`drop_report`] for why this is a value rather than three `tracing` calls
+/// in a row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DropReport {
+    /// Input is being discarded now: a line every tick for as long as it lasts.
+    Dropping {
+        recent: u64,
+        window: Duration,
+        /// `recent` over `window`, to one decimal, or `None` when the window is
+        /// too short to divide by.
+        per_second: Option<f64>,
+        total: u64,
+    },
+    /// It was being discarded and has stopped: one closing line.
+    Stopped { total: u64 },
+    /// Nothing to say.
+    Silent,
+}
+
+/// Decide what a tick should log about a peer's discarded-datagram reading.
+///
+/// Split out of [`Engine::note_dropped_datagrams`] because the edges are the part
+/// that can be wrong in a way nobody notices, and an Engine cannot be built in a
+/// test. The falling edge is the one that matters most: a warning that never
+/// closes leaves a reader watching a line that stopped being true, concluding
+/// input is being lost now when it ended minutes ago.
+///
+/// Silent when nothing is arriving and nothing was: a periodic `dropped 0` is how
+/// the one line that matters gets skimmed past on the day it is not zero. Note
+/// that this means silence on a peer whose drops ended before the previous
+/// sample — the closing line has already been printed, and the session total is
+/// in `--status` for anyone asking after the fact.
+///
+/// The rate is derived here rather than left to the reader. `dropped` and
+/// `window_ms` are both on the line, but the window is genuinely measured and so
+/// is an irregular figure like 2140ms, and 12-over-2140ms is not a division
+/// anyone does at a glance. The raw pair stays for whoever reconstructs the
+/// arithmetic afterwards.
+///
+/// `None` below [`RATE_FLOOR`] rather than a division: two samples taken close
+/// together — a session replaced, a tick that fired twice in quick succession —
+/// would otherwise put an infinity, a NaN, or a five-figure rate nobody measured
+/// on a line being read as a measurement.
+fn drop_report(was_dropping: bool, reading: state::DroppedDatagrams) -> DropReport {
+    if reading.recent > 0 {
+        let per_second = (reading.window >= RATE_FLOOR).then(|| {
+            let rate = reading.recent as f64 / reading.window.as_secs_f64();
+            (rate * 10.0).round() / 10.0
+        });
+        DropReport::Dropping {
+            recent: reading.recent,
+            window: reading.window,
+            per_second,
+            total: reading.total,
+        }
+    } else if was_dropping {
+        DropReport::Stopped {
+            total: reading.total,
+        }
+    } else {
+        DropReport::Silent
+    }
+}
+
+/// Shortest measured window [`drop_report`] will state a rate over.
+///
+/// Well under the [`TICK`] a real sample covers, so an ordinary reading always
+/// gets a rate; it only excludes windows short enough that the division says more
+/// about the sampling than about the drops.
+const RATE_FLOOR: Duration = Duration::from_millis(100);
 
 /// Whether clipboard content may cross to a machine at all.
 ///
@@ -7117,5 +7290,85 @@ mod tests {
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].node, node(2).to_hex());
+    }
+
+    fn reading(total: u64, recent: u64, window_ms: u64) -> state::DroppedDatagrams {
+        state::DroppedDatagrams {
+            total,
+            recent,
+            window: Duration::from_millis(window_ms),
+        }
+    }
+
+    #[test]
+    fn drops_arriving_are_reported_every_tick_with_a_rate() {
+        // The rising edge and the ticks after it are the same line on purpose: the
+        // question while a test is running is whether it is happening *now* and
+        // whether it is getting worse, and only a line per sample answers the
+        // second. The rate is derived here because 12-over-2140ms is not a
+        // division anyone does at a glance.
+        assert_eq!(
+            drop_report(false, reading(12, 12, 2140)),
+            DropReport::Dropping {
+                recent: 12,
+                window: Duration::from_millis(2140),
+                per_second: Some(5.6),
+                total: 12,
+            }
+        );
+        assert_eq!(
+            drop_report(true, reading(30, 18, 2000)),
+            DropReport::Dropping {
+                recent: 18,
+                window: Duration::from_millis(2000),
+                per_second: Some(9.0),
+                total: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn drops_that_stop_get_a_closing_line() {
+        // The edge that matters most. Without it someone is left watching a
+        // warning that stopped being true, reading ongoing loss into a run whose
+        // last drop was minutes ago.
+        assert_eq!(
+            drop_report(true, reading(30, 0, 2000)),
+            DropReport::Stopped { total: 30 }
+        );
+    }
+
+    #[test]
+    fn a_run_that_is_not_dropping_says_nothing_at_all() {
+        // Both quiet cases: a peer that has never dropped anything, and one whose
+        // episode was already closed off a sample ago. A periodic `dropped 0`
+        // would train the reader to skim past the line that matters on the day it
+        // is not zero.
+        assert_eq!(drop_report(false, reading(0, 0, 2000)), DropReport::Silent);
+        assert_eq!(drop_report(false, reading(30, 0, 2000)), DropReport::Silent);
+    }
+
+    #[test]
+    fn a_window_too_short_to_divide_by_yields_no_rate() {
+        // A session replaced between two samples measures a window of zero, and
+        // dividing by it would put an infinity on a line being read as a
+        // measurement. The raw count and window still go out.
+        let degenerate = drop_report(false, reading(9, 9, 0));
+        assert_eq!(
+            degenerate,
+            DropReport::Dropping {
+                recent: 9,
+                window: Duration::ZERO,
+                per_second: None,
+                total: 9,
+            }
+        );
+        assert!(matches!(
+            drop_report(false, reading(9, 9, 20)),
+            DropReport::Dropping {
+                per_second: None,
+                ..
+            }
+        ));
     }
 }

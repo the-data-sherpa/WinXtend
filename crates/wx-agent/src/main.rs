@@ -340,13 +340,54 @@ fn describe_displays(status: &ipc::StatusSnapshot) -> String {
     }
 }
 
+/// The discarded-datagram clause of a peer's line, or nothing when there is
+/// nothing to say.
+///
+/// Silent at zero deliberately. Zero is the ordinary case on every peer on every
+/// run, and a `dropped 0` on every line is how the one line that matters gets
+/// skimmed past on the day it is not zero.
+///
+/// The window figure leads when there is one, because it is the fact a person can
+/// act on while a test is still running; the session total follows it, because that
+/// is the one that says whether this has happened before. When the window is quiet
+/// but the total is not, only the total is printed — and it reads in the past tense,
+/// so a run that dropped input an hour ago is not mistaken for one dropping it now.
+///
+/// The wording says "input datagrams", not "packets lost", because the counter
+/// cannot see the network at all — `state::DroppedDatagrams` has the reasoning, and
+/// the two call for opposite responses.
+fn describe_drops(drops: &ipc::DroppedDatagramsSpec) -> Option<String> {
+    if drops.total == 0 {
+        return None;
+    }
+    if drops.recent > 0 {
+        let window = drops.window_ms as f64 / 1000.0;
+        Some(format!(
+            "dropping input: {} datagrams in the last {window:.1}s, {} this session",
+            drops.recent, drops.total
+        ))
+    } else {
+        Some(format!(
+            "dropped {} input datagrams this session",
+            drops.total
+        ))
+    }
+}
+
 /// How a peer's state reads in one line.
 fn describe(peer: &ipc::PeerSnapshot) -> (&'static str, String) {
     match &peer.status {
         ipc::PeerStatusSpec::Failed { error } => ("failed", error.clone()),
         ipc::PeerStatusSpec::Connected => (
             "connected",
-            peer.rtt_ms.map(|ms| format!("{ms}ms")).unwrap_or_default(),
+            [
+                peer.rtt_ms.map(|ms| format!("{ms}ms")),
+                peer.dropped_datagrams.as_ref().and_then(describe_drops),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", "),
         ),
         ipc::PeerStatusSpec::Pairing => ("pairing", "waiting for a code".into()),
         ipc::PeerStatusSpec::Connecting => ("connecting", String::new()),
@@ -667,6 +708,70 @@ mod tests {
         ));
         assert!(line.starts_with("DP-2 3440x1440"), "{line}");
         assert!(line.contains("last known"), "{line}");
+    }
+
+    fn connected_peer(drops: Option<ipc::DroppedDatagramsSpec>) -> ipc::PeerSnapshot {
+        ipc::PeerSnapshot {
+            node: "b05a98b3".repeat(8),
+            name: "cowen-workhorse".into(),
+            advertised_name: "cowen-workhorse".into(),
+            status: ipc::PeerStatusSpec::Connected,
+            paired: true,
+            blocked: false,
+            enabled: true,
+            addresses: Vec::new(),
+            platform: Some("linux".into()),
+            agent_version: Some("0.1.0".into()),
+            rtt_ms: Some(2),
+            monitors: Vec::new(),
+            capabilities: 0,
+            dropped_datagrams: drops,
+        }
+    }
+
+    fn drops(total: u64, recent: u64) -> ipc::DroppedDatagramsSpec {
+        ipc::DroppedDatagramsSpec {
+            total,
+            recent,
+            window_ms: 2_000,
+        }
+    }
+
+    #[test]
+    fn a_peer_that_has_dropped_no_input_says_nothing_about_it() {
+        // Zero is the ordinary case on every peer on every run. Printing it anyway
+        // is how the one line that matters gets skimmed past on the day it is not
+        // zero.
+        let (state, detail) = describe(&connected_peer(Some(drops(0, 0))));
+        assert_eq!(state, "connected");
+        assert_eq!(detail, "2ms");
+        // And a peer with no session at all carries no figure to print.
+        assert_eq!(describe(&connected_peer(None)).1, "2ms");
+    }
+
+    #[test]
+    fn input_being_dropped_right_now_reads_differently_from_input_dropped_earlier() {
+        // The distinction the whole field exists for: a person watching a test has
+        // to be able to tell "this is happening as I look at it" from "this happened
+        // at some point during the run", and a running total alone cannot say which.
+        let live = describe(&connected_peer(Some(drops(48, 12)))).1;
+        assert!(live.contains("12 datagrams in the last 2.0s"), "{live}");
+        assert!(live.contains("48 this session"), "{live}");
+
+        let over = describe(&connected_peer(Some(drops(48, 0)))).1;
+        assert!(over.contains("48 input datagrams this session"), "{over}");
+        assert!(!over.contains("last"), "{over}");
+    }
+
+    #[test]
+    fn the_dropped_input_line_does_not_claim_the_network_lost_anything() {
+        // The counter cannot see network loss — a datagram the wire dropped never
+        // arrives to be counted. Wording it as lost packets would point whoever read
+        // it at the opposite of the cause, and the two call for opposite responses.
+        let line = describe(&connected_peer(Some(drops(48, 12)))).1;
+        assert!(!line.contains("lost"), "{line}");
+        assert!(!line.contains("packet"), "{line}");
+        assert!(line.contains("input"), "{line}");
     }
 
     #[test]

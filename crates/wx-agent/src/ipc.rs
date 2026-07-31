@@ -78,7 +78,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use wx_proto::{Capabilities, Layout, Monitor, MonitorId, NodeId, Rect};
 
 use crate::config::{Config, SavedLayout};
-use crate::state::{AgentState, ConnStatus, PeerState};
+use crate::state::{AgentState, ConnStatus, DroppedDatagrams, PeerState};
 
 /// File in the config directory that tells a client where to connect.
 pub const ENDPOINT_FILE: &str = "ipc.json";
@@ -630,6 +630,50 @@ pub struct PeerSnapshot {
     /// each machine will actually do rather than what the software wishes it would.
     #[serde(default)]
     pub capabilities: u32,
+    /// Motion datagrams this machine took off the wire from this peer and threw
+    /// away, with the count for the most recent sampling window beside the total.
+    ///
+    /// Carried in the status rather than only logged for the reason
+    /// [`StatusSnapshot::firewall`] is, and per peer rather than as one figure for
+    /// the machine because a single number mixing every session would be worse
+    /// than none: the counter belongs to one connection, and what a reader needs
+    /// is which peer's traffic is not being kept up with. `None` while no session
+    /// exists — see [`crate::state::PeerState::dropped_datagrams`].
+    ///
+    /// Not a measure of network loss. [`crate::state::DroppedDatagrams`] says why
+    /// the difference matters before anyone acts on this.
+    #[serde(default)]
+    pub dropped_datagrams: Option<DroppedDatagramsSpec>,
+}
+
+/// Discarded motion datagrams for one peer, as JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedDatagramsSpec {
+    /// Total for the session that is up now; a reconnect starts it again at zero.
+    pub total: u64,
+    /// How many arrived within the last `window_ms`. This is the figure that says
+    /// whether loss is happening now rather than whether it ever did, and it is
+    /// the reason this is not simply the raw counter.
+    pub recent: u64,
+    /// The window `recent` was counted over, so a UI can render a rate without
+    /// hard-coding the agent's tick interval — a constant it cannot see, and one
+    /// it would go on using after the agent changed it.
+    ///
+    /// The interval the agent measured between the two samples, not the interval
+    /// it aimed for. Those diverge when the agent is behind, which is the only
+    /// condition that puts a figure in `recent` at all.
+    pub window_ms: u64,
+}
+
+impl DroppedDatagramsSpec {
+    pub fn of(drops: &DroppedDatagrams) -> Self {
+        Self {
+            total: drops.total,
+            recent: drops.recent,
+            window_ms: drops.window.as_millis() as u64,
+        }
+    }
 }
 
 impl PeerSnapshot {
@@ -651,6 +695,10 @@ impl PeerSnapshot {
             rtt_ms: peer.rtt.map(|d| d.as_millis() as u64),
             monitors: peer.monitors().iter().map(MonitorSpec::of).collect(),
             capabilities: peer.capabilities().0,
+            dropped_datagrams: peer
+                .dropped_datagrams
+                .as_ref()
+                .map(DroppedDatagramsSpec::of),
         }
     }
 }
@@ -1408,6 +1456,60 @@ mod tests {
         assert!(typing_it.contains(r#""pin":null"#), "{typing_it}");
     }
 
+    /// The same trap as the pairing snapshot above, and the same reason for
+    /// spelling the names out.
+    ///
+    /// `droppedText` in ui/src/format.js reads `total`, `recent` and `windowMs`
+    /// off the parsed peer, and treats a missing object as "no session" — which is
+    /// exactly what a renamed field would look like from there. The window would go
+    /// on showing every peer as having no session for the whole of a test run, with
+    /// every Rust test and every vitest still green, and the number would be
+    /// missing at the one moment someone was watching for it.
+    #[test]
+    fn a_peers_dropped_input_reaches_the_ui_under_the_names_it_reads() {
+        let drops = DroppedDatagramsSpec {
+            total: 48,
+            recent: 12,
+            window_ms: 2_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&drops).unwrap(),
+            r#"{"total":48,"recent":12,"windowMs":2000}"#
+        );
+
+        let peer = serde_json::to_string(&PeerSnapshot {
+            node: NodeId([2u8; 32]).to_hex(),
+            name: "workhorse".into(),
+            advertised_name: "workhorse".into(),
+            status: PeerStatusSpec::Connected,
+            paired: true,
+            blocked: false,
+            enabled: true,
+            addresses: Vec::new(),
+            platform: None,
+            agent_version: None,
+            rtt_ms: Some(2),
+            monitors: Vec::new(),
+            capabilities: 0,
+            dropped_datagrams: Some(drops),
+        })
+        .unwrap();
+        assert!(
+            peer.contains(r#""droppedDatagrams":{"total":48,"recent":12,"windowMs":2000}"#),
+            "{peer}"
+        );
+
+        // A peer with no session omits nothing and claims nothing: the window
+        // reads that as "no connection to have dropped anything on", which is not
+        // the same answer as zero.
+        let idle = serde_json::to_string(&PeerSnapshot {
+            dropped_datagrams: None,
+            ..serde_json::from_str::<PeerSnapshot>(&peer).unwrap()
+        })
+        .unwrap();
+        assert!(idle.contains(r#""droppedDatagrams":null"#), "{idle}");
+    }
+
     #[test]
     fn responses_and_events_are_distinguishable_without_looking_at_the_id() {
         let response = serde_json::to_string(&ServerMessage::Response {
@@ -1588,6 +1690,11 @@ mod tests {
                 capabilities: (wx_proto::Capabilities::CAPTURE_INPUT
                     | wx_proto::Capabilities::INJECT_INPUT)
                     .0,
+                dropped_datagrams: Some(DroppedDatagramsSpec {
+                    total: 48,
+                    recent: 12,
+                    window_ms: 2_000,
+                }),
             }],
         };
         let msg = ServerMessage::Response {

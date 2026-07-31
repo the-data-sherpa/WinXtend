@@ -128,6 +128,14 @@ encoded in one place, `InputEvent::reliability()`, and the sequence gate that
 discards reordered motion is explicitly forbidden from discarding a late
 button-release.
 
+One kind of drop is *not* by design: motion that arrived, decoded, and was then
+thrown away because the receiving machine's input queue was already full. That is
+the input loop on that machine falling behind rather than anything the network
+did, and the two present identically as "feels laggy", so it is counted per peer
+and said out loud — in `wx-agent --status`, in the UI's status screen, and in the
+log for as long as it is still happening. It is never a count of packets the
+network lost: those never arrive to be counted.
+
 ### Keystrokes cross the wire as text, not scancodes
 
 Sending scancodes is what forces every Synergy-lineage tool to demand identical
@@ -272,6 +280,13 @@ estimate.
 | Screen streaming | ❌ crate exists, not wired into the agent |
 | Relay for cross-NAT / VPN | ❌ not started |
 | Wayland | ⚠️ display enumeration, input injection, input capture — including real local suppression — and clipboard sync have landed; a Wayland machine has now driven the cursor onto a second physical machine once, over a real network, which leaves clipboard sync across machines, a clean-machine first run, and any validation beyond that single session as what is left of the alpha. Wayland input is the standing gap in every other tool in this space |
+
+Everything above that has happened between two physical machines happened over wired
+Ethernet, and the pair available to test on has only one radio between them, so
+wireless is untested end to end: the jitter, the loss pattern and the address change
+a roam produces have never been put in front of this software, and no run on this
+hardware can close that — read any validation of the two-machine path as covering
+wired links only.
 
 ## Installing on Ubuntu
 

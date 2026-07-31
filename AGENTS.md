@@ -562,6 +562,36 @@ reached and not that the portal answers; the agent-side bounded retry
 does. Read the rules on `retry_after` before touching either: a retry that could raise a
 consent dialog is a worse bug than the one both exist to fix.
 
+## The dropped-datagram counter cannot see the network, and the mistake inverts the diagnosis
+
+`Session::dropped_datagrams` (`crates/wx-net/src/transport.rs`) counts motion datagrams
+that **arrived and decoded** and were then thrown away because the local event queue was
+full. A datagram the network lost never reaches it and is counted nowhere, so a non-zero
+value never means "the link is lossy" — it means this machine's input loop has fallen
+behind, which is a defect, whereas loss on the wire is the design working (motion is
+`BestEffort` so a stale position is superseded, not retransmitted). The two call for
+opposite responses and both otherwise present only as "feels laggy". `DroppedDatagrams`
+in `crates/wx-agent/src/state.rs` carries the full reasoning; read it before wording
+anything user-facing about this number, and do not describe it as packet loss.
+
+It reaches a person two ways, both per peer: a `warn` line each tick while the count is
+moving (with a stop line when it settles), and `PeerSnapshot::dropped_datagrams` in
+`--status` and the UI. Both are deliberate — the snapshot total alone answers "did this
+ever happen", and the question during a test run is "is it happening now", which needs
+the window figure the log carries live. That window is measured between samples rather
+than assumed from the tick constant, because the sampling tick and the peer events being
+dropped share one serial wake loop: the tick that reads a non-zero count has queued
+behind the backlog that caused it, so the constant would name a shorter window than was
+actually covered and overstate the rate.
+
+A zero here is much weaker evidence than a non-zero figure, and a validation run should
+not read it as proof the input loop kept up. `send_datagram` falls back to the reliable
+stream when the path MTU is too small or the peer never enabled datagrams, and the stream
+reader waits on a full queue instead of discarding — so on such a session motion never
+travels as a datagram, a backed-up consumer presents as latency, and this stays at zero
+however far behind things get. A moving count is evidence; a zero is only the absence of
+it.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

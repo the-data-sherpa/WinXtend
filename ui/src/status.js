@@ -15,6 +15,7 @@ import {
   connectionState,
   displayServerLabel,
   displaysText,
+  droppedText,
   latency,
   nodeColor,
   platformLabel,
@@ -241,6 +242,11 @@ function peersPanel() {
           h("th", {}, "Machine"),
           h("th", {}, "State"),
           h("th", {}, "Round trip"),
+          // Input this machine could not keep up with, not input the network lost —
+          // see `droppedText`. Beside the round trip because the two are read
+          // together: a healthy RTT with a moving count here is the input loop
+          // falling behind, which is the reading the number exists to make possible.
+          h("th", {}, "Input dropped"),
           h("th", {}, "Displays"),
           h("th", {}, "Address")
         )
@@ -262,6 +268,7 @@ function peersPanel() {
             ),
             h("td", {}, h("span", { class: `pill ${state.tone}` }, state.label)),
             h("td", {}, latency(peer.rttMs)),
+            h("td", {}, droppedText(peer.droppedDatagrams)),
             h("td", {}, String(peer.monitors?.length ?? 0)),
             h("td", { class: "mono small" }, peer.addresses?.[0] || "not known")
           );
