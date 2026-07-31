@@ -659,6 +659,10 @@ pub struct DroppedDatagramsSpec {
     /// The window `recent` was counted over, so a UI can render a rate without
     /// hard-coding the agent's tick interval — a constant it cannot see, and one
     /// it would go on using after the agent changed it.
+    ///
+    /// The interval the agent measured between the two samples, not the interval
+    /// it aimed for. Those diverge when the agent is behind, which is the only
+    /// condition that puts a figure in `recent` at all.
     pub window_ms: u64,
 }
 

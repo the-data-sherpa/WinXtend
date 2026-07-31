@@ -2637,6 +2637,7 @@ impl Engine {
         if !self.state.is_reachable(node) {
             if let Some(link) = self.sessions.remove(&node) {
                 link.session.close(why);
+                self.state.clear_dropped_datagrams(node);
             }
             self.gates.remove(&node);
         }
@@ -2945,7 +2946,7 @@ impl Engine {
             .collect();
         for (node, rtt, dropped) in readings {
             self.state.set_rtt(node, rtt);
-            self.note_dropped_datagrams(node, dropped);
+            self.note_dropped_datagrams(node, dropped, now);
         }
 
         // Pairings nobody finished. These hold a session from an untrusted peer
@@ -3010,27 +3011,35 @@ impl Engine {
     /// `warn` rather than `info` because the condition is a defect by construction:
     /// dropping motion because the wire lost it is the design, dropping motion that
     /// already arrived is the input loop falling behind.
-    fn note_dropped_datagrams(&mut self, node: NodeId, total: u64) {
+    ///
+    /// `window_ms` is the interval the state measured between this sample and the
+    /// last, not [`TICK`]. This loop is the one place the difference bites: a tick
+    /// is dispatched from the same serial wake channel as the peer events whose
+    /// backlog causes the drops, so the tick that finds a non-zero count is one
+    /// that queued behind that backlog and covers longer than `TICK`. Printing the
+    /// constant would report a rate up to half again what was measured, on the one
+    /// line somebody is reading as a measurement.
+    fn note_dropped_datagrams(&mut self, node: NodeId, total: u64, now: Instant) {
         let was_dropping = self
             .state
             .peer(&node)
             .and_then(|p| p.dropped_datagrams)
             .is_some_and(|d| d.recent > 0);
-        let Some(now) = self.state.sample_dropped_datagrams(node, total, TICK) else {
+        let Some(reading) = self.state.sample_dropped_datagrams(node, total, now) else {
             return;
         };
-        if now.recent > 0 {
+        if reading.recent > 0 {
             tracing::warn!(
                 peer = %node,
-                dropped = now.recent,
-                window_ms = TICK.as_millis() as u64,
-                session_total = now.total,
+                dropped = reading.recent,
+                window_ms = reading.window.as_millis() as u64,
+                session_total = reading.total,
                 "input datagrams from a peer are being discarded; this machine's input queue is full"
             );
         } else if was_dropping {
             tracing::info!(
                 peer = %node,
-                session_total = now.total,
+                session_total = reading.total,
                 "input datagrams from a peer are no longer being discarded"
             );
         }
@@ -3367,6 +3376,11 @@ impl Engine {
         // the exchange always starts from a fresh connection.
         if let Some(link) = self.sessions.remove(&node) {
             link.session.close("restarting pairing");
+            // This path deliberately leaves the peer's status and backoff alone —
+            // the same pairing is starting again, not a connection ending — but the
+            // drop reading belonged to the session just closed, and left behind it
+            // reports a window of loss on a connection that is gone.
+            self.state.clear_dropped_datagrams(node);
         }
         // Silently, unlike every other removal: this is the same pairing starting
         // again, not one ending. A `PairingFinished` here would race the

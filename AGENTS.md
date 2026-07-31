@@ -555,7 +555,19 @@ It reaches a person two ways, both per peer: a `warn` line each tick while the c
 moving (with a stop line when it settles), and `PeerSnapshot::dropped_datagrams` in
 `--status` and the UI. Both are deliberate — the snapshot total alone answers "did this
 ever happen", and the question during a test run is "is it happening now", which needs
-the window figure the log carries live.
+the window figure the log carries live. That window is measured between samples rather
+than assumed from the tick constant, because the sampling tick and the peer events being
+dropped share one serial wake loop: the tick that reads a non-zero count has queued
+behind the backlog that caused it, so the constant would name a shorter window than was
+actually covered and overstate the rate.
+
+A zero here is much weaker evidence than a non-zero figure, and a validation run should
+not read it as proof the input loop kept up. `send_datagram` falls back to the reliable
+stream when the path MTU is too small or the peer never enabled datagrams, and the stream
+reader waits on a full queue instead of discarding — so on such a session motion never
+travels as a datagram, a backed-up consumer presents as latency, and this stays at zero
+however far behind things get. A moving count is evidence; a zero is only the absence of
+it.
 
 ## Maintaining this file
 
