@@ -60,9 +60,10 @@ layout editor.
 >   over the network — which is the only part of the X11 backend watched working
 >   rather than only tested. Its clipboard is a skeleton: all four operations return
 >   a not-implemented error, so an X11 machine advertises no clipboard capability at
->   all. macOS and evdev are further back than either: compiling skeletons,
->   documented down to the exact syscall sequences and implemented no further. On
->   those two the agent starts and does nothing.
+>   all — deferred past alpha rather than ruled out, and tracked in #39. macOS and
+>   evdev are further back than either: compiling skeletons, documented down to the
+>   exact syscall sequences and implemented no further. On those two the agent
+>   starts and does nothing.
 > - **A cursor has crossed between two physical machines exactly once. A clipboard
 >   never has.** On 2026-07-30 the cursor moved over a real network between a
 >   Wayland machine doing the driving and an X11 machine being driven, both running
@@ -77,7 +78,7 @@ layout editor.
 >   agents sharing one physical clipboard. Issue #11 is the two-machine test, and
 >   only its cursor half has been performed: the clipboard half has not been
 >   attempted between two machines, and cannot be with an X11 machine at either
->   end, because X11 has no clipboard implementation to attempt it with.
+>   end, because X11 has no clipboard implementation yet to attempt it with.
 > - **Screen streaming is not connected.** `wx-video` compiles and its tests
 >   pass, but nothing depends on it and the agent hardcodes a refusal in the
 >   `ControlMsg::VideoStart | ControlMsg::VideoReconfigure` arm of
@@ -220,7 +221,7 @@ for what the next release is about.
 | Display enumeration | ✅ | ⚠️ | ✅ RandR outputs and CRTCs | ✅ `wl_output`/`xdg_output` | n/a |
 | Input capture | ✅ | ⚠️ | ⛔ | ✅ libei via the InputCapture portal | ⚠️ |
 | Input injection | ✅ | ⚠️ | ✅ XTEST | ✅ libei via the RemoteDesktop portal | ⚠️ |
-| Clipboard | ✅ text/HTML/PNG/files | ⚠️ | ⚠️ | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
+| Clipboard | ✅ text/HTML/PNG/files | ⚠️ | ⚠️ deferred past alpha, #39 | ✅ text/HTML/PNG/files via the Clipboard portal | n/a |
 | Screen capture | ✅ GDI | ⚠️ | ⚠️ | ⚠️ | n/a |
 
 ✅ implemented · ⚠️ compiling skeleton, requirements documented, no implementation ·
@@ -234,13 +235,25 @@ took the cursor from a Wayland machine over a real network. It cannot *drive*:
 capture and local suppression were deliberately left out, because capture needs an
 exclusive `XIGrabDevice` whose worst failure leaves the local desktop apparently
 frozen, so it is a separate piece of work rather than half of this one. An X11
-machine is therefore never the machine you type at. Three further limits are stated
-where they bite: the clipboard is unimplemented — all four operations return a
-not-implemented error and no clipboard capability is advertised, so clipboard sync
-with an X11 machine at either end is not merely untested but impossible today; a
-character the receiving layout cannot produce is refused with a log line rather than
-mistyped (there is no scratch-keycode remap yet); and X11 has no per-monitor DPI, so
-screens are reported at raw pixel size with a scale of 1.0.
+machine is therefore never the machine you type at. Two further limits are stated
+where they bite: a character the receiving layout cannot produce is refused with a
+log line rather than mistyped (there is no scratch-keycode remap yet); and X11 has
+no per-monitor DPI, so screens are reported at raw pixel size with a scale of 1.0.
+
+**The X11 clipboard is deferred past alpha, not declined.** All four operations in
+`crates/wx-platform/src/linux_x11/` return a not-implemented error today, so an X11
+machine advertises no clipboard capability and clipboard sync does not happen with
+one at either end. Only one of those directions says so out loud: a peer that copies
+names the missing capability in a warning, while copying on the X11 machine itself is
+logged at trace level and an offer that reaches an X11 machine anyway at debug — so
+the paste that never arrives is the quiet case. That is a scope choice: alpha targets
+Linux/Wayland (#12), where the clipboard works. It is not a barrier. The Synergy
+lineage this project takes its shape from — Synergy, Barrier, Input Leap,
+Deskflow — has shipped X11 clipboard for years. It is simply more work than the
+Wayland path, because X11 has no clipboard storage at all, only the ICCCM
+selection-ownership protocol, which needs a long-lived window and event loop rather
+than a function call. Issue #39 carries the mechanism, the prior art and the cost
+estimate.
 
 | Feature | State |
 |---|---|
@@ -462,7 +475,8 @@ It is on for every paired machine and needs no configuration. Each side also has
 to advertise the matching capability — on Wayland that means the clipboard toggle
 in the `xdg-desktop-portal` consent dialog, which can be refused while input is
 allowed — and a machine that has not advertised it is named in a warning rather
-than quietly skipped.
+than quietly skipped. An X11 machine never advertises it: that backend's clipboard
+is deferred past alpha, tracked in #39.
 
 To turn it off for one peer, add its full hex node ID to `config.toml`.
 `wx-agent --status` prints only the first eight characters; the whole ID is a key
@@ -601,8 +615,11 @@ The alpha is Linux/Wayland. Roughly in order of value:
 3. **A UI control for the per-peer clipboard switch.** The setting is honoured
    today but only reachable by editing `config.toml` — see
    [Sharing the clipboard](#sharing-the-clipboard).
-4. **The macOS backend.**
-5. **Screen streaming, once there is a backend to stream from.** This is the one
+4. **The X11 clipboard**, deliberately left out of alpha. The ICCCM selection
+   protocol it needs is well-trodden ground in the Synergy lineage; issue #39 has
+   the mechanism, the prior art and the estimate.
+5. **The macOS backend.**
+6. **Screen streaming, once there is a backend to stream from.** This is the one
    place WinXtend would reach past a classic software KVM: a machine with no
    monitor attached sending its screen to the UI, so a headless mini-PC is usable
    rather than merely reachable. It is **not connected today** — `wx-video` exists
@@ -613,7 +630,7 @@ The alpha is Linux/Wayland. Roughly in order of value:
    also means a real codec behind the existing `Encoder` seam; the current
    lossless passthrough is LAN-only. Even finished, it needs the agent running, so
    it would never be a bare-metal rescue tool.
-6. A relay for machines on different networks or across a VPN.
+7. A relay for machines on different networks or across a VPN.
 
 ## Prior art
 
