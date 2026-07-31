@@ -243,14 +243,17 @@ no per-monitor DPI, so screens are reported at raw pixel size with a scale of 1.
 **The X11 clipboard is deferred past alpha, not declined.** All four operations in
 `crates/wx-platform/src/linux_x11/` return a not-implemented error today, so an X11
 machine advertises no clipboard capability and clipboard sync does not happen with
-one at either end — which the agent names in a warning rather than skipping quietly.
-That is a scope choice: alpha targets Linux/Wayland (#12), where the clipboard
-works. It is not a barrier. The Synergy lineage this project takes its shape from —
-Synergy, Barrier, Input Leap, Deskflow — has shipped X11 clipboard for years. It is
-simply more work than the Wayland path, because X11 has no clipboard storage at all,
-only the ICCCM selection-ownership protocol, which needs a long-lived window and
-event loop rather than a function call. Issue #39 carries the mechanism, the prior
-art and the cost estimate.
+one at either end. Only one of those directions says so out loud: a peer that copies
+names the missing capability in a warning, while copying on the X11 machine itself is
+logged at trace level and an offer that reaches an X11 machine anyway at debug — so
+the paste that never arrives is the quiet case. That is a scope choice: alpha targets
+Linux/Wayland (#12), where the clipboard works. It is not a barrier. The Synergy
+lineage this project takes its shape from — Synergy, Barrier, Input Leap,
+Deskflow — has shipped X11 clipboard for years. It is simply more work than the
+Wayland path, because X11 has no clipboard storage at all, only the ICCCM
+selection-ownership protocol, which needs a long-lived window and event loop rather
+than a function call. Issue #39 carries the mechanism, the prior art and the cost
+estimate.
 
 | Feature | State |
 |---|---|
