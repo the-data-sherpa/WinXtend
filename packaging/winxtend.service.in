@@ -19,9 +19,13 @@
 #     user on the machine without anyone having written a file.
 #
 # A unit in `~/.config/systemd/user` shadows one of the same name in
-# `/usr/lib/systemd/user`, so having both is not a conflict: after a `.deb`
-# install both name `/usr/bin/wx-agent` anyway, because that is what
-# `current_exe()` reports for the packaged agent.
+# `/usr/lib/systemd/user`, which is what makes running from a checkout work on
+# a machine that also has the package. It is also why `--install` does not write
+# one where it does not have to: after a `.deb` install the packaged copy
+# already names `/usr/bin/wx-agent`, which is what `current_exe()` reports for
+# the packaged agent, so registering links that copy and removes any local one
+# rather than pinning a snapshot of a path no upgrade can revise. See
+# `install_in` in crates/wx-agent/src/autostart.rs.
 #
 # # Why a user unit and not a system one
 #
