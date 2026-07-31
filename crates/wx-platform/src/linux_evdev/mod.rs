@@ -30,7 +30,7 @@ use wx_proto::{
 
 use crate::error::{PlatformError, Result};
 use crate::traits::{
-    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
+    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector, ScreenExits,
     ScreenSaverControl,
 };
 use crate::{PlatformBackend, PlatformInfo};
@@ -92,6 +92,16 @@ impl InputCapture for EvdevCapture {
 
     fn suppresses_local(&self) -> bool {
         false
+    }
+
+    /// Accepted and ignored: nothing here can take the pointer at a screen edge.
+    ///
+    /// The rule this carries is about backends that let the OS hand them the
+    /// cursor when it reaches an edge. This one captures nothing at all, so there
+    /// is no edge to arm and nothing to get wrong. An error would be a false
+    /// alarm on every layout change.
+    fn set_exits(&mut self, _exits: &[ScreenExits]) -> Result<()> {
+        Ok(())
     }
 }
 

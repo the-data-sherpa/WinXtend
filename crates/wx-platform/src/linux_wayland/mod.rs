@@ -139,7 +139,7 @@ use wx_proto::{
 
 use crate::error::{PlatformError, Result};
 use crate::traits::{
-    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
+    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector, ScreenExits,
     ScreenSaverControl,
 };
 use crate::{LiveCapabilities, PlatformBackend, PlatformInfo};
@@ -390,6 +390,20 @@ impl InputCapture for WaylandCapture {
 
     fn suppresses_local(&self) -> bool {
         self.session.state.suppresses_local()
+    }
+
+    /// The one backend where this decides anything.
+    ///
+    /// A pointer barrier is a request to be handed the cursor when it reaches a
+    /// line, so the set of barriers this session places *is* the set of edges that
+    /// will take the pointer. [`capture::barriers_for`] carries the argument.
+    ///
+    /// Deliberately not gated on the session being startable, for the same reason
+    /// [`InputCapture::stop`] is not: this is how the agent narrows what may grab
+    /// the cursor, and a narrowing must never be refused because the session is
+    /// still coming up. It is recorded and applied when the session arrives.
+    fn set_exits(&mut self, exits: &[ScreenExits]) -> Result<()> {
+        self.session.state.set_exits(exits.to_vec())
     }
 }
 

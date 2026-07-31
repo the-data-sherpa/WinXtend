@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use wx_proto::{KeyPayload, MouseButton, Point, ScrollUnit, SpecialKey};
+use wx_proto::{Edge, KeyPayload, MouseButton, Point, ScrollUnit, SpecialKey};
 
 use super::*;
 use crate::linux_wayland::keymap::tests::{NO, NO_NAMED, US};
@@ -177,9 +177,18 @@ impl Harness {
     }
 
     /// No sink and no driver: for the rules about the trait's own contract.
+    ///
+    /// Laid out with a peer to the right and nothing on the other three sides,
+    /// which is what [`Harness::activate`] crosses into. Declared before the
+    /// control hook goes in so that arming it queues no command for a test to
+    /// have to step over.
     fn bare() -> Self {
+        let state = CaptureState::new();
+        state
+            .set_exits(vec![exits(SCREEN, &[Edge::Right])])
+            .expect("declaring where the peers are cannot fail");
         Self {
-            state: CaptureState::new(),
+            state,
             events: Arc::new(Mutex::new(Vec::new())),
             commands: Arc::new(Mutex::new(Vec::new())),
         }
@@ -255,13 +264,138 @@ const SCREEN_RIGHT: Zone = Zone {
     h: 1080,
 };
 
+/// What the agent says about one screen.
+fn exits(zone: Zone, edges: &[Edge]) -> ScreenExits {
+    ScreenExits {
+        bounds: wx_proto::Rect::new(zone.x, zone.y, zone.w as u32, zone.h as u32),
+        edges: edges.to_vec(),
+    }
+}
+
+/// A machine with something beyond every edge of every screen.
+///
+/// What the old `barriers_for` assumed unconditionally, and now has to be told.
+/// Used by the tests about barrier *geometry*, which is a separate question from
+/// which edges are live.
+fn surrounded(zones: &[Zone]) -> Vec<ScreenExits> {
+    zones
+        .iter()
+        .map(|z| exits(*z, &[Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]))
+        .collect()
+}
+
+/// `cowen-ubuntu` as the portal reports it, in its own desktop space.
+///
+/// The screen the bug was reported on. In the global layout it sits at
+/// (6512, 5) with `cowen-workhorse` flush against its left-hand edge and nothing
+/// on the other three sides; locally it is a screen at the origin like any other,
+/// which is the whole reason this layer cannot answer the question itself.
+const UBUNTU: Zone = Zone {
+    x: 0,
+    y: 0,
+    w: 3072,
+    h: 1728,
+};
+
+#[test]
+fn an_edge_with_no_machine_beyond_it_is_not_armed() {
+    // The reported bug, at the layer it is decided. One peer, on the left. The
+    // other three edges must be ordinary screen edges: a barrier on any of them is
+    // a request to be handed the pointer, and there is nowhere to send it.
+    let plans = barriers_for(&[UBUNTU], &[exits(UBUNTU, &[Edge::Left])]);
+    assert_eq!(
+        plans.iter().map(|p| p.edge).collect::<Vec<_>>(),
+        vec![BarrierEdge::Left],
+        "only the edge with a machine beyond it may be armed"
+    );
+    // And still in the right place, so the crossing that should work still does.
+    assert_eq!(plans[0].position, (0, 0, 0, 1727));
+    assert_eq!(plans[0].zone, UBUNTU);
+    assert_eq!(
+        plans[0].id, 1,
+        "ids stay 1-based and gap-free after filtering"
+    );
+}
+
+#[test]
+fn a_machine_with_no_neighbours_anywhere_arms_nothing() {
+    // A lone machine, or every peer removed from the layout. Not an error and not
+    // a degraded mode: the pointer stops on all four sides, exactly as it does
+    // with nothing running.
+    assert!(barriers_for(&[UBUNTU], &[exits(UBUNTU, &[])]).is_empty());
+}
+
+#[test]
+fn a_screen_the_layout_does_not_place_arms_nothing() {
+    // A monitor absent from the layout is one the router refuses to resolve any
+    // crossing from, so a barrier on it could only ever pin the pointer. Failing
+    // closed also covers the moment before the agent has said anything at all.
+    assert!(barriers_for(&[UBUNTU], &[]).is_empty());
+    // An answer that describes some other screen entirely is not an answer about
+    // this one, and must not be borrowed for it.
+    let elsewhere = Zone {
+        x: 9000,
+        y: 9000,
+        w: 1920,
+        h: 1080,
+    };
+    assert!(barriers_for(&[UBUNTU], &[exits(elsewhere, &[Edge::Left])]).is_empty());
+}
+
+#[test]
+fn a_screen_is_recognised_without_the_two_rectangles_being_identical() {
+    // The portal's regions and the monitors `display` enumerates were measured to
+    // agree exactly, but a *safety* decision must not rest on that: a one-pixel
+    // disagreement would leave the screen unmatched and unarmed, which is a
+    // machine that silently stops driving anything.
+    let reported = Zone {
+        x: 0,
+        y: 0,
+        w: 3071,
+        h: 1727,
+    };
+    let plans = barriers_for(&[reported], &[exits(UBUNTU, &[Edge::Left])]);
+    assert_eq!(
+        plans.iter().map(|p| p.edge).collect::<Vec<_>>(),
+        vec![BarrierEdge::Left]
+    );
+}
+
+#[test]
+fn each_screen_is_armed_from_its_own_answer() {
+    // Two local screens, a peer beyond the right-hand one only. The left screen's
+    // outer edges are live nowhere, and the shared seam is skipped on both sides —
+    // so exactly one barrier survives on a desktop with eight outer edges.
+    let zones = [SCREEN, SCREEN_RIGHT];
+    let plans = barriers_for(
+        &zones,
+        &[exits(SCREEN, &[]), exits(SCREEN_RIGHT, &[Edge::Right])],
+    );
+    assert_eq!(
+        plans.iter().map(|p| (p.zone, p.edge)).collect::<Vec<_>>(),
+        vec![(SCREEN_RIGHT, BarrierEdge::Right)]
+    );
+}
+
+#[test]
+fn a_seam_between_two_local_screens_stays_unarmed_however_the_layout_answers() {
+    // The layout has no way to say "not across your own seam" — it sees the two
+    // monitors as adjacent and will happily report a neighbour there. The physical
+    // check has to win, or moving between the user's own screens activates capture.
+    let zones = [SCREEN, SCREEN_RIGHT];
+    let plans = barriers_for(&zones, &surrounded(&zones));
+    let armed: Vec<(Zone, BarrierEdge)> = plans.iter().map(|p| (p.zone, p.edge)).collect();
+    assert!(!armed.contains(&(SCREEN, BarrierEdge::Right)));
+    assert!(!armed.contains(&(SCREEN_RIGHT, BarrierEdge::Left)));
+}
+
 #[test]
 fn a_barrier_line_sits_on_the_boundary_and_its_extent_stops_one_short() {
     // Measured against the live compositor, and asymmetric in a way that is not
     // guessable: the line is at `offset + size`, the extent along it stops at
     // `offset + size - 1`. Both wrong forms are refused *silently*, losing that
     // edge and with it the only way the cursor leaves by it.
-    let plans = barriers_for(&[SCREEN]);
+    let plans = barriers_for(&[SCREEN], &surrounded(&[SCREEN]));
     assert_eq!(
         plans.iter().map(|p| p.id).collect::<Vec<_>>(),
         vec![1, 2, 3, 4],
@@ -282,7 +416,8 @@ fn the_seam_between_two_of_the_users_own_screens_is_left_unarmed() {
     // seam, local windows go quiet, and nothing claims the cursor — so the pull-back
     // guard, which measures the axis in the crossing direction, never fires for a
     // user carrying on across their own desktop.
-    let plans = barriers_for(&[SCREEN, SCREEN_RIGHT]);
+    let zones = [SCREEN, SCREEN_RIGHT];
+    let plans = barriers_for(&zones, &surrounded(&zones));
     let armed: Vec<(Zone, BarrierEdge)> = plans.iter().map(|p| (p.zone, p.edge)).collect();
     assert!(!armed.contains(&(SCREEN, BarrierEdge::Right)));
     assert!(!armed.contains(&(SCREEN_RIGHT, BarrierEdge::Left)));
@@ -311,7 +446,8 @@ fn two_screens_that_only_share_a_line_are_both_still_enclosed() {
         w: 1920,
         h: 1080,
     };
-    let plans = barriers_for(&[SCREEN, below]);
+    let zones = [SCREEN, below];
+    let plans = barriers_for(&zones, &surrounded(&zones));
     let armed: Vec<(Zone, BarrierEdge)> = plans.iter().map(|p| (p.zone, p.edge)).collect();
     assert!(armed.contains(&(SCREEN, BarrierEdge::Right)));
     assert!(armed.contains(&(below, BarrierEdge::Left)));
@@ -509,11 +645,62 @@ fn suppression_cannot_be_changed_on_a_capture_that_is_not_running() {
 // -- the stranded pointer ----------------------------------------------
 
 #[test]
-fn a_pointer_pinned_at_an_edge_with_no_peer_beyond_it_is_given_back() {
-    // The failure this guard exists for: the compositor activates on any armed
-    // barrier, but the layout may have nothing on the other side of that edge. The
-    // engine then never asks for suppression, and without this the user's pointer
-    // is pinned with no way out short of killing the agent.
+fn capture_on_an_edge_with_nothing_beyond_it_is_handed_straight_back() {
+    // The reported bug's symptom, and the last line of defence against it. Barriers
+    // are no longer armed on such an edge at all, but an activation can still
+    // arrive on one — a re-arm the compositor refused, or a layout that changed
+    // while the pointer was already travelling — and the user must not pay a
+    // quarter-screen drag for it.
+    let h = Harness::us();
+    // The `Enable` that starting left behind is not this test's subject.
+    h.commands();
+    h.state.activated(
+        Some(1),
+        Point::new(960.0, 0.0),
+        Some(BarrierEdge::Top),
+        Some(SCREEN),
+    );
+    assert!(
+        matches!(h.commands().as_slice(), [Command::Release { .. }]),
+        "an edge the layout has nothing beyond kept the pointer"
+    );
+    assert!(!h.state.suppresses_local());
+}
+
+#[test]
+fn capture_on_an_edge_that_does_lead_somewhere_is_kept() {
+    // The proven path, pinned alongside it: the edge with a machine beyond it must
+    // still capture, and still report where the pointer is, or the fix above would
+    // have stopped every crossing rather than the three bad ones.
+    let h = Harness::us();
+    // The `Enable` that starting left behind is not this test's subject.
+    h.commands();
+    h.state.activated(
+        Some(1),
+        Point::new(1920.0, 540.0),
+        Some(BarrierEdge::Right),
+        Some(SCREEN),
+    );
+    assert!(h.commands().is_empty(), "a real crossing was refused");
+    assert!(h.state.suppresses_local());
+    assert_eq!(
+        h.drain(),
+        vec![CapturedEvent::PointerMotion {
+            dx: 0.0,
+            dy: 0.0,
+            // Clamped onto the last pixel of the screen it left, which is what the
+            // engine resynchronises the virtual cursor against.
+            position: Point::new(1919.0, 540.0),
+        }]
+    );
+}
+
+#[test]
+fn a_pointer_pinned_at_an_edge_nobody_claimed_is_given_back() {
+    // What the pull-back guard is for now that barriers are only armed where the
+    // layout has somewhere to go: a crossing into an edge that *does* lead
+    // somewhere, which nothing then claims — the peer is offline, or the engine is
+    // still deciding. The pointer is pinned and only the user can end it.
     let h = Harness::us();
     h.activate();
     // Pushing further into the barrier changes nothing.
@@ -575,6 +762,66 @@ fn a_claim_that_was_refused_does_not_disable_the_guard_afterwards() {
         matches!(h.commands().as_slice(), [Command::Release { .. }]),
         "the pointer was stranded after a refused claim"
     );
+}
+
+// -- keeping up with the layout ----------------------------------------
+
+#[test]
+fn placing_a_machine_beside_this_one_arms_that_edge_without_a_restart() {
+    // A restart is not an option to fall back on: this portal has no restore token
+    // at the version the alpha target ships, so it would mean another consent
+    // dialog. Adding, moving or removing a machine has to reach the barriers on
+    // the running session.
+    let h = Harness::us();
+    h.commands();
+
+    h.state
+        .set_exits(vec![exits(SCREEN, &[Edge::Right, Edge::Bottom])])
+        .unwrap();
+    let Some(Command::Rearm(asked)) = h.commands().pop() else {
+        panic!("a new machine below did not reach the barriers");
+    };
+    assert_eq!(asked, vec![exits(SCREEN, &[Edge::Right, Edge::Bottom])]);
+
+    // And the removal of one disarms its edge again — the same push, so a machine
+    // taken out of the layout cannot leave a barrier behind it.
+    h.state.set_exits(vec![exits(SCREEN, &[])]).unwrap();
+    assert!(matches!(h.commands().as_slice(), [Command::Rearm(e)] if e[0].edges.is_empty()));
+    // Which the activation guard then honours, even before the compositor has
+    // acted on it.
+    h.state.activated(
+        Some(1),
+        Point::new(1920.0, 540.0),
+        Some(BarrierEdge::Right),
+        Some(SCREEN),
+    );
+    assert!(matches!(h.commands().as_slice(), [Command::Release { .. }]));
+}
+
+#[test]
+fn an_unchanged_layout_costs_no_round_trip() {
+    // The agent pushes the whole set whenever anything might have moved, which on a
+    // running mesh is often. Obeying an unchanged one means disabling the session
+    // and re-enabling it, so every heartbeat would open a window with no barriers
+    // placed at all.
+    let h = Harness::us();
+    h.commands();
+    h.state
+        .set_exits(vec![exits(SCREEN, &[Edge::Right])])
+        .unwrap();
+    assert!(h.commands().is_empty(), "an unchanged answer was obeyed");
+}
+
+#[test]
+fn what_the_driver_arms_from_is_what_it_was_last_told() {
+    // The session comes up long after the agent has an opinion — the consent dialog
+    // is answered by a human — so the driver reads this when the portal finally
+    // grants, rather than being handed a copy that was current at start-up.
+    let h = Harness::bare();
+    h.state
+        .set_exits(vec![exits(SCREEN, &[Edge::Left])])
+        .unwrap();
+    assert_eq!(h.state.exits(), vec![exits(SCREEN, &[Edge::Left])]);
 }
 
 #[test]

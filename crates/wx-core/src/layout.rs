@@ -240,6 +240,42 @@ impl GlobalLayout {
         })
     }
 
+    /// Whether anything in the layout lies beyond `edge` of `monitor`, so the
+    /// cursor has somewhere to go that way.
+    ///
+    /// This is what decides whether a machine arms a pointer barrier on that edge
+    /// at all. An edge with nothing beyond it must not capture: the pointer has to
+    /// stop at the side of the screen the way it does on any ordinary desktop, and
+    /// a platform backend that grabs it there takes the machine away from whoever
+    /// is sitting at it — see [`crate::router::InputRouter`]'s callers and
+    /// `wx_platform::InputCapture::set_exits`.
+    ///
+    /// Answered *through* [`GlobalLayout::resolve_crossing`] rather than by a
+    /// second adjacency test of its own, so the edges a machine arms and the
+    /// crossings it will actually perform cannot drift apart: an armed edge that
+    /// resolves to nothing is exactly the bug this exists to prevent.
+    ///
+    /// The exit point cannot change the answer, which is why the midpoint is a
+    /// sound thing to ask about rather than an approximation. Candidate
+    /// eligibility is `axis_gap`, which looks only at the two rectangles and the
+    /// edge; where along the edge the cursor leaves decides *which* monitor it
+    /// reaches, never *whether* there is one.
+    pub fn has_neighbour(&self, monitor: GlobalMonitorId, edge: Edge) -> bool {
+        let Some(rect) = self.rect(monitor) else {
+            return false;
+        };
+        self.resolve_crossing(monitor, edge_midpoint(rect, edge), edge)
+            .is_some()
+    }
+
+    /// Every edge of `monitor` the cursor can leave by.
+    pub fn exit_edges(&self, monitor: GlobalMonitorId) -> Vec<Edge> {
+        [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .into_iter()
+            .filter(|edge| self.has_neighbour(monitor, *edge))
+            .collect()
+    }
+
     /// Problems worth surfacing in the layout editor.
     pub fn validate(&self) -> Vec<LayoutProblem> {
         let mut problems = Vec::new();
@@ -690,6 +726,85 @@ mod tests {
     #[test]
     fn bounds_of_empty_layout_is_none() {
         assert_eq!(GlobalLayout::new().bounds(), None);
+    }
+
+    #[test]
+    fn only_the_edges_with_a_machine_beyond_them_are_exits() {
+        // The reported layout, verbatim: `cowen-workhorse` flush against
+        // `cowen-ubuntu`'s left-hand edge at x=6512, and nothing anywhere else. Three
+        // of the four edges must answer "nothing that way", or the machine arms
+        // barriers that grab a cursor with nowhere to send it.
+        let mut l = GlobalLayout::new();
+        l.insert(place(gid(1, 0), 6512, 5, 3072, 1728));
+        l.insert(place(gid(2, 0), 3072, 144, 3440, 1440));
+
+        assert_eq!(l.exit_edges(gid(1, 0)), vec![Edge::Left]);
+        assert_eq!(l.exit_edges(gid(2, 0)), vec![Edge::Right]);
+    }
+
+    #[test]
+    fn an_exit_edge_is_exactly_an_edge_a_crossing_resolves_through() {
+        // The two must not drift: an edge armed that resolves to nothing pins the
+        // pointer, and an edge left unarmed that would resolve is a screen the
+        // cursor cannot reach. Checked over arrangements that exercise abutting,
+        // gapped, diagonal and split placements rather than asserted by inspection.
+        let mut diagonal = GlobalLayout::new();
+        diagonal.insert(place(gid(1, 0), 0, 0, 1920, 1080));
+        diagonal.insert(place(gid(2, 0), 2400, 1400, 1920, 1080));
+
+        let mut split = GlobalLayout::new();
+        split.insert(place(gid(1, 0), 0, 0, 2560, 1440));
+        split.insert(place(gid(2, 0), 2560, 0, 1280, 720));
+        split.insert(place(gid(3, 0), 2560, 720, 1280, 720));
+
+        for layout in [side_by_side(), diagonal, split] {
+            for pl in layout.iter() {
+                let rect = pl.global_bounds;
+                for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+                    let resolves = layout
+                        .resolve_crossing(pl.monitor, edge_midpoint(rect, edge), edge)
+                        .is_some();
+                    assert_eq!(
+                        layout.has_neighbour(pl.monitor, edge),
+                        resolves,
+                        "{:?} {edge:?}",
+                        pl.monitor
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_machine_has_no_exits_at_all() {
+        // Nothing placed beside it, so the pointer stops on every side — the
+        // ordinary desktop behaviour, and what a fresh install has.
+        let mut l = GlobalLayout::new();
+        l.insert(place(gid(1, 0), 0, 0, 1920, 1080));
+        assert!(l.exit_edges(gid(1, 0)).is_empty());
+    }
+
+    #[test]
+    fn a_monitor_the_layout_does_not_place_has_no_exits() {
+        // The router refuses to resolve any crossing from one, so arming an edge on
+        // it could only ever pin the pointer.
+        assert!(side_by_side().exit_edges(gid(9, 9)).is_empty());
+    }
+
+    #[test]
+    fn removing_the_last_peer_takes_the_exit_with_it() {
+        // The layout is edited live from the UI, so this has to fall as well as rise.
+        let mut l = side_by_side();
+        assert_eq!(l.exit_edges(gid(1, 0)), vec![Edge::Right]);
+        l.remove(gid(2, 0));
+        assert!(l.exit_edges(gid(1, 0)).is_empty());
+    }
+
+    #[test]
+    fn a_machine_placed_between_two_others_has_exits_on_both_sides() {
+        let mut l = side_by_side();
+        l.insert(place(gid(3, 0), -1920, 0, 1920, 1080));
+        assert_eq!(l.exit_edges(gid(1, 0)), vec![Edge::Left, Edge::Right]);
     }
 
     #[test]

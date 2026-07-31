@@ -76,11 +76,11 @@
 
 use std::sync::Mutex;
 
-use wx_proto::{KeyAction, Modifiers, MouseButton, Point, ScrollUnit, SpecialKey};
+use wx_proto::{Edge, KeyAction, Modifiers, MouseButton, Point, ScrollUnit, SpecialKey};
 
 use crate::error::{PlatformError, Result};
 use crate::keyres::{KeyResolver, RawKey};
-use crate::traits::{CaptureSink, CapturedEvent};
+use crate::traits::{CaptureSink, CapturedEvent, ScreenExits};
 
 use super::keymap::{Keymap, LevelMods};
 use super::keys::{
@@ -97,10 +97,12 @@ const SCROLL_DETENT: f64 = 120.0;
 ///
 /// The portal has no way for a client to ask to be activated: the compositor
 /// decides, when the pointer crosses an armed barrier. That is the right gesture,
-/// but it means capture can activate on an edge the layout has no peer beyond —
-/// and then the pointer is pinned, the engine never asks for suppression because
-/// the cursor never left this machine, and nothing in the trait would ever release
-/// it. A user cannot recover from that without killing the agent.
+/// but the crossing can still come to nothing — [`barriers_for`] arms only edges
+/// the layout has a machine beyond, and that machine can be offline, or the
+/// handoff can go unclaimed. Then the pointer is pinned, the engine never asks for
+/// suppression because the cursor never left this machine, and nothing in the
+/// trait would ever release it. A user cannot recover from that without killing
+/// the agent.
 ///
 /// So a pull-back releases: once the accumulated motion has travelled this far
 /// *away* from the barrier while nothing has claimed the cursor, the session lets
@@ -144,6 +146,21 @@ pub enum BarrierEdge {
 }
 
 impl BarrierEdge {
+    /// The same side, named the way the global layout names it.
+    ///
+    /// The two types stay distinct — this one is a side of a physical screen and
+    /// [`Edge`] is a seam in the global layout — but a screen's left-hand side is
+    /// the side the layout calls `Left`, so the crossing is a rename and not a
+    /// judgement. This is the one place they meet.
+    fn layout_edge(self) -> Edge {
+        match self {
+            BarrierEdge::Top => Edge::Top,
+            BarrierEdge::Bottom => Edge::Bottom,
+            BarrierEdge::Left => Edge::Left,
+            BarrierEdge::Right => Edge::Right,
+        }
+    }
+
     /// How far `(dx, dy)` moves the pointer *away* from this edge.
     ///
     /// Negative for motion pushing further into the barrier, which is what a user
@@ -257,7 +274,7 @@ pub struct BarrierPlan {
     pub zone: Zone,
 }
 
-/// A barrier on every edge of the *outer* boundary of the zone set, in the
+/// A barrier on each edge the layout says the cursor can leave by, in the
 /// geometry the compositor accepts.
 ///
 /// The two coordinates are not symmetric, which is not obvious and was measured
@@ -267,14 +284,40 @@ pub struct BarrierPlan {
 /// the edge, though, must stay inside the zone: a top barrier running to x=3072 is
 /// refused where one running to x=3071 is accepted.
 ///
-/// Every outer edge is armed, not just the ones with a peer beyond them, because
-/// nothing at this layer knows the global layout — a barrier is the only way the
-/// compositor will tell us the pointer reached an edge at all. An edge with
-/// nothing behind it is handled where it becomes knowable: see
-/// [`RELEASE_PULLBACK`], which hands the pointer straight back.
+/// # Only the edges with somewhere to go
 ///
-/// An edge with *another local screen* behind it is a different case, and the one
-/// this skips. Two side-by-side monitors would otherwise both put a barrier on
+/// `exits` is the agent's answer, from the global layout, and it is the whole
+/// reason this function takes an argument beyond the zones. A barrier *is* a
+/// request to be handed the pointer: the compositor pins it on the line and
+/// suppresses local input the instant it is crossed, and the portal gives a client
+/// no way to decline an activation it did not want. So arming an edge with nothing
+/// beyond it does not merely waste a barrier — it takes the cursor at the side of
+/// a screen where the user expects it to stop, and the only way back is the
+/// deliberate quarter-screen drag [`RELEASE_PULLBACK`] asks for.
+///
+/// This layer cannot work that out for itself. Zones describe this machine's own
+/// screens and say nothing about what any other machine is placed next to, so an
+/// earlier version armed all four outer edges unconditionally and left
+/// [`RELEASE_PULLBACK`] to undo it. That was wrong in the ordinary case rather
+/// than a rare one: a two-machine mesh has a neighbour on *one* edge, so three
+/// edges out of four grabbed a cursor they had nowhere to send.
+///
+/// [`RELEASE_PULLBACK`] stays, and is now what it should always have been — the
+/// recovery for a crossing of an armed edge that then comes to nothing, rather
+/// than the routine path for an edge that should never have been armed. An
+/// activation the compositor *does* attribute to an edge the layout no longer has
+/// anything beyond is handed straight back instead, in
+/// [`CaptureState::activated`], at no cost to the user.
+///
+/// A zone no entry in `exits` describes gets no barriers at all. That is the same
+/// judgement the router makes: a screen the layout does not place is one it
+/// refuses to resolve any crossing from, so a barrier on it could only ever pin
+/// the pointer.
+///
+/// # The seam between two of the user's own screens
+///
+/// An edge with *another local screen* flush against it is skipped whatever the
+/// layout says. Two side-by-side monitors would otherwise both put a barrier on
 /// their shared line, so moving between the user's own two screens activates
 /// capture: the pointer pins at the seam, local windows are suppressed, and the
 /// router walks the virtual cursor onto local monitor 2 with no handoff — so
@@ -286,7 +329,7 @@ pub struct BarrierPlan {
 /// The tradeoff, stated plainly: a peer can never be reached across a physically
 /// internal seam. That costs nothing today because the global layout model does not
 /// express that placement anyway.
-pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
+pub fn barriers_for(zones: &[Zone], exits: &[ScreenExits]) -> Vec<BarrierPlan> {
     let mut out = Vec::new();
     for (index, zone) in zones.iter().enumerate() {
         // A zero-extent zone has no edge to put anything on, and `size - 1` would
@@ -294,6 +337,9 @@ pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
         if zone.w <= 0 || zone.h <= 0 {
             continue;
         }
+        let Some(live) = exits_for(exits, *zone) else {
+            continue;
+        };
         let (x, y, w, h) = (zone.x, zone.y, zone.w, zone.h);
         for (edge, position) in [
             (BarrierEdge::Top, (x, y, x + w - 1, y)),
@@ -301,6 +347,9 @@ pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
             (BarrierEdge::Left, (x, y, x, y + h - 1)),
             (BarrierEdge::Right, (x + w, y, x + w, y + h - 1)),
         ] {
+            if !live.contains(edge.layout_edge()) {
+                continue;
+            }
             if is_internal_seam(zones, index, *zone, edge) {
                 continue;
             }
@@ -316,6 +365,25 @@ pub fn barriers_for(zones: &[Zone]) -> Vec<BarrierPlan> {
         }
     }
     out
+}
+
+/// The caller's answer for the screen this zone is.
+///
+/// Matched by overlap rather than by equality. The portal's regions and the
+/// monitors [`super::display`] enumerates were measured to agree exactly on the
+/// alpha target, offsets and all — but resting a *safety* decision on two
+/// independently derived rectangles being identical to the pixel would turn a
+/// one-pixel disagreement into all four edges grabbing the cursor. Monitors do not
+/// overlap, so any overlap identifies the screen unambiguously.
+fn exits_for(exits: &[ScreenExits], zone: Zone) -> Option<&ScreenExits> {
+    exits.iter().find(|e| {
+        let r = e.bounds;
+        !r.is_empty()
+            && zone.x < r.right()
+            && r.x < zone.x.saturating_add(zone.w)
+            && zone.y < r.bottom()
+            && r.y < zone.y.saturating_add(zone.h)
+    })
 }
 
 /// Whether another zone in the same set sits flush against this edge, so the line
@@ -363,6 +431,13 @@ pub enum Command {
     Enable,
     /// Disarm them. Sent by `stop`.
     Disable,
+    /// Replace the placed barriers with the ones these exits call for.
+    ///
+    /// Sent whenever the layout changes which edges have somewhere beyond them, so
+    /// that adding, moving or removing a machine takes effect without a restart —
+    /// a restart means a fresh consent dialog on this portal, which has no restore
+    /// token at the version the alpha target ships.
+    Rearm(Vec<ScreenExits>),
     /// Hand the pointer back at `position`, ending this activation.
     Release {
         activation_id: Option<u32>,
@@ -399,6 +474,11 @@ struct Inner {
     activation: Option<Activation>,
     /// What the engine last asked for. Distinct from whether it is in force.
     wanted: bool,
+    /// Which edges of which screens the layout has somewhere beyond, as last
+    /// pushed down by the agent. Empty until it says otherwise, which is why a
+    /// session that comes up before the first layout arms nothing rather than
+    /// everything.
+    exits: Vec<ScreenExits>,
 }
 
 /// One capture activation: the window between the portal's `Activated` and
@@ -427,6 +507,7 @@ impl CaptureState {
                 buttons: Vec::new(),
                 activation: None,
                 wanted: false,
+                exits: Vec::new(),
             }),
         }
     }
@@ -507,6 +588,36 @@ impl CaptureState {
         }
         inner.wanted = true;
         Ok(())
+    }
+
+    /// Take the agent's answer about which edges have somewhere beyond them.
+    ///
+    /// See [`crate::traits::InputCapture::set_exits`] for why this comes from
+    /// above, and [`barriers_for`] for what it decides. Stored whether or not a
+    /// session exists yet: the consent dialog can sit on screen for as long as the
+    /// user takes, and the driver reads this when the session is finally granted.
+    ///
+    /// A re-arm is asked for only on a real change. Re-arming is a portal round
+    /// trip that disables and re-enables the session, so obeying an unchanged
+    /// push — and the agent pushes the whole set on every layout event — would put
+    /// a window in which the barriers are down on every peer's heartbeat.
+    pub fn set_exits(&self, exits: Vec<ScreenExits>) -> Result<()> {
+        let mut inner = self.lock();
+        if inner.exits == exits {
+            return Ok(());
+        }
+        inner.exits = exits.clone();
+        inner.send(Command::Rearm(exits));
+        Ok(())
+    }
+
+    /// What [`CaptureState::set_exits`] was last given.
+    ///
+    /// For the driver, which plans its barriers from this when a session is
+    /// granted rather than being told separately — so there is one answer and it
+    /// cannot be stale in one place and current in the other.
+    pub fn exits(&self) -> Vec<ScreenExits> {
+        self.lock().exits.clone()
     }
 
     // -- the driver side --------------------------------------------------
@@ -597,6 +708,27 @@ impl CaptureState {
             dy: 0.0,
             position,
         });
+
+        // An activation on an edge the layout has nothing beyond is one this side
+        // never asked for: [`barriers_for`] does not arm those. It can still
+        // happen — a re-arm the compositor refused, or a layout that changed while
+        // the pointer was already on its way to the edge — and the user must not
+        // pay a quarter-screen drag for it, so it goes straight back.
+        //
+        // Only where the compositor said which barrier fired. An unattributed
+        // activation has no edge to judge, and none to measure a pull-back along
+        // either (see `Activation::pullback_limit`), so it is left to the engine's
+        // own release.
+        if let Some((edge, zone)) = edge.zip(zone) {
+            if !inner.is_live_exit(edge, zone) {
+                tracing::debug!(
+                    ?edge,
+                    "capture activated on an edge the layout has nothing beyond; handing the \
+                     pointer straight back"
+                );
+                inner.release();
+            }
+        }
     }
 
     /// The compositor has stopped capturing, by its own decision.
@@ -796,6 +928,15 @@ impl Inner {
         };
         self.end_activation();
         self.send(command);
+    }
+
+    /// Whether the layout has somewhere for the cursor to go past this edge.
+    ///
+    /// The same question [`barriers_for`] answers when it decides what to arm,
+    /// asked of the same stored answer, so the check that catches a barrier which
+    /// should not have fired cannot disagree with the one that placed it.
+    fn is_live_exit(&self, edge: BarrierEdge, zone: Zone) -> bool {
+        exits_for(&self.exits, zone).is_some_and(|e| e.contains(edge.layout_edge()))
     }
 
     /// End the current activation, releasing anything held.

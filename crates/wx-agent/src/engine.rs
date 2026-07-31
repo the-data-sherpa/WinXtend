@@ -1030,6 +1030,29 @@ pub fn needs_placement(layout: &GlobalLayout, node: NodeId, monitors: &[Monitor]
         .any(|m| layout.rect(GlobalMonitorId::new(node, m.id)).is_none())
 }
 
+/// Which edges of this machine's own screens the cursor can leave by.
+///
+/// The join between the two halves of the answer: the layout knows what is beyond
+/// each screen, and only this machine knows where its screens are in its *own*
+/// desktop space — which is the space a capture backend's barriers live in. A
+/// monitor the layout does not place gets no exits at all, which is the same
+/// answer the router gives it: `GlobalLayout::resolve_move` refuses to resolve any
+/// crossing from a monitor it has never heard of, so an edge armed there could
+/// only ever pin the pointer with nowhere to send it.
+pub fn local_exits(
+    layout: &GlobalLayout,
+    node: NodeId,
+    monitors: &[Monitor],
+) -> Vec<wx_platform::ScreenExits> {
+    monitors
+        .iter()
+        .map(|m| wx_platform::ScreenExits {
+            bounds: m.local_bounds,
+            edges: layout.exit_edges(GlobalMonitorId::new(node, m.id)),
+        })
+        .collect()
+}
+
 /// Whether an incoming layout should replace the one in use.
 ///
 /// Highest revision wins, as the protocol says. Ties are the interesting case,
@@ -1125,6 +1148,9 @@ pub struct Engine {
     /// Last value pushed to the capture backend, so it is only changed on a real
     /// transition — flipping the suppression flag loses events.
     suppressed: bool,
+    /// Last exits pushed to the capture backend, for the same reason: on Wayland
+    /// obeying one is a portal round trip that briefly disarms every barrier.
+    exits: Vec<wx_platform::ScreenExits>,
     /// Key payload whose release must be swallowed because its press was consumed
     /// as a hotkey. Without it the peer sees a release for a key it never saw
     /// pressed.
@@ -1380,6 +1406,7 @@ impl Engine {
             events,
             wake: wake.clone(),
             suppressed: false,
+            exits: Vec::new(),
             swallow_release: None,
             driven_by: DrivenBy::default(),
             clipboard: ClipboardSync::new(),
@@ -1431,6 +1458,10 @@ impl Engine {
             }
         }
         engine.start_capture();
+        // Before anything can cross an edge. A backend told nothing arms nothing,
+        // which is the safe direction but would leave this machine unable to drive
+        // until the first layout change.
+        engine.sync_exits();
         engine.seed_static_peers();
         Ok(engine)
     }
@@ -1821,6 +1852,38 @@ impl Engine {
             self.state.local_monitors(),
             position,
         );
+    }
+
+    /// Tell the capture backend which screen edges have a machine beyond them,
+    /// when and only when the answer changes.
+    ///
+    /// The backend cannot work this out: adjacency is a fact about the *global*
+    /// layout, and a platform backend sees no further than this machine's own
+    /// screens. A backend that grabs the cursor at an edge — on Wayland a pointer
+    /// barrier is exactly that — must therefore be told, or it grabs at every edge
+    /// and the pointer is taken on three sides of a two-machine mesh.
+    ///
+    /// Pushed on a change rather than on a schedule, and the whole set rather than
+    /// a delta, because "which edges are live" is derived state with one owner: any
+    /// layout event, any display change, recompute and compare. On Wayland
+    /// obeying it is a portal round trip, which is why it must not be pushed
+    /// unchanged.
+    fn sync_exits(&mut self) {
+        let want = local_exits(
+            self.router.layout(),
+            self.local,
+            self.state.local_monitors(),
+        );
+        if want == self.exits {
+            return;
+        }
+        match self.platform.capture.set_exits(&want) {
+            Ok(()) => self.exits = want,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not tell the capture backend which screen edges lead to another machine"
+            ),
+        }
     }
 
     /// Push the suppression flag to the capture backend when, and only when, it
@@ -2862,6 +2925,13 @@ impl Engine {
             }
         }
 
+        // Not only inside the `set_local_monitors` branch above: `adopt_layout` is
+        // reached from there only when a placement is missing, so a display that
+        // was unplugged or resized leaves the recorded exits describing a screen
+        // that is no longer there. Recomputed here, where the monitor list is
+        // freshest; unchanged answers cost nothing.
+        self.sync_exits();
+
         self.sync_capabilities().await;
 
         // Round-trip times, for the UI and for diagnosing a slow link.
@@ -2993,6 +3063,7 @@ impl Engine {
         }
         self.sync_cursor();
         self.sync_suppression();
+        self.sync_exits();
 
         if persist {
             self.config.layout = Some(crate::config::SavedLayout::from_layout(&as_proto));
@@ -4956,6 +5027,68 @@ mod tests {
         // A screen the OS reports as zero-sized cannot hold a cursor and needs no
         // place in the layout.
         assert!(!needs_placement(&layout, node(2), &[mon(0, 0, 0)]));
+    }
+
+    #[test]
+    fn exits_are_reported_in_this_machines_own_desktop_space() {
+        // The two coordinate spaces are the point of this function. A capture
+        // backend's barriers live in the *local* space — `cowen-ubuntu`'s screen is
+        // at the origin as far as its own compositor is concerned — while the
+        // adjacency that decides which of them to arm is a fact about the global
+        // one, where the same screen sits at x=6512. Reporting the global rectangle
+        // would leave the backend unable to match any of its own screens, and a
+        // screen it cannot match arms nothing at all.
+        let mut layout = GlobalLayout::new();
+        layout.insert(Placement {
+            monitor: gid(1, 0),
+            global_bounds: Rect::new(6512, 5, 3072, 1728),
+            cursor_scale: 1.0,
+        });
+        layout.insert(Placement {
+            monitor: gid(2, 0),
+            global_bounds: Rect::new(3072, 144, 3440, 1440),
+            cursor_scale: 1.0,
+        });
+        let local = Monitor {
+            id: MonitorId(0),
+            name: "DP-1".into(),
+            local_bounds: Rect::new(0, 0, 3072, 1728),
+            scale: 1.25,
+            primary: true,
+        };
+
+        let exits = local_exits(&layout, node(1), std::slice::from_ref(&local));
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].bounds, local.local_bounds);
+        // The peer meets this screen's left-hand edge and nothing meets the other
+        // three. This is the reported bug, at the layer that answers it.
+        assert_eq!(exits[0].edges, vec![wx_proto::Edge::Left]);
+    }
+
+    #[test]
+    fn a_screen_missing_from_the_layout_is_offered_no_exits() {
+        // A display plugged in a moment ago and not yet placed. Arming it would
+        // grab the pointer for a crossing the router then refuses to resolve.
+        let exits = local_exits(
+            &two_machines(),
+            node(1),
+            &[mon(0, 0, 1920), mon(7, 5000, 1920)],
+        );
+        assert_eq!(exits.len(), 2);
+        assert_eq!(exits[0].edges, vec![wx_proto::Edge::Right]);
+        assert!(exits[1].edges.is_empty());
+    }
+
+    #[test]
+    fn a_machine_alone_in_the_layout_is_offered_no_exits() {
+        let mut alone = GlobalLayout::new();
+        alone.insert(place(gid(1, 0), 0, 1920));
+        let exits = local_exits(&alone, node(1), &[mon(0, 0, 1920)]);
+        assert_eq!(exits.len(), 1);
+        assert!(
+            exits[0].edges.is_empty(),
+            "a machine with no neighbours must capture nowhere"
+        );
     }
 
     #[test]

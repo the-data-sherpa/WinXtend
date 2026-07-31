@@ -36,9 +36,10 @@
 //! * `InputCapture` version 1; `CreateSession` granting `Keyboard | Pointer`;
 //!   `GetZones` reporting one 3072x1728 region at the origin, matching what
 //!   [`super::display`] enumerates;
-//! * barriers accepted on all four edges once placed the way [`barriers_for`]
-//!   places them, and rejected otherwise — see that function for the geometry the
-//!   compositor actually enforces;
+//! * a barrier accepted on any of the four edges once placed the way
+//!   [`barriers_for`] places them, and rejected otherwise — a fact about the
+//!   *geometry* the compositor enforces, and not a reason to arm all four. Which
+//!   edges are asked for is the layout's answer; see [`barriers_for`] for both;
 //! * thirteen `Activated` signals across one session with no further consent, each
 //!   carrying a real cursor position and the barrier that fired;
 //! * `Release` handing the pointer back and the session re-arming immediately;
@@ -47,11 +48,49 @@
 //!
 //! The consent dialog itself cannot be automated, and must not be: that click *is*
 //! the security property. See the same note at the top of [`super::driver`].
+//!
+//! # What has *not* been verified against a live compositor
+//!
+//! Moving the barriers on a running session — [`rearm`], reached when the layout
+//! changes which edges have a machine beyond them. Every step of it is a portal
+//! call this session already makes, but the `Disable`/`SetPointerBarriers`/`Enable`
+//! *sequence* has not been run against GNOME, because exercising it means arming
+//! capture on a working desktop and an exclusive grab that is not released takes
+//! the machine away from whoever is at it. `rearm` carries what is known — the
+//! GNOME 46 bug `ashpd`'s own docs record, and which of its failure modes are made
+//! safe here — and the pure half of the decision is tested in
+//! [`super::capture_tests`] and in this module's own tests without a desktop:
+//! [`PendingRearm`] decides *when* a re-arm happens and [`OwnDisable`] decides
+//! which `Disabled` signal is ours, and both are pure. Anyone with two machines to
+//! spare should confirm the portal half: move a machine in the layout editor and
+//! check the cursor then crosses by the new edge and not the old one.
+//!
+//! Two things are therefore deliberately never asked of the compositor, because a
+//! guess about how it answers would be load-bearing:
+//!
+//! * **`SetPointerBarriers` is never called with an empty array.** A machine the
+//!   layout puts nothing beside is the state every fresh install starts in, and
+//!   whether GNOME accepts an empty set is not established anywhere. So no request
+//!   is made at all and the session is left not enabled — see [`place_barriers`].
+//! * **`Enable` is never sent over an empty barrier set**, for the same reason and
+//!   because it would have nothing to arm. [`Barriers::should_enable`] is the one
+//!   place that decides.
+//!
+//! What that costs, and the assumption it leaves standing: because the empty plan
+//! makes no request, **the barriers placed for the previous layout stay registered
+//! with the compositor** when the last neighbour goes away. They are inert only
+//! because the session is disabled in the same breath and nothing re-enables it —
+//! so [`Barriers::should_enable`] must remain the *sole* gate on `Enable`. An
+//! `Enable` added anywhere that does not consult it would arm a barrier for a
+//! machine that is no longer there, which is the bug this whole layering exists to
+//! fix. There are two call sites today, in [`obey`] and [`rearm`], and both go
+//! through it.
 
+use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ashpd::desktop::input_capture::{
     ActivatedBarrier, Barrier, BarrierID, Capabilities as PortalCapabilities, CreateSessionOptions,
@@ -67,6 +106,7 @@ use wx_proto::Point;
 
 use super::capture::{barriers_for, zone_at, BarrierEdge, CaptureState, Command, Zone};
 use super::session::{SharedSession, INPUT_CAPTURE_CAPABILITIES};
+use crate::traits::ScreenExits;
 
 /// Name this client reports to the compositor. User-visible in the shell's
 /// screen-sharing indicator, so it is the product's name and not a code name.
@@ -146,10 +186,10 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
             shared.stopped();
             return;
         }
-        established = establish() => established,
+        established = establish(capture) => established,
     };
 
-    let (live, mut events) = match established {
+    let (live, mut barriers, mut events) = match established {
         Ok(live) => live,
         Err(Aborted { failure, session }) => {
             failure.report(shared);
@@ -163,7 +203,7 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
     tracing::info!(
         capabilities = ?live.granted,
         zones = live.zones.len(),
-        barriers = live.barriers,
+        barriers = barriers.edges.len(),
         "the desktop portal granted an InputCapture session"
     );
 
@@ -177,9 +217,115 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
     }));
     shared.activate(INPUT_CAPTURE_CAPABILITIES);
 
-    let reason = pump(&live, &mut events, capture, rx, stop).await;
+    let reason = pump(&live, &mut barriers, &mut events, capture, rx, stop).await;
     capture.detach();
     teardown(shared, live, reason).await;
+}
+
+/// Bring the placed barriers, and whether the session is enabled, into line with
+/// `exits`. Answers whether the session now matches what was asked for.
+///
+/// # Never called from the place that learns the layout changed
+///
+/// A re-arm ends the current activation, and ending one out from under the engine
+/// is a bug of its own: the router still says a peer owns the cursor, the engine
+/// never re-reads `suppresses_local`, and physical input goes to local windows
+/// while the remote cursor is frozen. So a layout edit does not interrupt a drive
+/// in progress — [`PendingRearm`] holds the change and this is only ever reached
+/// through [`PendingRearm::settle`], which runs at the top of [`pump`]'s loop.
+/// That is the one place every path that could have ended an activation comes back
+/// through, so the deferral cannot be forgotten by a call site that did not know
+/// about it.
+///
+/// # The disable/enable dance, and why it is guarded
+///
+/// GNOME's portal will not accept `SetPointerBarriers` on an enabled session. The
+/// specification says such a request suspends the session; the implementation
+/// requires it to have been disabled first, which `ashpd`'s own module docs record
+/// along with the GNOME 46 bug that then prevented re-enabling it. The alpha
+/// target is GNOME 50, well past that, but this sequence has **not** been
+/// exercised against a live compositor — arming capture on a working desktop to
+/// test it is precisely the thing that takes someone's machine away from them —
+/// so it is written to fail safe rather than to be clever.
+///
+/// The guard that matters is `Disabled`. That signal normally means the compositor
+/// has ended the session for its own reasons and the pump tears everything down
+/// over it; a `Disabled` raised by our *own* `Disable` would therefore turn a
+/// layout change into a lost session and a fresh consent dialog. So a disable this
+/// side asked for is announced first and the signal it may produce is absorbed.
+/// The same shape as `Release`, which GNOME is measured not to answer with a
+/// `Deactivated` — our own decision is authoritative for our own state, and the
+/// signal is kept for the case where the compositor is the one deciding. See
+/// [`OwnDisable`] for why that expectation is both counted and given a deadline.
+///
+/// A refusal anywhere leaves the previous barriers in place, logs, and answers
+/// `false` so the caller tries again — committing the new answer over a placement
+/// that never happened would leave the newly live edge unarmed for good, with only
+/// a `warn!` in the log. Until it does succeed the edges stay as they were, and an
+/// activation on an edge that is no longer live is handed straight back by
+/// [`CaptureState::activated`].
+async fn rearm(
+    live: &Live,
+    barriers: &mut Barriers,
+    capture: &CaptureState,
+    own_disable: &OwnDisable,
+    exits: Vec<ScreenExits>,
+) -> bool {
+    let wants_capture = capture.is_capturing();
+    // Idempotent, whatever the command queue holds: a `Rearm` sent before the
+    // session was granted arrives afterwards carrying exits already applied, and
+    // obeying it would cost a whole disable/enable cycle — a window with no
+    // barriers placed — for nothing.
+    if barriers.exits == exits && barriers.enabled == barriers.should_enable(wants_capture) {
+        return true;
+    }
+    if barriers.enabled {
+        own_disable.expect();
+        if let Err(e) = live.portal.disable(&live.session, Default::default()).await {
+            own_disable.forget();
+            tracing::warn!(error = %e, "could not disable the capture session to move its barriers");
+            return false;
+        }
+        barriers.enabled = false;
+        // A disabled session is not capturing, whether or not the compositor says
+        // so in a signal — GNOME is measured not to answer our own `Release` with a
+        // `Deactivated`, and the same may be true here. Waiting for a signal that
+        // may never come would leave `suppresses_local` claiming local input is
+        // still being swallowed, and any key held at the moment of the change
+        // stranded on whichever machine had the cursor. A no-op in practice,
+        // because `settle` only gets here with no activation in force.
+        capture.deactivated(None);
+    }
+    let placed = place_barriers(
+        &live.portal,
+        &live.session,
+        live.zone_set,
+        &live.zones,
+        exits,
+    )
+    .await;
+    let applied = match placed {
+        Ok(placed) => {
+            barriers.edges = placed.edges;
+            barriers.exits = placed.exits;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "the portal refused the new pointer barriers");
+            false
+        }
+    };
+    // Re-enabled even when the placement failed: the old barriers are still the
+    // session's, and leaving it disabled would silently stop this machine driving
+    // anything at all.
+    if barriers.should_enable(wants_capture) && !barriers.enabled {
+        if let Err(e) = live.portal.enable(&live.session, Default::default()).await {
+            tracing::warn!(error = %e, "could not re-arm the capture session after a layout change");
+            return false;
+        }
+        barriers.enabled = true;
+    }
+    applied
 }
 
 /// A capture session that has been granted, with its transport connected.
@@ -188,23 +334,256 @@ struct Live {
     session: Session<InputCapture>,
     granted: BitFlags<PortalCapabilities>,
     connection: reis::event::Connection,
-    /// Which edge each barrier id sits on and which zone it bounds, so an
-    /// activation knows which way the pointer came in — and therefore which way is
-    /// back out, and which screen it is really on.
-    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
     /// Every region the portal reported, kept rather than counted so an activation
     /// the compositor did not attribute to a barrier can still be clamped onto a
     /// screen that exists.
     zones: Vec<Zone>,
-    barriers: usize,
+    /// The `GetZones` serial the barriers are placed against. Retained because
+    /// re-arming has to quote it again, and the compositor refuses a set of
+    /// barriers offered against a zone set it has moved on from.
+    zone_set: u32,
 }
 
-impl Live {
+/// The barriers currently placed, and what they were placed for.
+///
+/// Separate from [`Live`] because it is the one part of the session that changes
+/// while the session runs: a layout change alters which edges have somewhere
+/// beyond them, and the barriers have to follow without a new session — this
+/// portal has no restore token at the version the alpha target ships, so a new
+/// session means a new consent dialog.
+struct Barriers {
+    /// Which edge each barrier id sits on and which zone it bounds, so an
+    /// activation knows which way the pointer came in — and therefore which way is
+    /// back out, and which screen it is really on.
+    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
+    /// The answer these were planned from, so an unchanged push costs no round
+    /// trip and a changed one is noticed. Advanced only when a placement actually
+    /// succeeded, so a refusal stays visible as a difference from what the layout
+    /// asked for and can be tried again.
+    exits: Vec<ScreenExits>,
+    /// Whether `Enable` is in force on the session.
+    ///
+    /// Tracked rather than inferred so a `Disable` is only sent — and therefore
+    /// only expected back — when there is something to disable, and so a session
+    /// with nothing placed is never enabled over an empty barrier set.
+    enabled: bool,
+}
+
+impl Barriers {
     fn barrier(&self, id: BarrierID) -> Option<(BarrierEdge, Zone)> {
         self.edges
             .iter()
             .find(|(b, _, _)| *b == id)
             .map(|(_, e, z)| (*e, *z))
+    }
+
+    /// Whether the session should be enabled: the engine has asked for capture
+    /// *and* there is a barrier to arm.
+    ///
+    /// The second half is the whole answer for a machine the layout puts nothing
+    /// beside, which is the state every fresh install starts in. Nothing is placed,
+    /// so nothing is enabled, so no edge can take the cursor — and none of that
+    /// rests on how the compositor answers a request this build never makes. The
+    /// session itself stays up and capable, and arms the moment a peer is placed.
+    fn should_enable(&self, wants_capture: bool) -> bool {
+        wants_capture && !self.edges.is_empty()
+    }
+}
+
+/// How long a `Disabled` signal may still be attributed to a `Disable` this side
+/// sent.
+///
+/// GNOME is measured not to answer a client-initiated `Release` with a
+/// `Deactivated`, so it may well not answer a client-initiated `Disable` with a
+/// `Disabled` either. An expectation that is never met must not stand for the rest
+/// of the session: the next `Disabled` would be absorbed by it, and that one is a
+/// screen lock or a revocation — a session that has really died, reported to the
+/// agent as nothing at all. A signal the portal does send follows the round trip
+/// that asked for it, so the window only has to cover that.
+const OWN_DISABLE_WINDOW: Duration = Duration::from_secs(2);
+
+/// The `Disabled` signals still owed to a `Disable` this side sent.
+///
+/// A queue of deadlines and not a flag, because both mismatches are reachable and
+/// both are silent. Two disables answered by one signal leaves an expectation
+/// standing that swallows a genuine revocation, so they are counted; a disable the
+/// compositor never answers would leave that expectation standing for ever, so
+/// each one expires. One signal answered by no expectation is the compositor
+/// deciding, and is still believed.
+///
+/// A `RefCell` and not a lock: the capture driver is one thread running a
+/// current-thread runtime, and everything that touches this is on it.
+#[derive(Default)]
+struct OwnDisable(std::cell::RefCell<VecDeque<Instant>>);
+
+impl OwnDisable {
+    /// A `Disable` is about to be sent.
+    fn expect(&self) {
+        self.0
+            .borrow_mut()
+            .push_back(Instant::now() + OWN_DISABLE_WINDOW);
+    }
+
+    /// It was refused, so no signal is coming.
+    fn forget(&self) {
+        self.0.borrow_mut().pop_back();
+    }
+
+    /// Answer whether an arriving `Disabled` is ours, and stop expecting that one.
+    fn claim(&self) -> bool {
+        self.claim_at(Instant::now())
+    }
+
+    fn claim_at(&self, now: Instant) -> bool {
+        let mut owed = self.0.borrow_mut();
+        // Pushed in order, so the front is always the oldest deadline.
+        while owed.front().is_some_and(|deadline| *deadline <= now) {
+            owed.pop_front();
+        }
+        owed.pop_front().is_some()
+    }
+}
+
+/// How long to wait before offering a refused set of barriers again.
+///
+/// Bounded rather than endless: a portal that has refused this five times is not
+/// going to be talked round, and a warning every thirty seconds for the life of
+/// the process is noise rather than information. A later layout change starts the
+/// budget over, which is the case that matters — the acceptance criterion is that
+/// changing the layout re-arms without a restart.
+const REARM_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+
+/// The barrier change the layout has asked for and the session has not applied.
+///
+/// The one owner of "a re-arm is owed", and the reason [`rearm`] is never called
+/// from the branch that learns about a layout change. Two things it exists to stop,
+/// both of which are an action deferred on an event that may never arrive:
+///
+/// * a re-arm run *during* an activation, which ends the drive the user is in the
+///   middle of and leaves the engine believing local input is still suppressed;
+/// * a re-arm the portal refused and nobody tried again, which leaves a newly live
+///   edge unarmed for good because every layer above has already committed the new
+///   answer and will never push it a second time.
+///
+/// [`PendingRearm::due`] is the whole decision and is pure, so both are tested with
+/// no desktop.
+#[derive(Default)]
+struct PendingRearm {
+    /// What the layout last asked for, until it has been applied.
+    wanted: Option<Vec<ScreenExits>>,
+    /// When a refused attempt may be made again.
+    retry_at: Option<Instant>,
+    /// How many refusals have been answered with a retry so far.
+    attempts: usize,
+}
+
+impl PendingRearm {
+    /// The layout wants these edges live. Supersedes anything still owed, and
+    /// starts the retry budget over.
+    fn want(&mut self, exits: Vec<ScreenExits>) {
+        self.wanted = Some(exits);
+        self.retry_at = None;
+        self.attempts = 0;
+    }
+
+    /// The re-arm to apply now, if there is one and this is the moment for it.
+    ///
+    /// Deferred, never dropped, while an activation is in force: the user is
+    /// driving a peer and a layout edit must not take that away from them. It is
+    /// applied at the next pass of the pump loop after the activation ends, by
+    /// whatever ended it — a clean release, the compositor deactivating, a paused
+    /// or removed device, the engine giving up suppression, a `stop`. None of those
+    /// call sites has to know this exists.
+    fn due(&self, now: Instant, activation_in_force: bool) -> Option<&[ScreenExits]> {
+        let wanted = self.wanted.as_deref()?;
+        if activation_in_force {
+            return None;
+        }
+        if self.retry_at.is_some_and(|at| now < at) {
+            return None;
+        }
+        Some(wanted)
+    }
+
+    /// When the pump loop should come back of its own accord, if it should.
+    ///
+    /// Nothing at all while an activation is in force, and that is not an
+    /// optimisation. [`PendingRearm::due`] refuses during a drive whatever the
+    /// deadline says, so a deadline surfaced then is one the loop wakes for and can
+    /// do nothing about — and a refused deadline already in the past makes that
+    /// wake instantaneous, spinning the driver thread at full tilt, taking the
+    /// [`CaptureState`] lock against the events it is delivering, for exactly as
+    /// long as the user keeps driving. Nothing is lost by staying asleep: whatever
+    /// ends the activation is itself a branch of the loop, and `due` re-reads the
+    /// deadline on the way back through.
+    fn wake_at(&self, activation_in_force: bool) -> Option<Instant> {
+        if activation_in_force {
+            return None;
+        }
+        self.retry_at
+    }
+
+    /// The session now matches what the layout asked for.
+    fn applied(&mut self) {
+        self.wanted = None;
+        self.retry_at = None;
+        self.attempts = 0;
+    }
+
+    /// The portal refused. Try again later, until the budget is out.
+    fn refused(&mut self, now: Instant) {
+        match REARM_RETRY_DELAYS.get(self.attempts) {
+            Some(delay) => {
+                self.attempts += 1;
+                self.retry_at = Some(now + *delay);
+            }
+            None => {
+                tracing::warn!(
+                    "the portal would not move the pointer barriers; the screen edges stay as \
+                     they were until the layout changes again"
+                );
+                self.applied();
+            }
+        }
+    }
+
+    /// Apply what is owed, if anything is and this is the moment for it, and
+    /// answer when the loop should come back for what is left.
+    ///
+    /// The wake instant comes from here rather than being read off afterwards so
+    /// that the answer and the condition it was computed under cannot disagree, and
+    /// so the [`CaptureState`] lock is taken once a pass.
+    async fn settle(
+        &mut self,
+        live: &Live,
+        barriers: &mut Barriers,
+        capture: &CaptureState,
+        own_disable: &OwnDisable,
+    ) -> Option<Instant> {
+        let activation_in_force = capture.suppresses_local();
+        let Some(exits) = self.due(Instant::now(), activation_in_force) else {
+            return self.wake_at(activation_in_force);
+        };
+        let exits = exits.to_vec();
+        if rearm(live, barriers, capture, own_disable, exits).await {
+            self.applied();
+        } else {
+            self.refused(Instant::now());
+        }
+        self.wake_at(capture.suppresses_local())
+    }
+}
+
+/// Wait for a deadline, or for ever when there is nothing to wait for.
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep(at.saturating_duration_since(Instant::now())).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -230,7 +609,9 @@ impl Aborted {
 }
 
 /// Run the whole sequence and bring the `ei` connection up.
-async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborted> {
+async fn establish(
+    capture: &CaptureState,
+) -> Result<(Live, Barriers, reis::tokio::EiConvertEventStream), Aborted> {
     let portal = InputCapture::new().await.map_err(Aborted::before_session)?;
     tracing::debug!(version = portal.version(), "portal InputCapture interface");
 
@@ -256,17 +637,17 @@ async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborte
             session: None,
         })?;
 
-    match negotiate(&portal, &session, granted).await {
+    match negotiate(&portal, &session, granted, capture).await {
         Ok(negotiated) => Ok((
             Live {
                 portal,
                 session,
                 granted,
                 connection: negotiated.connection,
-                edges: negotiated.edges,
                 zones: negotiated.zones,
-                barriers: negotiated.barriers,
+                zone_set: negotiated.zone_set,
             },
+            negotiated.barriers,
             negotiated.events,
         )),
         Err(failure) => Err(Aborted {
@@ -279,15 +660,16 @@ async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborte
 struct Negotiated {
     connection: reis::event::Connection,
     events: reis::tokio::EiConvertEventStream,
-    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
+    barriers: Barriers,
     zones: Vec<Zone>,
-    barriers: usize,
+    zone_set: u32,
 }
 
 async fn negotiate(
     portal: &InputCapture,
     session: &Session<InputCapture>,
     granted: BitFlags<PortalCapabilities>,
+    capture: &CaptureState,
 ) -> Result<Negotiated, Failure> {
     accept_granted(granted)?;
 
@@ -299,43 +681,14 @@ async fn negotiate(
         .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?;
 
     let regions: Vec<Zone> = zones.regions().iter().copied().map(zone_of).collect();
-    let placed = barriers_for(&regions);
-    // A plan whose id the portal cannot express is one this build asked for and
-    // cannot name; dropping it loses an edge, which is far better than shifting
-    // every later id and mis-attributing a refusal.
-    let barriers: Vec<Barrier> = placed
-        .iter()
-        .filter_map(|p| Some(Barrier::new(BarrierID::new(p.id)?, p.position)))
-        .collect();
-    let response = portal
-        .set_pointer_barriers(session, &barriers, zones.zone_set(), Default::default())
+    let zone_set = zones.zone_set();
+    // Whatever the agent has said by now. The consent dialog is answered by a
+    // human, so a layout has usually arrived long before this point; if none has,
+    // nothing is armed and the first `Rearm` places the barriers instead.
+    let exits = capture.exits();
+    let barriers = place_barriers(portal, session, zone_set, &regions, exits)
         .await
-        .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?
-        .response()
         .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?;
-
-    // A barrier the compositor would not place is one edge the cursor cannot
-    // leave by. Not fatal — the other three still work, and a node with one usable
-    // edge is far better than none — but it is exactly the kind of thing that
-    // reads as "the cursor won't go left" and is otherwise unattributable.
-    let refused = response.failed_barriers();
-    if !refused.is_empty() {
-        tracing::warn!(
-            ?refused,
-            "the compositor would not place some pointer barriers; the cursor cannot leave by \
-             those edges"
-        );
-    }
-    let edges: Vec<(BarrierID, BarrierEdge, Zone)> = placed
-        .into_iter()
-        .filter_map(|p| Some((BarrierID::new(p.id)?, p.edge, p.zone)))
-        .filter(|(id, _, _)| !refused.contains(id))
-        .collect();
-    if edges.is_empty() {
-        return Err(Failure::broken(
-            "the compositor placed none of the pointer barriers, so nothing can start a capture",
-        ));
-    }
 
     let fd = portal
         .connect_to_eis(session, Default::default())
@@ -356,8 +709,88 @@ async fn negotiate(
         connection,
         events,
         zones: regions,
-        barriers: edges.len(),
+        zone_set,
+        barriers,
+    })
+}
+
+/// Ask the compositor for exactly the barriers `exits` calls for.
+///
+/// Replaces whatever is currently placed: `SetPointerBarriers` is the whole set,
+/// not an addition to it, so an edge that has stopped being live is disarmed by
+/// being left out.
+///
+/// Placing none is a legitimate outcome and not an error. A machine the layout
+/// puts nothing next to has nowhere to send the cursor from any edge, and the
+/// right behaviour is a pointer that stops on all four sides — the session stays
+/// up, capable of driving nothing, and arms itself the moment a peer is placed
+/// beside it.
+///
+/// **An empty plan is not sent.** Whether GNOME accepts a `SetPointerBarriers`
+/// with an empty array is not established by this change, by `ashpd`'s docs, or by
+/// anything that has been run against the alpha target — and a refusal at
+/// [`negotiate`] aborts the whole session, which would leave every fresh
+/// single-machine install reporting no capture capability at all. That is the
+/// common case, not an edge one, so it is not made to rest on a guess: no request
+/// is made, and [`Barriers::should_enable`] then keeps the session out of `Enable`.
+/// Barriers already placed are left with the compositor rather than cleared, which
+/// is safe because [`rearm`] disables the session in the same breath and a session
+/// that is not enabled cannot be activated — the same property teardown relies on
+/// — and because the next non-empty placement replaces the whole set.
+async fn place_barriers(
+    portal: &InputCapture,
+    session: &Session<InputCapture>,
+    zone_set: u32,
+    zones: &[Zone],
+    exits: Vec<ScreenExits>,
+) -> ashpd::Result<Barriers> {
+    let placed = barriers_for(zones, &exits);
+    if placed.is_empty() {
+        tracing::debug!("the layout has no machine beyond any screen edge; nothing to arm");
+        return Ok(Barriers {
+            edges: Vec::new(),
+            exits,
+            enabled: false,
+        });
+    }
+    // A plan whose id the portal cannot express is one this build asked for and
+    // cannot name; dropping it loses an edge, which is far better than shifting
+    // every later id and mis-attributing a refusal.
+    let barriers: Vec<Barrier> = placed
+        .iter()
+        .filter_map(|p| Some(Barrier::new(BarrierID::new(p.id)?, p.position)))
+        .collect();
+    let response = portal
+        .set_pointer_barriers(session, &barriers, zone_set, Default::default())
+        .await?
+        .response()?;
+
+    // A barrier the compositor would not place is one edge the cursor cannot
+    // leave by. Not fatal — the others still work, and a node with one usable
+    // edge is far better than none — but it is exactly the kind of thing that
+    // reads as "the cursor won't go left" and is otherwise unattributable.
+    let refused = response.failed_barriers();
+    if !refused.is_empty() {
+        tracing::warn!(
+            ?refused,
+            "the compositor would not place some pointer barriers; the cursor cannot leave by \
+             those edges"
+        );
+    }
+    let edges: Vec<(BarrierID, BarrierEdge, Zone)> = placed
+        .into_iter()
+        .filter_map(|p| Some((BarrierID::new(p.id)?, p.edge, p.zone)))
+        .filter(|(id, _, _)| !refused.contains(id))
+        .collect();
+    tracing::debug!(
+        armed = edges.len(),
+        asked = barriers.len(),
+        "pointer barriers placed"
+    );
+    Ok(Barriers {
         edges,
+        exits,
+        enabled: false,
     })
 }
 
@@ -402,6 +835,7 @@ fn zone_of(region: Region) -> Zone {
 /// Drive the session until it ends.
 async fn pump(
     live: &Live,
+    barriers: &mut Barriers,
     events: &mut reis::tokio::EiConvertEventStream,
     capture: &CaptureState,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -429,7 +863,38 @@ async fn pump(
     let mut disabled = std::pin::pin!(OptionStream(disabled));
     let mut closed = std::pin::pin!(OptionStream(closed));
 
+    let own_disable = OwnDisable::default();
+
+    // The layout may have changed while the consent dialog was on screen, which is
+    // a window measured in however long a human takes. Any `Rearm` sent then went
+    // nowhere — there was no command hook yet — so the answer is re-read here
+    // rather than waiting for the next layout event, which may never come.
+    //
+    // Here and not before `pump`, deliberately. A `Disable` sent before `Disabled`
+    // is being watched leaves an expectation standing for a signal that can no
+    // longer be delivered, and the next genuine revocation — a screen lock — is
+    // then absorbed by it and the session dies with nobody told.
+    //
+    // Only on a real change. Nothing owed on the ordinary path, where the answer is
+    // still the one `negotiate` planned from: asking for it again would re-issue
+    // `SetPointerBarriers` with the identical plan on every session establishment.
+    // Arming is not this call's business — the `Enable` `attach` queued does that,
+    // and `obey` handles it idempotently.
+    let mut pending = PendingRearm::default();
+    let current = capture.exits();
+    if current != barriers.exits {
+        tracing::debug!("the layout changed while the session was being granted; re-arming");
+        pending.want(current);
+    }
+
     loop {
+        // The single owner of "the barriers owe the layout a change". Every path
+        // that ends an activation arrives as one of the branches below and comes
+        // straight back here, so a deferred re-arm is applied by whatever ended the
+        // activation without that path having to know it exists. An unchanged
+        // answer costs nothing — `rearm` returns at once.
+        let retry_at = pending.settle(live, barriers, capture, &own_disable).await;
+
         tokio::select! {
             biased;
 
@@ -441,7 +906,7 @@ async fn pump(
             // disables the branch instead, which is what "there is nobody left to
             // send commands" should mean.
             Some(command) = commands.recv() => {
-                if let Err(e) = obey(live, command).await {
+                if let Err(e) = obey(live, barriers, &own_disable, &mut pending, command).await {
                     // Not fatal: a refused `Release` leaves the pointer pinned,
                     // which the user can still clear by crossing back, and a
                     // refused `Enable` leaves capture idle. Tearing the session
@@ -454,7 +919,7 @@ async fn pump(
                 let position = signal.cursor_position()
                     .map(|(x, y)| Point::new(f64::from(x), f64::from(y)));
                 let barrier = match signal.barrier_id() {
-                    Some(ActivatedBarrier::Barrier(id)) => live.barrier(id),
+                    Some(ActivatedBarrier::Barrier(id)) => barriers.barrier(id),
                     _ => None,
                 };
                 match position {
@@ -492,6 +957,15 @@ async fn pump(
             Some(signal) = deactivated.next() => capture.deactivated(signal.activation_id()),
 
             Some(_) = disabled.next() => {
+                // A disable this side asked for — moving the barriers after a layout
+                // change, or `stop` — is not the compositor revoking anything, and
+                // tearing the session down over it would cost a consent dialog to get
+                // back. See `OwnDisable`.
+                if own_disable.claim() {
+                    tracing::debug!("the portal acknowledged a disable this side asked for");
+                    capture.deactivated(None);
+                    continue;
+                }
                 // The compositor has stopped capturing for this session and will not
                 // start again without a fresh `Enable`. Handled defensively rather
                 // than tested, because the case that produces it is a screen lock and
@@ -519,20 +993,66 @@ async fn pump(
                     "the compositor closed the libei capture transport".into(),
                 ),
             },
+
+            // Nothing happened, but a refused re-arm is owed another attempt. Only
+            // ever armed while one is outstanding; otherwise this branch waits for
+            // ever and the loop is driven entirely by the ones above.
+            () = wait_until(retry_at) => {},
         }
     }
 }
 
 /// Carry out one [`Command`] from the trait side.
-async fn obey(live: &Live, command: Command) -> ashpd::Result<()> {
+async fn obey(
+    live: &Live,
+    barriers: &mut Barriers,
+    own_disable: &OwnDisable,
+    pending: &mut PendingRearm,
+    command: Command,
+) -> ashpd::Result<()> {
     match command {
         Command::Enable => {
+            // Nothing placed is nothing to arm. The session is enabled by [`rearm`]
+            // the moment the layout puts a machine beyond an edge; see
+            // [`Barriers::should_enable`].
+            if !barriers.should_enable(true) {
+                tracing::debug!("no screen edge has a machine beyond it; nothing to arm");
+                return Ok(());
+            }
+            if barriers.enabled {
+                return Ok(());
+            }
             tracing::debug!("arming the pointer barriers");
-            live.portal.enable(&live.session, Default::default()).await
+            live.portal
+                .enable(&live.session, Default::default())
+                .await?;
+            barriers.enabled = true;
+            Ok(())
         }
         Command::Disable => {
+            if !barriers.enabled {
+                return Ok(());
+            }
             tracing::debug!("disarming the pointer barriers");
-            live.portal.disable(&live.session, Default::default()).await
+            own_disable.expect();
+            match live.portal.disable(&live.session, Default::default()).await {
+                Ok(()) => {
+                    barriers.enabled = false;
+                    Ok(())
+                }
+                Err(e) => {
+                    own_disable.forget();
+                    Err(e)
+                }
+            }
+        }
+        // Recorded rather than obeyed. A re-arm ends the activation, so it waits
+        // for one to end rather than taking a drive away from the user mid-gesture;
+        // [`PendingRearm`] owns when that happens.
+        Command::Rearm(exits) => {
+            tracing::debug!("the layout changed which edges have a machine beyond them");
+            pending.want(exits);
+            Ok(())
         }
         Command::Release {
             activation_id,
@@ -907,5 +1427,139 @@ mod tests {
             Stage::BeforeConsent,
         );
         assert!(matches!(failure.kind, FailureKind::Unsupported));
+    }
+
+    // -- which `Disabled` signal is ours ----------------------------------
+    //
+    // Nothing below arms a capture session or talks to a compositor: the two
+    // decisions the re-arm sequence turns on are pure, which is the only way they
+    // can be exercised at all — see the module docs on what is deliberately not
+    // verified against a live desktop.
+
+    #[test]
+    fn each_disable_this_side_sent_absorbs_one_signal_and_no_more() {
+        // The old flag latched, so two disables in flight and one `Disabled` back
+        // left it standing to swallow a genuine revocation — and one disable
+        // answered twice had the second read as the compositor ending the session,
+        // costing a fresh consent dialog.
+        let own = OwnDisable::default();
+        own.expect();
+        own.expect();
+        let now = Instant::now();
+        assert!(own.claim_at(now));
+        assert!(own.claim_at(now));
+        assert!(
+            !own.claim_at(now),
+            "a third `Disabled` with nothing outstanding is the compositor's own decision"
+        );
+    }
+
+    #[test]
+    fn a_disable_the_compositor_never_answered_stops_absorbing_signals() {
+        // GNOME sends no `Deactivated` for a client-initiated `Release`, so it may
+        // well send no `Disabled` for a client-initiated `Disable`. An expectation
+        // that outlived its round trip must not swallow the screen lock that comes
+        // an hour later.
+        let own = OwnDisable::default();
+        own.expect();
+        let later = Instant::now() + OWN_DISABLE_WINDOW + Duration::from_secs(1);
+        assert!(!own.claim_at(later));
+    }
+
+    #[test]
+    fn a_disable_the_portal_refused_expects_nothing_back() {
+        let own = OwnDisable::default();
+        own.expect();
+        own.forget();
+        assert!(!own.claim_at(Instant::now()));
+    }
+
+    // -- when a re-arm happens --------------------------------------------
+
+    fn some_exits() -> Vec<ScreenExits> {
+        vec![ScreenExits {
+            bounds: wx_proto::Rect::new(0, 0, 1920, 1080),
+            edges: vec![wx_proto::Edge::Left],
+        }]
+    }
+
+    #[test]
+    fn a_layout_change_does_not_interrupt_a_drive_in_progress() {
+        // Re-arming ends the activation, and the engine is not watching for that:
+        // it would go on believing local input is suppressed while the pointer is
+        // back on this machine and the remote cursor is frozen. So the change waits
+        // — and is applied the moment the activation ends, whatever ended it.
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        let now = Instant::now();
+        assert!(pending.due(now, true).is_none());
+        assert!(pending.due(now, false).is_some());
+    }
+
+    #[test]
+    fn nothing_is_owed_once_the_session_matches_the_layout() {
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        pending.applied();
+        assert!(pending.due(Instant::now(), false).is_none());
+        assert!(pending.wake_at(false).is_none());
+    }
+
+    #[test]
+    fn a_refused_rearm_is_tried_again_rather_than_left_unarmed() {
+        // Every layer above has already committed the new answer by the time the
+        // portal refuses, so an identical push is never sent again. If the retry
+        // did not live here, a transient refusal when a peer is added would leave
+        // that edge with no barrier for good, with only a `warn!` to say so.
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        let now = Instant::now();
+        pending.refused(now);
+        assert!(pending.due(now, false).is_none(), "not immediately");
+        assert_eq!(pending.wake_at(false), Some(now + REARM_RETRY_DELAYS[0]));
+        assert!(pending.due(now + REARM_RETRY_DELAYS[0], false).is_some());
+    }
+
+    #[test]
+    fn the_loop_does_not_wake_for_a_retry_it_would_refuse_anyway() {
+        // The pairing that spins: a refused re-arm whose deadline passes during a
+        // drive. `due` says no for as long as the activation lasts, so a deadline
+        // offered to the loop is one it wakes for instantly and can do nothing
+        // about — round and round, taking the capture lock each pass, through
+        // exactly the drive the deferral is protecting. Whatever ends the
+        // activation wakes the loop by itself, and the deadline is read again then.
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        let now = Instant::now();
+        pending.refused(now);
+        let overdue = now + REARM_RETRY_DELAYS[0] + Duration::from_secs(1);
+        assert!(pending.due(overdue, true).is_none());
+        assert!(pending.wake_at(true).is_none());
+        assert!(pending.due(overdue, false).is_some());
+        assert!(pending.wake_at(false).is_some());
+    }
+
+    #[test]
+    fn a_rearm_the_portal_keeps_refusing_gives_up_rather_than_retrying_for_ever() {
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        let mut now = Instant::now();
+        for delay in REARM_RETRY_DELAYS {
+            assert!(pending.due(now, false).is_some());
+            pending.refused(now);
+            now += delay;
+        }
+        assert!(pending.due(now, false).is_some(), "the last attempt");
+        pending.refused(now);
+        assert!(
+            pending
+                .due(now + Duration::from_secs(3600), false)
+                .is_none(),
+            "a portal that has refused five times will not be talked round"
+        );
+        // A later layout change is a different answer and starts over, which is the
+        // case the acceptance criterion is about.
+        pending.want(some_exits());
+        assert!(pending.due(now, false).is_some());
     }
 }

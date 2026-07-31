@@ -38,7 +38,7 @@ use wx_proto::{KeyAction, Modifiers, MouseButton, Point, ScrollUnit};
 
 use crate::error::{PlatformError, Result};
 use crate::keyres::{KeyResolver, RawKey};
-use crate::traits::{CaptureSink, CapturedEvent};
+use crate::traits::{CaptureSink, CapturedEvent, ScreenExits};
 use crate::windows::vk::special_from_vk;
 
 /// One notch of the scroll wheel in the units the hook reports.
@@ -177,6 +177,17 @@ impl crate::traits::InputCapture for WindowsCapture {
 
     fn suppresses_local(&self) -> bool {
         self.suppress.load(Ordering::SeqCst)
+    }
+
+    /// Accepted and ignored: the hooks see everything and grab nothing.
+    ///
+    /// `WH_MOUSE_LL` reports motion wherever the pointer is and never takes it at
+    /// a screen edge, so an edge with nothing beyond it is already handled by the
+    /// router refusing the crossing — there is no barrier here to arm or disarm.
+    /// Contrast Wayland, where the compositor decides when to hand the pointer
+    /// over and a barrier is a request for it.
+    fn set_exits(&mut self, _exits: &[ScreenExits]) -> Result<()> {
+        Ok(())
     }
 }
 

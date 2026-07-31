@@ -60,7 +60,7 @@ pub use error::{PlatformError, Result};
 pub use keyres::{KeyResolver, RawKey};
 pub use traits::{
     CaptureSink, CapturedEvent, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
-    ScreenSaverControl,
+    ScreenExits, ScreenSaverControl,
 };
 
 use std::path::Path;
