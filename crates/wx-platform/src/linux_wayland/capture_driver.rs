@@ -75,6 +75,16 @@
 //! * **`Enable` is never sent over an empty barrier set**, for the same reason and
 //!   because it would have nothing to arm. [`Barriers::should_enable`] is the one
 //!   place that decides.
+//!
+//! What that costs, and the assumption it leaves standing: because the empty plan
+//! makes no request, **the barriers placed for the previous layout stay registered
+//! with the compositor** when the last neighbour goes away. They are inert only
+//! because the session is disabled in the same breath and nothing re-enables it —
+//! so [`Barriers::should_enable`] must remain the *sole* gate on `Enable`. An
+//! `Enable` added anywhere that does not consult it would arm a barrier for a
+//! machine that is no longer there, which is the bug this whole layering exists to
+//! fix. There are two call sites today, in [`obey`] and [`rearm`], and both go
+//! through it.
 
 use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
@@ -500,8 +510,21 @@ impl PendingRearm {
         Some(wanted)
     }
 
-    /// When the loop should come back for a refused attempt, if it should.
-    fn retry_at(&self) -> Option<Instant> {
+    /// When the pump loop should come back of its own accord, if it should.
+    ///
+    /// Nothing at all while an activation is in force, and that is not an
+    /// optimisation. [`PendingRearm::due`] refuses during a drive whatever the
+    /// deadline says, so a deadline surfaced then is one the loop wakes for and can
+    /// do nothing about — and a refused deadline already in the past makes that
+    /// wake instantaneous, spinning the driver thread at full tilt, taking the
+    /// [`CaptureState`] lock against the events it is delivering, for exactly as
+    /// long as the user keeps driving. Nothing is lost by staying asleep: whatever
+    /// ends the activation is itself a branch of the loop, and `due` re-reads the
+    /// deadline on the way back through.
+    fn wake_at(&self, activation_in_force: bool) -> Option<Instant> {
+        if activation_in_force {
+            return None;
+        }
         self.retry_at
     }
 
@@ -529,16 +552,22 @@ impl PendingRearm {
         }
     }
 
-    /// Apply what is owed, if anything is and this is the moment for it.
+    /// Apply what is owed, if anything is and this is the moment for it, and
+    /// answer when the loop should come back for what is left.
+    ///
+    /// The wake instant comes from here rather than being read off afterwards so
+    /// that the answer and the condition it was computed under cannot disagree, and
+    /// so the [`CaptureState`] lock is taken once a pass.
     async fn settle(
         &mut self,
         live: &Live,
         barriers: &mut Barriers,
         capture: &CaptureState,
         own_disable: &OwnDisable,
-    ) {
-        let Some(exits) = self.due(Instant::now(), capture.suppresses_local()) else {
-            return;
+    ) -> Option<Instant> {
+        let activation_in_force = capture.suppresses_local();
+        let Some(exits) = self.due(Instant::now(), activation_in_force) else {
+            return self.wake_at(activation_in_force);
         };
         let exits = exits.to_vec();
         if rearm(live, barriers, capture, own_disable, exits).await {
@@ -546,6 +575,7 @@ impl PendingRearm {
         } else {
             self.refused(Instant::now());
         }
+        self.wake_at(capture.suppresses_local())
     }
 }
 
@@ -844,8 +874,18 @@ async fn pump(
     // is being watched leaves an expectation standing for a signal that can no
     // longer be delivered, and the next genuine revocation — a screen lock — is
     // then absorbed by it and the session dies with nobody told.
+    //
+    // Only on a real change. Nothing owed on the ordinary path, where the answer is
+    // still the one `negotiate` planned from: asking for it again would re-issue
+    // `SetPointerBarriers` with the identical plan on every session establishment.
+    // Arming is not this call's business — the `Enable` `attach` queued does that,
+    // and `obey` handles it idempotently.
     let mut pending = PendingRearm::default();
-    pending.want(capture.exits());
+    let current = capture.exits();
+    if current != barriers.exits {
+        tracing::debug!("the layout changed while the session was being granted; re-arming");
+        pending.want(current);
+    }
 
     loop {
         // The single owner of "the barriers owe the layout a change". Every path
@@ -853,8 +893,7 @@ async fn pump(
         // straight back here, so a deferred re-arm is applied by whatever ended the
         // activation without that path having to know it exists. An unchanged
         // answer costs nothing — `rearm` returns at once.
-        pending.settle(live, barriers, capture, &own_disable).await;
-        let retry_at = pending.retry_at();
+        let retry_at = pending.settle(live, barriers, capture, &own_disable).await;
 
         tokio::select! {
             biased;
@@ -1461,7 +1500,7 @@ mod tests {
         pending.want(some_exits());
         pending.applied();
         assert!(pending.due(Instant::now(), false).is_none());
-        assert!(pending.retry_at().is_none());
+        assert!(pending.wake_at(false).is_none());
     }
 
     #[test]
@@ -1475,8 +1514,27 @@ mod tests {
         let now = Instant::now();
         pending.refused(now);
         assert!(pending.due(now, false).is_none(), "not immediately");
-        assert_eq!(pending.retry_at(), Some(now + REARM_RETRY_DELAYS[0]));
+        assert_eq!(pending.wake_at(false), Some(now + REARM_RETRY_DELAYS[0]));
         assert!(pending.due(now + REARM_RETRY_DELAYS[0], false).is_some());
+    }
+
+    #[test]
+    fn the_loop_does_not_wake_for_a_retry_it_would_refuse_anyway() {
+        // The pairing that spins: a refused re-arm whose deadline passes during a
+        // drive. `due` says no for as long as the activation lasts, so a deadline
+        // offered to the loop is one it wakes for instantly and can do nothing
+        // about — round and round, taking the capture lock each pass, through
+        // exactly the drive the deferral is protecting. Whatever ends the
+        // activation wakes the loop by itself, and the deadline is read again then.
+        let mut pending = PendingRearm::default();
+        pending.want(some_exits());
+        let now = Instant::now();
+        pending.refused(now);
+        let overdue = now + REARM_RETRY_DELAYS[0] + Duration::from_secs(1);
+        assert!(pending.due(overdue, true).is_none());
+        assert!(pending.wake_at(true).is_none());
+        assert!(pending.due(overdue, false).is_some());
+        assert!(pending.wake_at(false).is_some());
     }
 
     #[test]
