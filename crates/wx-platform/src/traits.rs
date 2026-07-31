@@ -13,7 +13,8 @@
 //! recording fakes.
 
 use wx_proto::{
-    ClipboardFormat, InputEvent, KeyEvent, Monitor, MouseButton, NormPos, Point, ScrollUnit,
+    ClipboardFormat, Edge, InputEvent, KeyEvent, Monitor, MouseButton, NormPos, Point, Rect,
+    ScrollUnit,
 };
 
 use crate::error::Result;
@@ -118,6 +119,53 @@ pub trait InputCapture: Send {
     fn set_suppress_local(&mut self, suppress: bool) -> Result<()>;
 
     fn suppresses_local(&self) -> bool;
+
+    /// Which edges of which local screens the cursor is allowed to leave by.
+    ///
+    /// A backend that grabs the pointer at a screen edge must only do so where the
+    /// layout has somewhere for the cursor to go. On every other edge the pointer
+    /// has to stop dead, exactly as it does with nothing running — a machine that
+    /// takes the cursor at an edge with nothing beyond it has taken the desktop
+    /// away from whoever is sitting at it, and no local action gives it back.
+    ///
+    /// The caller is the only thing that knows: adjacency is a fact about the
+    /// global layout, which is the agent's, and a platform backend can see no
+    /// further than its own screens. So this is pushed down rather than asked for,
+    /// and pushed down *again* on every layout change — adding, removing or
+    /// moving a machine changes which edges are live, and must take effect without
+    /// a restart.
+    ///
+    /// Until it is called, no edge is live. Failing closed is deliberate: an
+    /// unarmed edge is an ordinary screen edge, where an edge armed on a guess is
+    /// the failure above.
+    ///
+    /// Idempotent. Callers push the whole set whenever it may have changed rather
+    /// than tracking deltas, and a backend for which nothing changed must do
+    /// nothing — on Wayland re-arming means a portal round trip.
+    fn set_exits(&mut self, exits: &[ScreenExits]) -> Result<()>;
+}
+
+/// The edges of one local screen the cursor may leave this machine by.
+///
+/// Keyed by geometry rather than by [`wx_proto::MonitorId`] because the thing a
+/// backend has to match it against may not be a monitor at all: on Wayland the
+/// capture portal reports its own regions, which are rectangles in this machine's
+/// desktop space and carry no monitor identity. Bounds are the one description
+/// both ends already agree on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenExits {
+    /// The screen, in this machine's own desktop space — the same coordinates
+    /// [`DisplayEnumerator::monitors`] reports [`Monitor::local_bounds`] in.
+    pub bounds: Rect,
+    /// Edges of it with somewhere for the cursor to go. Empty means this screen is
+    /// surrounded by nothing, and the pointer stops on all four sides.
+    pub edges: Vec<Edge>,
+}
+
+impl ScreenExits {
+    pub fn contains(&self, edge: Edge) -> bool {
+        self.edges.contains(&edge)
+    }
 }
 
 /// Injects received input into this machine's OS.

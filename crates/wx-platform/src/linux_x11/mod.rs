@@ -64,7 +64,7 @@ use wx_proto::{
 
 use crate::error::{PlatformError, Result};
 use crate::traits::{
-    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
+    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector, ScreenExits,
     ScreenSaverControl,
 };
 use crate::{LiveCapabilities, PlatformBackend, PlatformInfo};
@@ -332,6 +332,14 @@ impl InputCapture for X11Capture {
 
     fn suppresses_local(&self) -> bool {
         false
+    }
+
+    /// Accepted and ignored: this backend is a driven target and captures nothing.
+    ///
+    /// See the module docs for why it stops at RandR and XTEST. With no capture
+    /// there is no edge that could take the pointer, so there is nothing to arm.
+    fn set_exits(&mut self, _exits: &[ScreenExits]) -> Result<()> {
+        Ok(())
     }
 }
 

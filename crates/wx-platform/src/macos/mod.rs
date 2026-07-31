@@ -37,7 +37,7 @@ use wx_proto::{
 
 use crate::error::{PlatformError, Result};
 use crate::traits::{
-    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector,
+    CaptureSink, ClipboardAccess, DisplayEnumerator, InputCapture, InputInjector, ScreenExits,
     ScreenSaverControl,
 };
 use crate::{PlatformBackend, PlatformInfo};
@@ -117,6 +117,16 @@ impl InputCapture for MacCapture {
 
     fn suppresses_local(&self) -> bool {
         false
+    }
+
+    /// Accepted and ignored, and it will stay that way once the tap is written.
+    ///
+    /// A `CGEventTap` sees every event wherever the pointer is and never has the
+    /// cursor handed to it at an edge, so which edges are live is the router's
+    /// business here rather than this backend's — the same answer the Windows
+    /// hooks give, and the opposite of Wayland's portal.
+    fn set_exits(&mut self, _exits: &[ScreenExits]) -> Result<()> {
+        Ok(())
     }
 }
 

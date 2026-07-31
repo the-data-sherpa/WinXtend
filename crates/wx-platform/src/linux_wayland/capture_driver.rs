@@ -36,9 +36,10 @@
 //! * `InputCapture` version 1; `CreateSession` granting `Keyboard | Pointer`;
 //!   `GetZones` reporting one 3072x1728 region at the origin, matching what
 //!   [`super::display`] enumerates;
-//! * barriers accepted on all four edges once placed the way [`barriers_for`]
-//!   places them, and rejected otherwise — see that function for the geometry the
-//!   compositor actually enforces;
+//! * a barrier accepted on any of the four edges once placed the way
+//!   [`barriers_for`] places them, and rejected otherwise — a fact about the
+//!   *geometry* the compositor enforces, and not a reason to arm all four. Which
+//!   edges are asked for is the layout's answer; see [`barriers_for`] for both;
 //! * thirteen `Activated` signals across one session with no further consent, each
 //!   carrying a real cursor position and the barrier that fired;
 //! * `Release` handing the pointer back and the session re-arming immediately;
@@ -47,6 +48,20 @@
 //!
 //! The consent dialog itself cannot be automated, and must not be: that click *is*
 //! the security property. See the same note at the top of [`super::driver`].
+//!
+//! # What has *not* been verified against a live compositor
+//!
+//! Moving the barriers on a running session — [`rearm`], reached when the layout
+//! changes which edges have a machine beyond them. Every step of it is a portal
+//! call this session already makes, but the `Disable`/`SetPointerBarriers`/`Enable`
+//! *sequence* has not been run against GNOME, because exercising it means arming
+//! capture on a working desktop and an exclusive grab that is not released takes
+//! the machine away from whoever is at it. `rearm` carries what is known — the
+//! GNOME 46 bug `ashpd`'s own docs record, and which of its failure modes are made
+//! safe here — and the pure half of the decision is tested in
+//! [`super::capture_tests`] without a desktop. Anyone with two machines to spare
+//! should confirm it: move a machine in the layout editor and check the cursor
+//! then crosses by the new edge and not the old one.
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -67,6 +82,7 @@ use wx_proto::Point;
 
 use super::capture::{barriers_for, zone_at, BarrierEdge, CaptureState, Command, Zone};
 use super::session::{SharedSession, INPUT_CAPTURE_CAPABILITIES};
+use crate::traits::ScreenExits;
 
 /// Name this client reports to the compositor. User-visible in the shell's
 /// screen-sharing indicator, so it is the product's name and not a code name.
@@ -146,10 +162,10 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
             shared.stopped();
             return;
         }
-        established = establish() => established,
+        established = establish(capture) => established,
     };
 
-    let (live, mut events) = match established {
+    let (live, mut barriers, mut events) = match established {
         Ok(live) => live,
         Err(Aborted { failure, session }) => {
             failure.report(shared);
@@ -163,7 +179,7 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
     tracing::info!(
         capabilities = ?live.granted,
         zones = live.zones.len(),
-        barriers = live.barriers,
+        barriers = barriers.edges.len(),
         "the desktop portal granted an InputCapture session"
     );
 
@@ -177,9 +193,98 @@ async fn run(shared: &SharedSession, capture: &CaptureState, mut stop: oneshot::
     }));
     shared.activate(INPUT_CAPTURE_CAPABILITIES);
 
-    let reason = pump(&live, &mut events, capture, rx, stop).await;
+    // The layout may have changed while the consent dialog was on screen, which is
+    // a window measured in however long a human takes. Any `Rearm` sent then went
+    // nowhere — there was no command hook yet — so the answer is re-read here
+    // rather than waiting for the next layout event, which may never come.
+    let own_disable = OwnDisable::default();
+    let current = capture.exits();
+    if current != barriers.exits {
+        tracing::debug!("the layout changed while the session was being granted; re-arming");
+        rearm(&live, &mut barriers, capture, &own_disable, current).await;
+    }
+
+    let reason = pump(
+        &live,
+        &mut barriers,
+        &own_disable,
+        &mut events,
+        capture,
+        rx,
+        stop,
+    )
+    .await;
     capture.detach();
     teardown(shared, live, reason).await;
+}
+
+/// Replace the placed barriers with the ones `exits` calls for.
+///
+/// # The disable/enable dance, and why it is guarded
+///
+/// GNOME's portal will not accept `SetPointerBarriers` on an enabled session. The
+/// specification says such a request suspends the session; the implementation
+/// requires it to have been disabled first, which `ashpd`'s own module docs record
+/// along with the GNOME 46 bug that then prevented re-enabling it. The alpha
+/// target is GNOME 50, well past that, but this sequence has **not** been
+/// exercised against a live compositor — arming capture on a working desktop to
+/// test it is precisely the thing that takes someone's machine away from them —
+/// so it is written to fail safe rather than to be clever.
+///
+/// The guard that matters is `Disabled`. That signal normally means the compositor
+/// has ended the session for its own reasons and the pump tears everything down
+/// over it; a `Disabled` raised by our *own* `Disable` would therefore turn a
+/// layout change into a lost session and a fresh consent dialog. So a disable this
+/// side asked for is announced first and the signal it may produce is absorbed.
+/// The same shape as `Release`, which GNOME is measured not to answer with a
+/// `Deactivated` — our own decision is authoritative for our own state, and the
+/// signal is kept for the case where the compositor is the one deciding.
+///
+/// A refusal anywhere leaves the previous barriers in place and logs. That is the
+/// safe direction: the edges stay as they were, and an activation on an edge that
+/// is no longer live is handed straight back by [`CaptureState::activated`].
+async fn rearm(
+    live: &Live,
+    barriers: &mut Barriers,
+    capture: &CaptureState,
+    own_disable: &OwnDisable,
+    exits: Vec<ScreenExits>,
+) {
+    let was_capturing = capture.is_capturing();
+    own_disable.expect();
+    if let Err(e) = live.portal.disable(&live.session, Default::default()).await {
+        own_disable.forget();
+        tracing::warn!(error = %e, "could not disable the capture session to move its barriers");
+        return;
+    }
+    // A disabled session is not capturing, whether or not the compositor says so
+    // in a signal — GNOME is measured not to answer our own `Release` with a
+    // `Deactivated`, and the same may be true here. Waiting for a signal that may
+    // never come would leave `suppresses_local` claiming local input is still
+    // being swallowed, and any key held at the moment of the change stranded on
+    // whichever machine had the cursor. Idempotent: the signal, if it does arrive,
+    // finds nothing left to end.
+    capture.deactivated(None);
+    match place_barriers(
+        &live.portal,
+        &live.session,
+        live.zone_set,
+        &live.zones,
+        exits,
+    )
+    .await
+    {
+        Ok(placed) => *barriers = placed,
+        Err(e) => tracing::warn!(error = %e, "the portal refused the new pointer barriers"),
+    }
+    // Re-enabled even when the placement failed: the old barriers are still the
+    // session's, and leaving it disabled would silently stop this machine driving
+    // anything at all.
+    if was_capturing {
+        if let Err(e) = live.portal.enable(&live.session, Default::default()).await {
+            tracing::warn!(error = %e, "could not re-arm the capture session after a layout change");
+        }
+    }
 }
 
 /// A capture session that has been granted, with its transport connected.
@@ -188,23 +293,66 @@ struct Live {
     session: Session<InputCapture>,
     granted: BitFlags<PortalCapabilities>,
     connection: reis::event::Connection,
-    /// Which edge each barrier id sits on and which zone it bounds, so an
-    /// activation knows which way the pointer came in — and therefore which way is
-    /// back out, and which screen it is really on.
-    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
     /// Every region the portal reported, kept rather than counted so an activation
     /// the compositor did not attribute to a barrier can still be clamped onto a
     /// screen that exists.
     zones: Vec<Zone>,
-    barriers: usize,
+    /// The `GetZones` serial the barriers are placed against. Retained because
+    /// re-arming has to quote it again, and the compositor refuses a set of
+    /// barriers offered against a zone set it has moved on from.
+    zone_set: u32,
 }
 
-impl Live {
+/// The barriers currently placed, and what they were placed for.
+///
+/// Separate from [`Live`] because it is the one part of the session that changes
+/// while the session runs: a layout change alters which edges have somewhere
+/// beyond them, and the barriers have to follow without a new session — this
+/// portal has no restore token at the version the alpha target ships, so a new
+/// session means a new consent dialog.
+struct Barriers {
+    /// Which edge each barrier id sits on and which zone it bounds, so an
+    /// activation knows which way the pointer came in — and therefore which way is
+    /// back out, and which screen it is really on.
+    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
+    /// The answer these were planned from, so an unchanged push costs no round
+    /// trip and a changed one is noticed.
+    exits: Vec<ScreenExits>,
+}
+
+impl Barriers {
     fn barrier(&self, id: BarrierID) -> Option<(BarrierEdge, Zone)> {
         self.edges
             .iter()
             .find(|(b, _, _)| *b == id)
             .map(|(_, e, z)| (*e, *z))
+    }
+}
+
+/// Whether the next `Disabled` signal is one this side asked for.
+///
+/// A `Cell` and not an atomic: the capture driver is one thread running a
+/// current-thread runtime, and everything that touches this is on it.
+#[derive(Default)]
+struct OwnDisable(std::cell::Cell<bool>);
+
+impl OwnDisable {
+    /// A `Disable` is about to be sent.
+    fn expect(&self) {
+        self.0.set(true);
+    }
+
+    /// It was refused, so no signal is coming.
+    fn forget(&self) {
+        self.0.set(false);
+    }
+
+    /// Answer whether an arriving `Disabled` is ours, and stop expecting one.
+    ///
+    /// One signal per disable. A second `Disabled` with nothing outstanding really
+    /// is the compositor ending the session, and must still be believed.
+    fn claim(&self) -> bool {
+        self.0.replace(false)
     }
 }
 
@@ -230,7 +378,9 @@ impl Aborted {
 }
 
 /// Run the whole sequence and bring the `ei` connection up.
-async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborted> {
+async fn establish(
+    capture: &CaptureState,
+) -> Result<(Live, Barriers, reis::tokio::EiConvertEventStream), Aborted> {
     let portal = InputCapture::new().await.map_err(Aborted::before_session)?;
     tracing::debug!(version = portal.version(), "portal InputCapture interface");
 
@@ -256,17 +406,17 @@ async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborte
             session: None,
         })?;
 
-    match negotiate(&portal, &session, granted).await {
+    match negotiate(&portal, &session, granted, capture).await {
         Ok(negotiated) => Ok((
             Live {
                 portal,
                 session,
                 granted,
                 connection: negotiated.connection,
-                edges: negotiated.edges,
                 zones: negotiated.zones,
-                barriers: negotiated.barriers,
+                zone_set: negotiated.zone_set,
             },
+            negotiated.barriers,
             negotiated.events,
         )),
         Err(failure) => Err(Aborted {
@@ -279,15 +429,16 @@ async fn establish() -> Result<(Live, reis::tokio::EiConvertEventStream), Aborte
 struct Negotiated {
     connection: reis::event::Connection,
     events: reis::tokio::EiConvertEventStream,
-    edges: Vec<(BarrierID, BarrierEdge, Zone)>,
+    barriers: Barriers,
     zones: Vec<Zone>,
-    barriers: usize,
+    zone_set: u32,
 }
 
 async fn negotiate(
     portal: &InputCapture,
     session: &Session<InputCapture>,
     granted: BitFlags<PortalCapabilities>,
+    capture: &CaptureState,
 ) -> Result<Negotiated, Failure> {
     accept_granted(granted)?;
 
@@ -299,43 +450,14 @@ async fn negotiate(
         .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?;
 
     let regions: Vec<Zone> = zones.regions().iter().copied().map(zone_of).collect();
-    let placed = barriers_for(&regions);
-    // A plan whose id the portal cannot express is one this build asked for and
-    // cannot name; dropping it loses an edge, which is far better than shifting
-    // every later id and mis-attributing a refusal.
-    let barriers: Vec<Barrier> = placed
-        .iter()
-        .filter_map(|p| Some(Barrier::new(BarrierID::new(p.id)?, p.position)))
-        .collect();
-    let response = portal
-        .set_pointer_barriers(session, &barriers, zones.zone_set(), Default::default())
+    let zone_set = zones.zone_set();
+    // Whatever the agent has said by now. The consent dialog is answered by a
+    // human, so a layout has usually arrived long before this point; if none has,
+    // nothing is armed and the first `Rearm` places the barriers instead.
+    let exits = capture.exits();
+    let barriers = place_barriers(portal, session, zone_set, &regions, exits)
         .await
-        .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?
-        .response()
         .map_err(|e| Failure::from_ashpd(e, Stage::AfterGrant))?;
-
-    // A barrier the compositor would not place is one edge the cursor cannot
-    // leave by. Not fatal — the other three still work, and a node with one usable
-    // edge is far better than none — but it is exactly the kind of thing that
-    // reads as "the cursor won't go left" and is otherwise unattributable.
-    let refused = response.failed_barriers();
-    if !refused.is_empty() {
-        tracing::warn!(
-            ?refused,
-            "the compositor would not place some pointer barriers; the cursor cannot leave by \
-             those edges"
-        );
-    }
-    let edges: Vec<(BarrierID, BarrierEdge, Zone)> = placed
-        .into_iter()
-        .filter_map(|p| Some((BarrierID::new(p.id)?, p.edge, p.zone)))
-        .filter(|(id, _, _)| !refused.contains(id))
-        .collect();
-    if edges.is_empty() {
-        return Err(Failure::broken(
-            "the compositor placed none of the pointer barriers, so nothing can start a capture",
-        ));
-    }
 
     let fd = portal
         .connect_to_eis(session, Default::default())
@@ -356,9 +478,65 @@ async fn negotiate(
         connection,
         events,
         zones: regions,
-        barriers: edges.len(),
-        edges,
+        zone_set,
+        barriers,
     })
+}
+
+/// Ask the compositor for exactly the barriers `exits` calls for.
+///
+/// Replaces whatever is currently placed: `SetPointerBarriers` is the whole set,
+/// not an addition to it, so an edge that has stopped being live is disarmed by
+/// being left out.
+///
+/// Placing none is a legitimate outcome and not an error. A machine the layout
+/// puts nothing next to has nowhere to send the cursor from any edge, and the
+/// right behaviour is a pointer that stops on all four sides — the session stays
+/// up, capable of driving nothing, and arms itself the moment a peer is placed
+/// beside it.
+async fn place_barriers(
+    portal: &InputCapture,
+    session: &Session<InputCapture>,
+    zone_set: u32,
+    zones: &[Zone],
+    exits: Vec<ScreenExits>,
+) -> ashpd::Result<Barriers> {
+    let placed = barriers_for(zones, &exits);
+    // A plan whose id the portal cannot express is one this build asked for and
+    // cannot name; dropping it loses an edge, which is far better than shifting
+    // every later id and mis-attributing a refusal.
+    let barriers: Vec<Barrier> = placed
+        .iter()
+        .filter_map(|p| Some(Barrier::new(BarrierID::new(p.id)?, p.position)))
+        .collect();
+    let response = portal
+        .set_pointer_barriers(session, &barriers, zone_set, Default::default())
+        .await?
+        .response()?;
+
+    // A barrier the compositor would not place is one edge the cursor cannot
+    // leave by. Not fatal — the others still work, and a node with one usable
+    // edge is far better than none — but it is exactly the kind of thing that
+    // reads as "the cursor won't go left" and is otherwise unattributable.
+    let refused = response.failed_barriers();
+    if !refused.is_empty() {
+        tracing::warn!(
+            ?refused,
+            "the compositor would not place some pointer barriers; the cursor cannot leave by \
+             those edges"
+        );
+    }
+    let edges: Vec<(BarrierID, BarrierEdge, Zone)> = placed
+        .into_iter()
+        .filter_map(|p| Some((BarrierID::new(p.id)?, p.edge, p.zone)))
+        .filter(|(id, _, _)| !refused.contains(id))
+        .collect();
+    tracing::debug!(
+        armed = edges.len(),
+        asked = barriers.len(),
+        "pointer barriers placed"
+    );
+    Ok(Barriers { edges, exits })
 }
 
 /// Refuse a grant that is missing either capability.
@@ -400,8 +578,11 @@ fn zone_of(region: Region) -> Zone {
 }
 
 /// Drive the session until it ends.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     live: &Live,
+    barriers: &mut Barriers,
+    own_disable: &OwnDisable,
     events: &mut reis::tokio::EiConvertEventStream,
     capture: &CaptureState,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -441,7 +622,7 @@ async fn pump(
             // disables the branch instead, which is what "there is nobody left to
             // send commands" should mean.
             Some(command) = commands.recv() => {
-                if let Err(e) = obey(live, command).await {
+                if let Err(e) = obey(live, barriers, own_disable, capture, command).await {
                     // Not fatal: a refused `Release` leaves the pointer pinned,
                     // which the user can still clear by crossing back, and a
                     // refused `Enable` leaves capture idle. Tearing the session
@@ -454,7 +635,7 @@ async fn pump(
                 let position = signal.cursor_position()
                     .map(|(x, y)| Point::new(f64::from(x), f64::from(y)));
                 let barrier = match signal.barrier_id() {
-                    Some(ActivatedBarrier::Barrier(id)) => live.barrier(id),
+                    Some(ActivatedBarrier::Barrier(id)) => barriers.barrier(id),
                     _ => None,
                 };
                 match position {
@@ -492,6 +673,15 @@ async fn pump(
             Some(signal) = deactivated.next() => capture.deactivated(signal.activation_id()),
 
             Some(_) = disabled.next() => {
+                // A disable this side asked for — moving the barriers after a layout
+                // change, or `stop` — is not the compositor revoking anything, and
+                // tearing the session down over it would cost a consent dialog to get
+                // back. See `OwnDisable`.
+                if own_disable.claim() {
+                    tracing::debug!("the portal acknowledged a disable this side asked for");
+                    capture.deactivated(None);
+                    continue;
+                }
                 // The compositor has stopped capturing for this session and will not
                 // start again without a fresh `Enable`. Handled defensively rather
                 // than tested, because the case that produces it is a screen lock and
@@ -524,7 +714,13 @@ async fn pump(
 }
 
 /// Carry out one [`Command`] from the trait side.
-async fn obey(live: &Live, command: Command) -> ashpd::Result<()> {
+async fn obey(
+    live: &Live,
+    barriers: &mut Barriers,
+    own_disable: &OwnDisable,
+    capture: &CaptureState,
+    command: Command,
+) -> ashpd::Result<()> {
     match command {
         Command::Enable => {
             tracing::debug!("arming the pointer barriers");
@@ -532,7 +728,17 @@ async fn obey(live: &Live, command: Command) -> ashpd::Result<()> {
         }
         Command::Disable => {
             tracing::debug!("disarming the pointer barriers");
-            live.portal.disable(&live.session, Default::default()).await
+            own_disable.expect();
+            let result = live.portal.disable(&live.session, Default::default()).await;
+            if result.is_err() {
+                own_disable.forget();
+            }
+            result
+        }
+        Command::Rearm(exits) => {
+            tracing::debug!("the layout changed which edges have a machine beyond them");
+            rearm(live, barriers, capture, own_disable, exits).await;
+            Ok(())
         }
         Command::Release {
             activation_id,

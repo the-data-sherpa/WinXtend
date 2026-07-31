@@ -122,7 +122,7 @@ real compositor on one box, with no extra packages:
   first-pass layout does **not** reliably put the second machine on the right, so
   read the placements rather than assuming a direction. Passing the *cursor*
   between them on one host is a different matter and is confounded, not merely
-  fiddly: both agents arm pointer barriers on every edge of the same screen and
+  fiddly: both agents place their barriers against the same physical screen and
   the compositor allows only one active capture, and they then fight over one
   physical pointer, because the "remote" machine's injection warps the very
   pointer the "local" machine's capture has pinned. Budget for that before
@@ -231,6 +231,37 @@ from the device list, so the session publishes `INJECT_CAPABILITIES` and
 measured about it — why no `wlr`/`ext` data-control route exists on this target,
 and the portal calls that fail — is in the module docs of
 `crates/wx-platform/src/linux_wayland/clipboard.rs` and `clipboard_portal.rs`.
+
+## Which screen edges may take the cursor is the layout's answer, not a backend's
+
+A capture backend that lets the OS hand it the pointer at a screen edge — on
+Wayland a pointer barrier *is* a request for exactly that — must only do so where
+the global layout has another machine beyond that edge. Everywhere else the
+pointer has to stop dead, as it does with nothing running: an edge that grabs the
+cursor with nowhere to send it has taken the desktop away from whoever is sitting
+at it. That was the bug behind three edges out of four "grabbing" on a
+two-machine mesh, and it was invisible until a second machine first appeared in a
+layout.
+
+The backend cannot work it out. Zones and monitors describe *this* machine's
+screens and say nothing about what is placed beside them, so the answer is pushed
+down: `GlobalLayout::has_neighbour`/`exit_edges` (`crates/wx-core/src/layout.rs`)
+→ `local_exits` (`crates/wx-agent/src/engine.rs`, which is also where the global
+and local coordinate spaces are joined) → `InputCapture::set_exits`. Three rules
+hold it together and each has a test:
+
+- **`has_neighbour` is answered through `resolve_crossing`**, not by a second
+  adjacency test, so the edges a machine arms and the crossings it will actually
+  perform cannot drift apart.
+- **Told nothing, arm nothing.** A backend that has not been pushed an answer, and
+  a screen no answer describes, arm no edges. An unarmed edge is an ordinary
+  screen edge; an edge armed on a guess is the failure above.
+- **The push repeats on every layout and display change**, because a restart is
+  not available — `InputCapture` has no restore token at the alpha target's
+  version, so a new session means a new consent dialog.
+
+`RELEASE_PULLBACK` in `capture.rs` is no longer the routine path for a bad edge;
+it is the recovery for an activation that could not be attributed to a barrier.
 
 Everything measured about the capture side — that suppression is real and
 exclusive, that the compositor sends a capturing client no modifier state and no
