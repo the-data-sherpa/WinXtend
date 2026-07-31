@@ -61,9 +61,9 @@ layout editor.
 >   rather than only tested. Its clipboard is a skeleton: all four operations return
 >   a not-implemented error, so an X11 machine advertises no clipboard capability at
 >   all — deferred past alpha rather than ruled out, and tracked in #39. macOS and
->   evdev are further back than either: compiling skeletons,
->   documented down to the exact syscall sequences and implemented no further. On
->   those two the agent starts and does nothing.
+>   evdev are further back than either: compiling skeletons, documented down to the
+>   exact syscall sequences and implemented no further. On those two the agent
+>   starts and does nothing.
 > - **A cursor has crossed between two physical machines exactly once. A clipboard
 >   never has.** On 2026-07-30 the cursor moved over a real network between a
 >   Wayland machine doing the driving and an X11 machine being driven, both running
