@@ -127,6 +127,14 @@ encoded in one place, `InputEvent::reliability()`, and the sequence gate that
 discards reordered motion is explicitly forbidden from discarding a late
 button-release.
 
+One kind of drop is *not* by design: motion that arrived, decoded, and was then
+thrown away because the receiving machine's input queue was already full. That is
+the input loop on that machine falling behind rather than anything the network
+did, and the two present identically as "feels laggy", so it is counted per peer
+and said out loud — in `wx-agent --status`, in the UI's status screen, and in the
+log for as long as it is still happening. It is never a count of packets the
+network lost: those never arrive to be counted.
+
 ### Keystrokes cross the wire as text, not scancodes
 
 Sending scancodes is what forces every Synergy-lineage tool to demand identical
